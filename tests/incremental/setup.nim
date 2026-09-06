@@ -14,4 +14,5 @@ proc arg(name: string): string =
 if arg("bindir").len > 0: toolchainDir = arg("bindir")
 if arg("cachedir").len > 0: nimcacheDir = arg("cachedir")
 
+incrementalOCacheTests()
 incrementalTests()

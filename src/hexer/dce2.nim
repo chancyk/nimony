@@ -22,7 +22,35 @@ type
     # `foo.1.I<type hash>` -> `foo.1.I<type hash>.module`
     # that is selected for the generic instance
 
-proc resolveSymbolConflicts(modules: Table[string, ModuleAnalysis]): ResolveTable =
+proc prefersOffer(offerName, existingName, mainModule: string): bool =
+  ## Ownership rule for an instantiation offered by several modules.
+  ##
+  ## The base rule is "the lexicographically smallest full name wins": every
+  ## candidate shares the `key & '.'` prefix, so this compares module suffixes
+  ## and is deterministic for a given set of modules.
+  ##
+  ## On top of that the MAIN module never owns a symbol another module also
+  ## offers. The main module is the one participant that is guaranteed to
+  ## differ between two programs built from the same libraries -- most sharply
+  ## for the compile-time-eval sub-programs, whose main suffix is a checksum of
+  ## the evaluated expression. Letting it win would make a *shared* module's
+  ## `.c.nif` (an `imp` declaration naming the winner) depend on which main it
+  ## happens to be linked with, and that in turn defeats the content-addressed
+  ## object cache in `deps.buildGraph`. A symbol only the main module offers
+  ## still stays there: this rule only ever demotes main in favour of an
+  ## existing alternative.
+  ##
+  ## `mainModule` may be "" (unknown), in which case the base rule applies
+  ## unchanged.
+  if mainModule.len > 0:
+    let offerIsMain = extractModule(offerName) == mainModule
+    let existingIsMain = extractModule(existingName) == mainModule
+    if offerIsMain != existingIsMain:
+      return existingIsMain
+  result = offerName < existingName
+
+proc resolveSymbolConflicts(modules: Table[string, ModuleAnalysis];
+                            mainModule: string): ResolveTable =
   # Resolve conflicts between duplicate symbols (e.g., generic instantiations)
   # Returns: symbol mapping from key to canonical
   result = initTable[string, SymId]()
@@ -31,7 +59,7 @@ proc resolveSymbolConflicts(modules: Table[string, ModuleAnalysis]): ResolveTabl
       let offerName = pool.syms[offer]
       let key = removeModule(offerName)
       let existing = result.getOrDefault(key, SymId(0))
-      if existing == SymId(0) or offerName < pool.syms[existing]:
+      if existing == SymId(0) or prefersOffer(offerName, pool.syms[existing], mainModule):
         result[key] = offer
 
 proc translate(resolved: ResolveTable; sym: SymId): SymId =
@@ -189,7 +217,9 @@ proc deadCodeElimination*(files: openArray[string]; outdir: string) =
     let modName = splitModulePath(file).name
     graphs[modName] = readModuleAnalysis(file.changeModuleExt ".dce.nif")
 
-  let resolved = resolveSymbolConflicts(graphs)
+  # No main-module marker in this API: `files` is a flat list whose order is
+  # the caller's, so pass "" and keep the plain lexicographic ownership rule.
+  let resolved = resolveSymbolConflicts(graphs, "")
 
   let live = markLive(graphs, resolved)
   for file in files:
@@ -290,11 +320,15 @@ proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string) =
   ## resolve table + live sets, and write them to `liveOut`. This is the
   ## small serial step in the split DCE pipeline.
   var graphs = initTable[string, ModuleAnalysis]()
+  var mainModule = ""
   for file in dceFiles:
     let modName = splitModulePath(file).name
+    if mainModule.len == 0: mainModule = modName
     graphs[modName] = readModuleAnalysis(file)
 
-  let resolved = resolveSymbolConflicts(graphs)
+  # `dceFiles[0]` is the main module: `deps.generateFinalBuildFile` emits the
+  # `dceLive` inputs in `c.nodes` order and `c.nodes[0]` is the root module.
+  let resolved = resolveSymbolConflicts(graphs, mainModule)
   let live = markLive(graphs, resolved)
   writeLiveFile(liveOut, resolved, live)
 
