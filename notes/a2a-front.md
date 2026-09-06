@@ -39,14 +39,22 @@ writes. Two things had to move for that:
 
 - `nifindexes.createIndex` re-read the module it had just written (mmap +
   parse) to checksum it. Split into `indexContent(infile, nifContent, …)` (pure)
-  and `writeIndex`; `createIndex` is now `vfsRead` + those two. The checksum is
-  taken over a re-parse of the exact bytes in both paths, so the file-level and
-  buffer-level callers cannot drift apart.
+  and `writeIndex`; `createIndex` is now that read plus those two, with
+  `vfsRead` in place of the mmap so one code path serves both callers. The
+  checksum is taken over a parse of the exact bytes either way, so the
+  file-level and buffer-level callers cannot drift apart.
 - `nifpools.writeFile` was render + write in one. Split into `renderModule` and
-  `writeRendered`. `semmain.buildOutputs` renders once and the same string is
-  both the `.s.nif` and the checksum input, which also removes the re-read: one
-  render and one parse per module where there used to be one render, one write,
-  one mmap and one parse.
+  `writeRendered`, so a phase can produce its bytes without deciding where —
+  or whether — they are stored.
+
+**The file path keeps its read-back.** `buildOutputs` renders the module and
+could hand `writeOutputs` a finished index, saving a read and a parse per
+module. It does not: `writeOutputs` writes the module and lets `createIndex`
+read it back, exactly as before. That read is the only place in a small build
+where one process reads a file it wrote itself, and `tests/nifcache` counts it
+to prove `--vfs:verify` is not a no-op (`verify=0` fails the suite). Skipping
+it is what running the phase in-process buys — `indexBytes` is that door — not
+something to change under the tools that still spawn.
 
 ## 2. What the new surface is
 
@@ -70,7 +78,7 @@ proc resetNiflerGlobals*()
 type SemOutputs* = object
   code*: TokenBuf          # the .s.nif as tokens
   text*: string            # the same module rendered — the bytes on disk
-  index*: string           # the .s.idx.nif bytes
+  sections*: IndexSections # what the .s.idx.nif is built from
   deps*: TokenBuf          # the .s.deps.nif as tokens
   ok*: bool
 
@@ -78,6 +86,7 @@ proc loadInput*(infile: string; timer: var PhaseTimer): TokenBuf
 proc semcheckToBuf*(input: var TokenBuf; infile, outfile: string; config: sink NifConfig;
                     moduleFlags: set[ModuleFlag]; commandLineArgs: sink string;
                     canSelfExec: bool; timer: var PhaseTimer): SemOutputs
+proc indexBytes*(o: var SemOutputs; outfile: string): string  # no file needed
 proc writeOutputs*(o: var SemOutputs; outfile: string)
 proc semcheckToFiles*(...; timer: var PhaseTimer): bool   # load+sem+write
 proc semcheck*(...)                                       # quits on error (nimony.nim)
@@ -184,10 +193,10 @@ running two unrelated modules back to back, not for a nested evaluation.
    the main module has no index (`setupProgram` passes `hasIndex = false`), so
    the field is dead for it. Documented at the proc.
 4. **`createIndex` now reads its module with `vfsRead` instead of mmapping it.**
-   One extra copy of the bytes per module, and one fewer thing that can keep a
-   file locked on Windows. The path-based `semcheck` does not even do that
-   read any more: it hands `buildOutputs`'s rendered string straight to
-   `indexContent`.
+   One extra copy of the bytes per module, one code path shared with the
+   buffer-level caller, and one fewer thing that can keep a file locked on
+   Windows. It is still a read through the store, which is what
+   `tests/nifcache` asserts.
 5. **Files touched outside the phase's own list**, all additively:
    `src/lib/nifindexes.nim` (the `indexContent`/`writeIndex` split — no other
    A2a sub-task touches it), `src/lib/filelinecache.nim` (a six-line reset

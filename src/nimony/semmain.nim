@@ -140,12 +140,12 @@ type
   SemOutputs* = object
     ## Everything a semantic check produces, before a file is touched: the
     ## `.s.nif` as tokens (what an in-process consumer wants) and as the exact
-    ## bytes that go on disk, the `.s.idx.nif` bytes, and the `.s.deps.nif` as
-    ## tokens. `writeOutputs` is the only thing between this and the three
-    ## files the path-based `semcheck` leaves behind.
+    ## bytes that go on disk, what the `.s.idx.nif` is built from, and the
+    ## `.s.deps.nif` as tokens. `writeOutputs` is the only thing between this
+    ## and the three files the path-based `semcheck` leaves behind.
     code*: TokenBuf
     text*: string
-    index*: string
+    sections*: IndexSections
     deps*: TokenBuf
     ok*: bool   ## false when sem reported errors; the buffers are then empty
 
@@ -190,23 +190,34 @@ proc buildOutputs(c: var SemContext; dest: var TokenBuf; outfile: string): SemOu
           else:
             echo "  [", k, "] ", tk.kind
         break
-  # The module is rendered exactly once, here: the bytes are what the `.s.nif`
-  # gets and what the index checksum is taken over, so a buffer-level caller
-  # and a file-level one cannot produce different indexes for the same module.
+  # The module is rendered here and nowhere else: these are the bytes the
+  # `.s.nif` gets, and the bytes an in-process consumer would spill.
   result = SemOutputs(ok: true)
   result.text = renderModule(dest, outfile)
-  result.index = indexContent(outfile, result.text, true,
-    IndexSections(
-      converters: move c.converterIndexMap,
-      exportBuf: buildIndexExports(c)))
+  result.sections = IndexSections(
+    converters: move c.converterIndexMap,
+    exportBuf: buildIndexExports(c))
   result.deps = buildDepsFile(c)
   result.code = move dest
 
+proc indexBytes*(o: var SemOutputs; outfile: string): string =
+  ## The `.s.idx.nif` for a module that never reaches a file. Consumes
+  ## `o.sections`, so call it at most once — and note that `writeOutputs`
+  ## does NOT go through here: on the file path the module is written first
+  ## and `createIndex` reads it back, which is what nimsem has always done.
+  ## That read is the only place in a small build where a process reads a
+  ## file it wrote itself, and `tests/nifcache` counts it to prove
+  ## `--vfs:verify` is not a no-op. Removing it is what running the phase
+  ## in-process buys; it is not a change of behaviour on the file path.
+  indexContent(outfile, o.text, true, move o.sections)
+
 proc writeOutputs*(o: var SemOutputs; outfile: string) =
   ## Put a module's outputs where the rest of the pipeline (hexer, an importing
-  ## nimsem, nifmake's staleness check) expects to find them.
+  ## nimsem, nifmake's staleness check) expects to find them: the same three
+  ## writes in the same order as before A2a, `createIndex`'s read-back included.
   onRaiseQuit writeRendered(outfile, o.text, OnlyIfChanged)
-  onRaiseQuit writeIndex(outfile, o.index)
+  onRaiseQuit createIndex(outfile, readonlyCursorAt(o.code, 0).info, true,
+                          move o.sections)
   onRaiseQuit writeFile(o.deps, changeModuleExt(outfile, ".s.deps.nif"), OnlyIfChanged)
 
 proc writeOutput(c: var SemContext; dest: var TokenBuf; outfile: string) =
