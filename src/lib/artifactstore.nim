@@ -125,7 +125,15 @@
 ##   instead of serving stale bytes. That is one `stat` — the same syscall the
 ##   caller would have made anyway for `vfsExists`/`vfsMtime`.
 
+when defined(nimony):
+  # `vfs.nim` does the same: the relay proc fields, the pin slots and the raw
+  # `pointer` a blob carries are all nilable by construction.
+  {.feature: "lenientnils".}
+
 import std / [tables, strutils, os, syncio]
+when defined(nimony):
+  # Nimony's `os` does not re-export these; `vfs.nim` splits the same way.
+  import std / [envvars, dirs, paths]
 import vfs
 
 const
@@ -303,10 +311,47 @@ proc releasePin(b: var VfsBlob) {.nimcall.} =
     store.pinned[idx] = nil
     store.freeSlots.add idx
 
+when defined(nimony):
+  proc bytesPtr(s: string): pointer = nil
+    ## Nimony rejects `addr s[0]`, so a nimony-built compiler cannot hand out
+    ## a blob over a resident entry and `storeOpenMmap` falls through to the
+    ## disk backend instead. Every entry is written through today, so this
+    ## costs a cache hit and can never cost a wrong answer. (`hastur boot`
+    ## compiles nimony, nimsem and hexer with nimony itself; the store is
+    ## still installed there, it just does not serve mmaps.)
+else:
+  proc bytesPtr(s: string): pointer =
+    if s.len > 0: cast[pointer](unsafeAddr s[0]) else: nil
+
 proc blobOver(p: Payload): VfsBlob =
   let idx = acquirePin(p)
-  let data = if p.bytes.len > 0: cast[pointer](unsafeAddr p.bytes[0]) else: nil
-  result = initBlob(data, p.bytes.len, cast[pointer](idx + 1), releasePin)
+  result = initBlob(bytesPtr(p.bytes), p.bytes.len, cast[pointer](idx + 1), releasePin)
+
+# --- entry lookup ---------------------------------------------------------
+
+proc entryOf(path: string): Payload =
+  ## The one place the entry table is read. `Table.[]` is `.raises` under
+  ## nimony, so the lookup is wrapped once here rather than guarded at each of
+  ## the seven wrappers; `nil` is "not resident".
+  when defined(nimony):
+    try: result = store.entries[path]
+    except: result = nil
+  else:
+    result = store.entries.getOrDefault(path, nil)
+
+proc setEnvVar(key, value: string) =
+  when defined(nimony):
+    try: putEnv(key, value)
+    except: discard
+  else:
+    putEnv(key, value)
+
+proc ensureDir(dir: string) =
+  when defined(nimony):
+    try: createDir(path(dir))
+    except: discard
+  else:
+    createDir(dir)
 
 # --- generations ----------------------------------------------------------
 
@@ -381,7 +426,8 @@ proc dropLargest(): bool =
         victim = path
         victimSize = p.bytes.len
   if victimSize < 0: return false
-  let p = store.entries[victim]
+  let p = entryOf(victim)
+  if p == nil: return false
   spillEntry(victim, p)
   store.stats.residentBytes -= p.bytes.len
   store.entries.del victim
@@ -399,8 +445,9 @@ proc putEntry(path: string; content: string; cls: PathClass;
               onDisk: bool; diskMtime: int64) =
   ## Install a NEW payload. The old one, if any, is left to whatever blobs
   ## still hold it.
-  store.entries.withValue(path, old):
-    store.stats.residentBytes -= old[].bytes.len
+  let old = entryOf(path)
+  if old != nil:
+    store.stats.residentBytes -= old.bytes.len
     dec store.stats.entries
   let p = Payload(bytes: content, repr: erText, generation: nextGeneration(),
                   diskMtime: diskMtime, onDisk: onDisk, cls: cls)
@@ -425,12 +472,13 @@ proc storeWrite(path, content: string) {.nimcall.} =
 
 proc storeRead(path: string): string {.nimcall.} =
   inc store.stats.reads
-  store.entries.withValue(path, p):
-    if isCurrent(path, p[]):
-      if store.policy == spVerify and p[].onDisk:
-        verifyAgainstDisk(path, p[])
+  let p = entryOf(path)
+  if p != nil:
+    if isCurrent(path, p):
+      if store.policy == spVerify and p.onDisk:
+        verifyAgainstDisk(path, p)
       inc store.stats.readHits
-      return p[].bytes
+      return p.bytes
   result = store.prevRead(path)
   # Admit it. It came from disk, so it is on disk, and evicting it later is
   # free. `classifyPath` still decides whether a later write goes through.
@@ -438,32 +486,34 @@ proc storeRead(path: string): string {.nimcall.} =
 
 proc storeOpenMmap(path: string): VfsBlob {.nimcall.} =
   inc store.stats.mmaps
-  store.entries.withValue(path, p):
-    if isCurrent(path, p[]) and p[].bytes.len > 0:
-      if store.policy == spVerify and p[].onDisk:
-        verifyAgainstDisk(path, p[])
+  let p = entryOf(path)
+  if p != nil:
+    if isCurrent(path, p) and bytesPtr(p.bytes) != nil:
+      if store.policy == spVerify and p.onDisk:
+        verifyAgainstDisk(path, p)
       inc store.stats.mmapHits
-      return blobOver(p[])
+      return blobOver(p)
   # Not resident: let the disk backend map it. Mapping is already cheap
   # (JIT.md 3.3: ~0.1 ms per MB) and copying the bytes into the store to hand
   # back a pointer into them would cost more than it saves.
   result = store.prevOpenMmap(path)
 
 proc storeExists(path: string): bool {.nimcall.} =
-  store.entries.withValue(path, p):
-    if not p[].onDisk: return true
+  let p = entryOf(path)
+  if p != nil and not p.onDisk: return true
   result = store.prevExists(path)
 
 proc storeMtime(path: string): int64 {.nimcall.} =
-  store.entries.withValue(path, p):
-    if not p[].onDisk: return p[].generation
+  let p = entryOf(path)
+  if p != nil and not p.onDisk: return p.generation
   result = store.prevMtime(path)
 
 proc storeNow(): int64 {.nimcall.} = store.prevNow()
 
 proc storeRemove(path: string) {.nimcall.} =
-  store.entries.withValue(path, p):
-    store.stats.residentBytes -= p[].bytes.len
+  let p = entryOf(path)
+  if p != nil:
+    store.stats.residentBytes -= p.bytes.len
     dec store.stats.entries
   store.entries.del path
   store.prevRemove(path)
@@ -555,6 +605,19 @@ proc requestStorePolicy*(name: string): bool =
   result = parseStorePolicy(name, p)
   if result: request.policy = $p
 
+proc parseBudgetMB*(text: string): int =
+  ## `--vfs-budget:<MB>`, parsed once for every tool that accepts the flag.
+  ## Anything that is not a positive number of megabytes comes back as -1 and
+  ## the caller produces its own diagnostic.
+  result = -1
+  when defined(nimony):
+    try: result = parseInt(text)
+    except: result = -1
+  else:
+    try: result = parseInt(text)
+    except ValueError: result = -1
+  if result <= 0: result = -1
+
 proc requestStoreBudgetMB*(mb: int) =
   ## `--vfs-budget:<MB>`. Zero or less leaves the default in place.
   if mb > 0: request.budgetMB = mb
@@ -571,12 +634,10 @@ proc applyRequestedStore*() =
   var mb = request.budgetMB
   if mb <= 0:
     let fromEnv = getEnv(VfsBudgetEnv)
-    if fromEnv.len > 0:
-      try: mb = parseInt(fromEnv)
-      except ValueError: mb = 0
+    if fromEnv.len > 0: mb = parseBudgetMB(fromEnv)
   if mb <= 0: mb = DefaultBudgetMB
-  putEnv(VfsPolicyEnv, $p)
-  putEnv(VfsBudgetEnv, $mb)
+  setEnvVar(VfsPolicyEnv, $p)
+  setEnvVar(VfsBudgetEnv, $mb)
   installArtifactStore(p, mb * 1024 * 1024)
 
 proc storeInstalled*(): bool = store.installed
@@ -605,8 +666,8 @@ proc spillAll*(paths: openArray[string]) =
   ## spawning the process that will read them.
   if not store.installed: return
   for path in paths:
-    store.entries.withValue(path, p):
-      spillEntry(path, p[])
+    let p = entryOf(path)
+    if p != nil: spillEntry(path, p)
 
 proc spillAll*() =
   ## Every memory-only entry. This is `storeFlush` without the policy check.
@@ -635,7 +696,7 @@ proc spillTo*(dir: string) =
   ## point is to be able to look at every artifact that exists, which is the
   ## debugging story JIT.md 5.1 asks the store to keep.
   if not store.installed: return
-  if not dirExists(dir): createDir(dir)
+  ensureDir(dir)
   for path, p in store.entries:
     store.prevWrite(dir / extractFilename(path), p.bytes)
 

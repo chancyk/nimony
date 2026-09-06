@@ -63,9 +63,7 @@ proc handleCmdLine() =
         if not requestStorePolicy(val):
           quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
       of "vfs-budget", "vfsbudget":
-        var mb = 0
-        try: mb = parseInt(val)
-        except ValueError: mb = -1
+        let mb = parseBudgetMB(val)
         if mb <= 0: quit "invalid value for --vfs-budget; expected a size in megabytes"
         requestStoreBudgetMB mb
       else: quit(Usage)
