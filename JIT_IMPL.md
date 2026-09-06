@@ -632,6 +632,29 @@ Gate: B3's numbers on each platform.
 
 ---
 
+## Measuring
+
+Every phase's own before/after numbers are necessary but not sufficient: the
+number that matters is the merged branch against the fork point, on a quiet
+machine, with one script. The rule, from 2026-09-06 on:
+
+1. The fork-point toolchain lives in a worktree built once:
+   `git worktree add /tmp/devloop_base f69b8afc && (cd /tmp/devloop_base &&
+   nim c -r src/hastur/hastur build all)`.
+2. After the agents of a wave have all reported and BEFORE the next wave is
+   launched (the only window with no contention), run
+   `bench/devloop_bench.sh /tmp/devloop_base base 3` and
+   `bench/devloop_bench.sh . head 3`, and append both tables to
+   `bench/results/<date>/progress.md` under the merged commit hash.
+3. Read cpu-sum first, wall second. A scenario whose cpu-sum is more than 5 %
+   worse than `base` and is not explained by the phase that was just merged
+   blocks the next launch until it is understood (profile with
+   `nimony c -f --profile`, then bisect by phase branch).
+4. Scenarios: hello (forced / no change / edit), CTFE `tmyops` (cold / warm /
+   edit / forced), `bench/ctfe_bench.nim` (cold / edit), stdlib `tall.nim`
+   (cold / forced / `strutils` edit). B-track phases add `nimony r` and the
+   engine's per-evaluation time when those exist.
+
 ## Execution rules for agents
 
 1. Work in a git worktree on a branch named `jit/<phase>`; commit there;
