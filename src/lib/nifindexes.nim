@@ -129,46 +129,65 @@ proc getSymbolSection(tag: TagId; values: seq[(SymId, SymId)]): TokenBuf =
 
   result.addParRi()
 
-proc createIndex*(infile: string; root: NifLineInfo; buildChecksum: bool; sections: IndexSections) {.canRaise.} =
+proc indexNameOf*(infile: string): string =
   # Mirror the doc-mode cache split: `foo.sc.nif` → `foo.sc.idx.nif`, the regular
   # `foo.s.nif` → `foo.s.idx.nif`. Keeps both populations valid in parallel.
   let isDocMode = infile.endsWith(".sc.nif")
   let idxExt = if isDocMode: ".sc.idx.nif" else: ".s.idx.nif"
-  let indexName = changeModuleExt(infile, idxExt)
-  var content = "(.nif27)\n(index\n"
+  result = changeModuleExt(infile, idxExt)
+
+proc indexContent*(infile, nifContent: string; buildChecksum: bool;
+                   sections: IndexSections): string =
+  ## The bytes of the `.s.idx.nif` for the module `infile`, whose own bytes are
+  ## `nifContent` (they need not be on disk).
+  ## The checksum is taken over a re-parse of exactly those bytes, so the
+  ## buffer-level caller (`semmain.semcheckToBuf`) and the file-level one
+  ## (`createIndex`) cannot drift apart.
+  result = "(.nif27)\n(index\n"
 
   if sections.converters.len != 0:
     let converterSectionBuf = getSymbolSection(TagId(ConverterIdx), sections.converters)
 
-    content.add toString(converterSectionBuf)
-    content.add "\n"
+    result.add toString(converterSectionBuf)
+    result.add "\n"
 
   if sections.exportBuf.len != 0:
-    content.add toString(sections.exportBuf)
-    content.add "\n"
+    result.add toString(sections.exportBuf)
+    result.add "\n"
 
   if buildChecksum:
-    var r = nifreader.open(infile)
+    var r = nifreader.openFromBuffer(nifContent, nifreader.extractModuleSuffix(infile))
     var buf = createTokenBuf()
     nifcoreparse.parse(r, buf)
-    # Close eagerly: the reader mmaps `infile`, and a leaked mapping keeps the
-    # file locked on Windows — a later rewrite of the same file (e.g. repeated
-    # `runEval` const folds writing the same tco<hash>.p.nif) then fails.
     nifreader.close(r)
     var checksum = newSha1State()
     processForChecksum(checksum, buf)
     let final = SecureHash checksum.finalize()
-    content.add "(checksum \"" & $final & "\")"
-  content.add "\n)\n"
-  # OnlyIfChanged: clients (downstream nimsem/hexer) depend on this file.
-  # When a module's interface and inline-proc bodies are unchanged, its
-  # checksum is identical, so we keep the old mtime to avoid cascading
-  # rebuilds through importers. nifmake's `needsRebuild` uses the freshest
-  # of a node's outputs (max), so the always-written `.s.nif` still proves
-  # "we ran since the inputs changed" for nimsem's own staleness check.
+    result.add "(checksum \"" & $final & "\")"
+  result.add "\n)\n"
+
+proc writeIndex*(infile, content: string) {.canRaise.} =
+  ## OnlyIfChanged: clients (downstream nimsem/hexer) depend on this file.
+  ## When a module's interface and inline-proc bodies are unchanged, its
+  ## checksum is identical, so we keep the old mtime to avoid cascading
+  ## rebuilds through importers. nifmake's `needsRebuild` uses the freshest
+  ## of a node's outputs (max), so the always-written `.s.nif` still proves
+  ## "we ran since the inputs changed" for nimsem's own staleness check.
+  let indexName = indexNameOf(infile)
   let existingContent = try: vfsRead(indexName) except: ""
   if existingContent != content:
     vfsWrite(indexName, content)
+
+proc createIndex*(infile: string; root: NifLineInfo; buildChecksum: bool; sections: IndexSections) {.canRaise.} =
+  var moduleContent = ""
+  if buildChecksum:
+    # The checksum is over the module as written, so read it back. The reader
+    # mmaps `infile`; `vfsRead` copies instead, which is what lets the reader be
+    # closed before the index write — a leaked mapping keeps the file locked on
+    # Windows, and a later rewrite of the same file (e.g. repeated `runEval`
+    # const folds writing the same tco<hash>.p.nif) then fails.
+    moduleContent = vfsRead(infile)
+  writeIndex(infile, indexContent(infile, moduleContent, buildChecksum, sections))
 
 proc createIndex*(infile: string; buildChecksum: bool; root: NifLineInfo) {.canRaise.} =
   createIndex(infile, root, buildChecksum, IndexSections())

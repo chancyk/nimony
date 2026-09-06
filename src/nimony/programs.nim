@@ -73,6 +73,22 @@ type
 var
   prog*: Program
 
+proc resetProgram*() =
+  ## Forget everything the process learned about a compiled program: the
+  ## `NifModule` cache (`prog.mods`, keyed by module suffix and holding a live
+  ## `Reader` plus that module's index tables), the module currently being
+  ## compiled (`prog.main`) and every published toplevel entry (`prog.mem`,
+  ## keyed by `SymId`).
+  ##
+  ## All three are meaningless — and actively wrong — once `nifpools.pool` is
+  ## replaced, because their keys are ids of that pool: a `SymId` minted after
+  ## the reset would hit a `prog.mem` entry published for a different symbol
+  ## that happened to be interned at the same index. Never reset one without
+  ## the other; `semmain.resetFrontendGlobals` does both in the right order.
+  ## `getEntry` hands out a `ptr ToplevelEntry` into `prog.mem`, so no such
+  ## pointer may be live across this call.
+  prog = Program()
+
 # -------------- Iface helpers (style-aware) ----------------------------
 #
 # Thin wrappers over the global `pool.styleSiblings` index. When
@@ -538,7 +554,9 @@ proc publishStringType*() =
           str.addDotToken() # default value
   publish symId, str, SemcheckBodies
 
-proc setupProgram*(infile, outfile: string; owningBuf: var TokenBuf; hasIndex=false): Cursor =
+proc setMainModule(infile, outfile: string) =
+  ## Where the module being compiled lives and what extension its output
+  ## carries; `suffixToNif`/`semIndexExt` read both back for every import.
   prog.main = splitModulePath(infile)
   let outp = splitModulePath(outfile)
   if prog.main.dir.len == 0:
@@ -547,6 +565,25 @@ proc setupProgram*(infile, outfile: string; owningBuf: var TokenBuf; hasIndex=fa
     except:
       prog.main.dir = "."
   prog.main.ext = outp.ext
+
+proc setupProgramFromBuf*(infile, outfile: string; input: var TokenBuf): Cursor =
+  ## Buffer-level twin of `setupProgram`: the caller already holds the module's
+  ## tokens (parsed from a `.p.nif` with `denseLineInfo = true`, against the
+  ## pool that is current now), so nothing is read from disk. The main module
+  ## is registered without a reader: a reader is only ever used to jump to an
+  ## index entry (`tryLoadSym`), and the main module carries no index here —
+  ## exactly as `setupProgram` leaves it for `hasIndex = false`.
+  ##
+  ## Imports are still loaded from `.s.nif`/`.s.idx.nif` files by `load`; only
+  ## the main input is buffer-level (see `notes/a2a-front.md`).
+  setMainModule infile, outfile
+  result = beginRead(input)
+  prog.mods[prog.main.name] = NifModule(
+    public: initOrderedTable[string, NifIndexEntry](),
+    private: initOrderedTable[string, NifIndexEntry]())
+
+proc setupProgram*(infile, outfile: string; owningBuf: var TokenBuf; hasIndex=false): Cursor =
+  setMainModule infile, outfile
 
   var m = newNifModule(infile)
 

@@ -51,34 +51,39 @@ Options:
   --help                    show this help
 """
 
-proc writeHelp() = quit(Usage, QuitSuccess)
-proc writeVersion() = quit(Version & "\n", QuitSuccess)
-
 type
   Command = enum
     None, SingleModule, GenerateIdx, Execute, Idetools, BuildPlugin
 
+proc exitWith(msg: string): int =
+  ## `quit msg` as a value: the same bytes on stderr and the same exit code,
+  ## but the process survives so a second module can be checked in it
+  ## (`JIT.md` 6.1).
+  stderr.writeLine msg
+  result = 1
+
 proc processModules(infiles: seq[string]; config: sink NifConfig;
-                    moduleFlags: set[ModuleFlag]; commandLineArgs: string) =
+                    moduleFlags: set[ModuleFlag]; commandLineArgs: string): int =
   for infile in infiles:
     if not semos.fileExists(infile):
-      quit "cannot find " & infile
+      return exitWith("cannot find " & infile)
   var outfiles: seq[string] = @[]
   for infile in infiles:
     # Mirror the doc-mode prefix: `.pc.nif` → `.sc.nif`, plain `.p.nif` → `.s.nif`.
     # Keeps the doc and code-gen caches separate so they don't trample each other.
     let outExt = if infile.endsWith(".pc.nif"): ".sc.nif" else: ".s.nif"
     outfiles.add infile.changeModuleExt(outExt)
-  # Cost ledger (JIT.md 5.2): the whole semantic check is this phase's
-  # `produce`; loading, serializing and writing happen inside `semcheck` and
-  # only become separable with A2a's buffer-level entry points. A cycle group
-  # is one sample keyed by its first module, with the bytes of all its outputs.
+  # Cost ledger (JIT.md 5.2): `semcheckToFiles` splits a single module into
+  # load, parse, produce, serialize and write (A2a); a cycle group is written
+  # as a unit and stays one `produce`. One sample keyed by the first module,
+  # with the bytes of all the group's outputs.
   var timer = initPhaseTimer(outfiles[0].parentDir, "nimsem",
                              moduleSuffixOf(outfiles[0]))
-  semcheck(infiles, outfiles, ensureMove config, moduleFlags, commandLineArgs, false)
-  timer.noteProduce()
+  let ok = semcheckToFiles(infiles, outfiles, ensureMove config, moduleFlags,
+                           commandLineArgs, false, timer)
   for outfile in outfiles: timer.noteBytes(fileSizeOrZero(outfile))
   timer.finish()
+  result = if ok: 0 else: 1
 
 proc executeNif(files: seq[string]; config: sink NifConfig) =
   # file 0 is special as it is the main file. We need to run injectDerefs on it first.
@@ -107,14 +112,22 @@ proc executeNif(files: seq[string]; config: sink NifConfig) =
     moduleFlags = {}
   )
 
-proc handleCmdLine() =
+proc runNimsem*(argv: seq[string]): int =
+  ## nimsem's command line as a proc: the same parsing, the same messages on
+  ## stderr and the same exit code, returned instead of `quit`ed so the tool
+  ## can run twice in one process (`JIT.md` 6.1). Call
+  ## `semmain.resetFrontendGlobals()` between two runs.
+  ##
+  ## `--help` and `--version` are the one exception: `cli.parseCommonOption`
+  ## still `quit`s for them, and no in-process caller passes them.
   var args: seq[string] = @[]
   var cmd = Command.None
   var forceRebuild = false
   var moduleFlags: set[ModuleFlag] = {}
   var config = initNifConfig("")
   var commandLineArgs = ""
-  for kind, key, val in getopt():
+  var p = initOptParser(argv)
+  for kind, key, val in getopt(p):
     case kind
     of cmdArgument:
       if cmd == None:
@@ -130,7 +143,7 @@ proc handleCmdLine() =
         of "plugin":
           cmd = BuildPlugin
         else:
-          quit "command expected"
+          return exitWith("command expected")
       else:
         args.add key
 
@@ -150,7 +163,10 @@ proc handleCmdLine() =
           # reasoning as the matching branch in `nimony.nim`.
           forceRebuild = true
           forwardArg = false
-        else: writeHelp()
+        else:
+          # `quit(Usage, QuitSuccess)`, minus the quit.
+          stderr.writeLine Usage
+          return 0
       if forwardArg:
         commandLineArgs.add " --" & key
         if val.len > 0:
@@ -166,34 +182,43 @@ proc handleCmdLine() =
 
   case cmd
   of None:
-    quit "command missing"
+    result = exitWith("command missing")
   of SingleModule:
     if args.len < 1:
-      quit "want at least 1 command line argument"
-    processModules(args, ensureMove config, moduleFlags, commandLineArgs)
+      result = exitWith("want at least 1 command line argument")
+    else:
+      result = processModules(args, ensureMove config, moduleFlags, commandLineArgs)
   of GenerateIdx:
     if args.len != 1:
-      quit "want exactly 1 command line argument"
-    indexFromNif(args[0])
+      result = exitWith("want exactly 1 command line argument")
+    else:
+      indexFromNif(args[0])
+      result = 0
   of Execute:
     if args.len == 0:
-      quit "want more than 0 command line argument"
-    executeNif args, ensureMove config
+      result = exitWith("want more than 0 command line argument")
+    else:
+      executeNif args, ensureMove config
+      result = 0
   of BuildPlugin:
     if args.len != 2:
-      quit "want exactly 2 command line arguments: <plugin.nim> <executable>"
-    buildPlugin(config, args[0], args[1])
+      result = exitWith("want exactly 2 command line arguments: <plugin.nim> <executable>")
+    else:
+      buildPlugin(config, args[0], args[1])
+      result = 0
   of Idetools:
     if args.len == 0:
-      quit "want more than 0 command line argument"
-    case config.toTrack.mode
-    of TrackUsages, TrackDef:
-      usages(args, config)
-    of TrackNone:
-      quit "no --track information provided"
+      result = exitWith("want more than 0 command line argument")
+    else:
+      case config.toTrack.mode
+      of TrackUsages, TrackDef:
+        usages(args, config)
+        result = 0
+      of TrackNone:
+        result = exitWith("no --track information provided")
 
 when isMainModule:
-  handleCmdLine()
+  let exitCode = runNimsem(commandLineParams())
   storeFlush()
   when defined(prepMutStats):
     stderr.writeLine "[prepMutStats] fast=", cowFastCount,
@@ -201,3 +226,4 @@ when isMainModule:
       " slowBytes=", cowSlowBytes,
       " cmdline=", commandLineParams().join(" ")
   dumpVfsProfile("nimsem")
+  if exitCode != 0: quit exitCode

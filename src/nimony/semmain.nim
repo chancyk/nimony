@@ -20,7 +20,10 @@ import std / [tables, sets, syncio, assertions, hashes]
 from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / [symparser, nifindexes, docpaths]
+import ".." / lib / [symparser, nifindexes, docpaths, ledger]
+from ".." / lib / nifcoreparse import parse
+from ".." / lib / filelinecache import resetFileLineCache
+from identstyle import resetStyleTables
 import ".." / gear2 / modnames
 import ".." / models / nifindex_tags
 import nimony_model, symtabs, builtintypes, decls, programs, sigmatch, conceptcache,
@@ -66,7 +69,7 @@ proc buildIndexExports(c: var SemContext): TokenBuf =
         result.addIdent(s, NoLineInfo)
       result.addParRi()
 
-proc writeNewDepsFile(c: var SemContext; outfile: string) =
+proc buildDepsFile(c: var SemContext): TokenBuf =
   # Update .s.deps.nif file that doesn't contain modules imported under `when false:`
   # so that Hexer and following phases doesn't read such modules.
   var deps = createTokenBuf(16)
@@ -107,8 +110,7 @@ proc writeNewDepsFile(c: var SemContext; outfile: string) =
       deps.buildTree TagId(DependencyIdx), NoLineInfo:
         for f in c.fileDeps:
           deps.addStrLit f
-  let depsFile = changeModuleExt(outfile, ".s.deps.nif")
-  onRaiseQuit writeFile(deps, depsFile, OnlyIfChanged)
+  result = ensureMove deps
 
 proc pruneMatchedForwardDecls(c: var SemContext; dest: var TokenBuf) =
   ## Overwrite `(proc :sym ...)` subtrees with DotTokens for every symbol
@@ -134,7 +136,20 @@ proc pruneMatchedForwardDecls(c: var SemContext; dest: var TokenBuf) =
     else:
       inc i
 
-proc writeOutput(c: var SemContext; dest: var TokenBuf; outfile: string) =
+type
+  SemOutputs* = object
+    ## Everything a semantic check produces, before a file is touched: the
+    ## `.s.nif` as tokens (what an in-process consumer wants) and as the exact
+    ## bytes that go on disk, what the `.s.idx.nif` is built from, and the
+    ## `.s.deps.nif` as tokens. `writeOutputs` is the only thing between this
+    ## and the three files the path-based `semcheck` leaves behind.
+    code*: TokenBuf
+    text*: string
+    sections*: IndexSections
+    deps*: TokenBuf
+    ok*: bool   ## false when sem reported errors; the buffers are then empty
+
+proc buildOutputs(c: var SemContext; dest: var TokenBuf; outfile: string): SemOutputs =
   pruneMatchedForwardDecls(c, dest)
   # Insert `(import (kv suffix "path") …)` at the beginning of the (stmts ...)
   # so the hexer sees it before any executable code. The path is paired with
@@ -175,13 +190,39 @@ proc writeOutput(c: var SemContext; dest: var TokenBuf; outfile: string) =
           else:
             echo "  [", k, "] ", tk.kind
         break
-  onRaiseQuit writeFile(dest, outfile, OnlyIfChanged)
-  let root = readonlyCursorAt(dest, 0).info
-  onRaiseQuit createIndex(outfile, root, true,
-    IndexSections(
-      converters: move c.converterIndexMap,
-      exportBuf: buildIndexExports(c)))
-  writeNewDepsFile c, outfile
+  # The module is rendered here and nowhere else: these are the bytes the
+  # `.s.nif` gets, and the bytes an in-process consumer would spill.
+  result = SemOutputs(ok: true)
+  result.text = renderModule(dest, outfile)
+  result.sections = IndexSections(
+    converters: move c.converterIndexMap,
+    exportBuf: buildIndexExports(c))
+  result.deps = buildDepsFile(c)
+  result.code = move dest
+
+proc indexBytes*(o: var SemOutputs; outfile: string): string =
+  ## The `.s.idx.nif` for a module that never reaches a file. Consumes
+  ## `o.sections`, so call it at most once — and note that `writeOutputs`
+  ## does NOT go through here: on the file path the module is written first
+  ## and `createIndex` reads it back, which is what nimsem has always done.
+  ## That read is the only place in a small build where a process reads a
+  ## file it wrote itself, and `tests/nifcache` counts it to prove
+  ## `--vfs:verify` is not a no-op. Removing it is what running the phase
+  ## in-process buys; it is not a change of behaviour on the file path.
+  indexContent(outfile, o.text, true, move o.sections)
+
+proc writeOutputs*(o: var SemOutputs; outfile: string) =
+  ## Put a module's outputs where the rest of the pipeline (hexer, an importing
+  ## nimsem, nifmake's staleness check) expects to find them: the same three
+  ## writes in the same order as before A2a, `createIndex`'s read-back included.
+  onRaiseQuit writeRendered(outfile, o.text, OnlyIfChanged)
+  onRaiseQuit createIndex(outfile, readonlyCursorAt(o.code, 0).info, true,
+                          move o.sections)
+  onRaiseQuit writeFile(o.deps, changeModuleExt(outfile, ".s.deps.nif"), OnlyIfChanged)
+
+proc writeOutput(c: var SemContext; dest: var TokenBuf; outfile: string) =
+  var o = buildOutputs(c, dest, outfile)
+  writeOutputs o, outfile
 
 proc dbgCheckSeals*(dest: TokenBuf; label: string) =
   ## `-d:sealCheck` debugging aid: report inconsistent seals per phase.
@@ -454,7 +495,10 @@ proc reorderInnerGenericInstances(c: SemContext; dest: var TokenBuf) =
 
 func hasPendingPlugins(c: SemContext): bool {.inline.} = c.pendingTypePlugins.len != 0 or c.pendingModulePlugins.len != 0
 
-proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
+proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor): bool =
+  ## False when errors were reported; they are already on stderr, so the
+  ## caller's only job is to give up. (A tool that `quit`s here cannot be
+  ## called twice in one process — `JIT.md` 6.1.)
   c.currentScope = Scope(tab: initTable[StrId, seq[Sym]](), kind: ToplevelScope)
 
   assert n0.stmtKind == StmtsS
@@ -529,9 +573,10 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
     when true: #defined(enableContracts):
       var moreErrors = analyzeContractsFinalIr(dest, c.thisModuleSuffix, c.features, c.g.config.bits, c.g.config.verbose)
       if reporters.reportErrors(moreErrors) > 0:
-        quit 1
+        return false
+    result = true
   else:
-    quit 1
+    result = false
 
 proc addIfAbsent[T](s: var seq[T]; x: T) =
   for y in s:
@@ -581,8 +626,9 @@ proc initSemContext(suffix: string; config: ProgramContext; moduleFlags: set[Mod
   for magic in ["typeof", "compiles", "defined", "declared"]:
     result.unoverloadableMagics.incl(pool.strings.getOrIncl(magic))
 
-proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf) =
+proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf): bool =
   ## Post-processing after phase3: generics, contracts, derefs.
+  ## False when errors were reported (see `semcheckCore`).
   if c.expanded.len > 0:
     dest.addParLe CommentS, readonlyCursorAt(c.expanded, 0).info
     dest.add c.expanded
@@ -605,7 +651,7 @@ proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf) =
     when true:
       var moreErrors = analyzeContractsFinalIr(afterSem, c.thisModuleSuffix, c.features, c.g.config.bits, c.g.config.verbose)
       if reporters.reportErrors(moreErrors) > 0:
-        quit 1
+        return false
     if c.genericInnerProcs.len > 0:
       reorderInnerGenericInstances(c, afterSem)
     if c.hasPendingPlugins:
@@ -613,10 +659,11 @@ proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf) =
     else:
       var finalBuf = beginRead afterSem
       dest = injectDerefs(finalBuf, c.typeHooks, c.classes, c.thisModuleSuffix, c.g.config.bits)
+    result = true
   else:
-    quit 1
+    result = false
 
-proc maybeValidatePostSem(dest: var TokenBuf; moduleName: string) =
+proc maybeValidatePostSem(dest: var TokenBuf; moduleName: string): bool =
   ## Validate that `dest` conforms to the post-sem subset of `doc/tags.md`.
   ## Reports violations on stderr and aborts with a non-zero exit status so
   ## that drift from the spec is a hard error. Active by default in host-Nim
@@ -624,6 +671,7 @@ proc maybeValidatePostSem(dest: var TokenBuf; moduleName: string) =
   ## (`phase_validator.nim` / `tags_grammar.nim`) compiles under nimony.
   ## `-d:skipPostSemValidator` opts out (used by Windows CI — see hastur's
   ## `validatePassesFlag`).
+  result = true
   when not defined(nimony) and not defined(skipPostSemValidator):
     let phase = postSemPhase()
     let violations = validate(dest, phase)
@@ -632,12 +680,13 @@ proc maybeValidatePostSem(dest: var TokenBuf; moduleName: string) =
         $violations.len & " violation(s)" &
         (if violations.len >= 200: " (truncated)" else: "") & ":"
       discard reportViolations(phase.name, violations)
-      quit 1
+      result = false
 
 proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
                         moduleFlags: set[ModuleFlag];
-                        commandLineArgs: string; canSelfExec: bool) =
+                        commandLineArgs: string; canSelfExec: bool): bool =
   ## Semantic check multiple modules that form a cycle group.
+  ## False when errors were reported (see `semcheckCore`).
   ## All modules are processed through each phase together:
   ## phase1(all) -> resolve cyclic imports -> phase2(all) ->
   ## resolve cyclic imports -> phase3(all).
@@ -700,45 +749,125 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
 
   # Post-processing and output for each module
   for i in 0..<modules.len:
-    semcheckPostProcess modules[i].c, modules[i].dest
+    if not semcheckPostProcess(modules[i].c, modules[i].dest):
+      return false
     if reportErrors(modules[i].dest) == 0:
-      maybeValidatePostSem modules[i].dest, modules[i].outfile
+      if not maybeValidatePostSem(modules[i].dest, modules[i].outfile):
+        return false
       writeOutput modules[i].c, modules[i].dest, modules[i].outfile
     else:
-      quit 1
+      return false
+  result = true
 
-proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFlags: set[ModuleFlag];
-               commandLineArgs: sink string; canSelfExec: bool) =
-  ## Semantic check one or more modules.
-  ## For single modules (len=1), this is the normal case.
-  ## For multiple modules, they form a cycle group and are processed together.
-  assert infiles.len == outfiles.len
-  assert infiles.len > 0
+proc resetFrontendGlobals*() =
+  ## Put the frontend back where it was at process start, so the next module
+  ## sem'd in this process cannot see anything the previous one left behind
+  ## (`JIT.md` 6.1: in-process phases run sequentially and reset on entry).
+  ##
+  ## Every process-global `var` the frontend owns is reset here:
+  ##
+  ## * `nifpools.pool` and `nifpools.globalTags`, plus the
+  ##   `nifcore.fallbackPool`/`fallbackTags` pointers into them
+  ##   (`nifpools.resetPools`). Interned ids are what end up in the `.s.nif`,
+  ##   so this is what keeps a module's output independent of what was
+  ##   compiled before it.
+  ## * `programs.prog` — the module cache, the main module and every published
+  ##   toplevel entry (`programs.resetProgram`). Its keys are ids of the pool
+  ##   above, so it must go with it.
+  ## * `identstyle.styleGroups`, `identstyle.styleHighWaterMark` and
+  ##   `identstyle.pragmaStyleIndex` (`identstyle.resetStyleTables`). The
+  ##   watermark is an index into `pool.strings` and would point past the end
+  ##   of a fresh pool.
+  ## * `filelinecache.gFileLineCache` — file contents cached for diagnostics,
+  ##   keyed by path, so a re-read of an edited file quotes the new source.
+  ##
+  ## Not reset, deliberately: `artifactstore`'s store and the `vfs` relays
+  ## (process-wide policy from `--vfs`, with its own `uninstallArtifactStore`),
+  ## `toolhash`'s cached hash (process identity), and nifler's parser state
+  ## (`nifler.resetNiflerGlobals`, which owns nothing of ours).
+  resetPools()
+  resetProgram()
+  resetStyleTables()
+  resetFileLineCache()
 
-  if infiles.len > 1:
-    semcheckCycleGroup(infiles, outfiles, ensureMove config, moduleFlags,
-                       commandLineArgs, canSelfExec)
-    return
+proc loadInput*(infile: string; timer: var PhaseTimer): TokenBuf =
+  ## The module's `.p.nif` as tokens, with the read and the parse timed apart.
+  ## Same reader settings as `programs.setupProgram` used to use inline; the
+  ## reader is closed here rather than kept alive in `prog.mods`, because
+  ## nothing index-jumps into the module being compiled.
+  var r = nifreader.open(infile)
+  discard nifreader.processDirectives(r)
+  timer.noteLoad()
+  result = createTokenBuf(300)
+  nifcoreparse.parse(r, result, denseLineInfo = true)
+  nifreader.close(r)
+  timer.noteParse()
 
-  let infile = infiles[0]
-  let outfile = outfiles[0]
-
-  var owningBuf = createTokenBuf(300)
-  var n0 = setupProgram(infile, outfile, owningBuf)
+proc semcheckToBuf*(input: var TokenBuf; infile, outfile: string; config: sink NifConfig;
+                    moduleFlags: set[ModuleFlag]; commandLineArgs: sink string;
+                    canSelfExec: bool; timer: var PhaseTimer): SemOutputs =
+  ## Semantic check ONE module whose `.p.nif` the caller already holds, and
+  ## hand back its three outputs without touching a file (`JIT.md` 6.1).
+  ##
+  ## `input` must have been parsed against the pool that is current now, and
+  ## the process must not have checked another module since the last
+  ## `resetFrontendGlobals`. Imported modules are still read from their
+  ## `.s.nif`/`.s.idx.nif` by `programs.load`: the buffer level is the phase's
+  ## own input and outputs, not yet its dependencies (`notes/a2a-front.md`).
+  var n0 = setupProgramFromBuf(infile, outfile, input)
   if SkipSystem in moduleFlags:
     programs.publishStringType()
   var c = initSemContext(prog.main.name, ProgramContext(config: config),
                          moduleFlags, commandLineArgs, canSelfExec)
 
   var dest = createTokenBuf()
-
+  var ok = true
   while true:
-    semcheckCore c, dest, n0
-    if not c.hasPendingPlugins: break
+    ok = semcheckCore(c, dest, n0)
+    if not ok or not c.hasPendingPlugins: break
     handleTypePlugins c, dest
 
-  if reportErrors(dest) == 0:
-    maybeValidatePostSem dest, outfile
-    writeOutput c, dest, outfile
+  if ok and reportErrors(dest) == 0 and maybeValidatePostSem(dest, outfile):
+    timer.noteProduce()
+    result = buildOutputs(c, dest, outfile)
+    timer.noteSerialize()
   else:
+    timer.noteProduce()
+    result = SemOutputs(ok: false)
+
+proc semcheckToFiles*(infiles, outfiles: seq[string]; config: sink NifConfig;
+                      moduleFlags: set[ModuleFlag]; commandLineArgs: sink string;
+                      canSelfExec: bool; timer: var PhaseTimer): bool =
+  ## Semantic check one or more modules and leave the results on disk.
+  ## For single modules (len=1), this is the normal case: load, parse, sem,
+  ## serialize and write are separate steps here, and `semcheckToBuf` is the
+  ## middle one. For multiple modules, they form a cycle group and are
+  ## processed together; that path stays file-based (`writeOutput` per member)
+  ## because the group's members are written as a unit.
+  ##
+  ## False when errors were reported; they are already on stderr.
+  assert infiles.len == outfiles.len
+  assert infiles.len > 0
+
+  if infiles.len > 1:
+    result = semcheckCycleGroup(infiles, outfiles, ensureMove config, moduleFlags,
+                                commandLineArgs, canSelfExec)
+    timer.noteProduce()
+    return
+
+  var input = loadInput(infiles[0], timer)
+  var o = semcheckToBuf(input, infiles[0], outfiles[0], ensureMove config, moduleFlags,
+                        commandLineArgs, canSelfExec, timer)
+  if not o.ok: return false
+  writeOutputs o, outfiles[0]
+  timer.noteWrite()
+  result = true
+
+proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFlags: set[ModuleFlag];
+               commandLineArgs: sink string; canSelfExec: bool) =
+  ## `semcheckToFiles` for a caller that keeps no cost ledger and treats a
+  ## reported error as the end of the process.
+  var timer = initPhaseTimer("", "", "")
+  if not semcheckToFiles(infiles, outfiles, ensureMove config, moduleFlags,
+                         commandLineArgs, canSelfExec, timer):
     quit 1
