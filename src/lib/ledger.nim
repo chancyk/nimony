@@ -355,8 +355,11 @@ proc parseLedgerText(l: var Ledger; content: string) =
     else:
       discard "the `ns` unit marker and anything a later version adds"
 
-proc readLedgerFile(l: var Ledger; path: string) =
-  if vfsExists(path):
+proc readLedgerFile(l: var Ledger; path: string): bool {.discardable.} =
+  ## True when the file was there. One open instead of a stat plus an open:
+  ## this runs once in every tool process of every build.
+  result = vfsExists(path)
+  if result:
     parseLedgerText(l, vfsRead(path))
 
 # --- fragments -------------------------------------------------------------
@@ -391,10 +394,15 @@ proc writeFragment*(dir: string; key: LedgerKey; s: LedgerSample;
   ## Fold one measurement into this key's fragment and publish it. Reading the
   ## previous fragment back is what makes `samples` and the average survive
   ## across runs even when `ledger.nif` has not been written yet.
-  var l = openFragment(dir, key)
+  let p = fragmentPath(dir, key)
+  var l = Ledger(path: p, entries: @[], current: toolhash, dirty: false)
+  # Whether the fragment was there also answers whether its directory is, so
+  # the steady state pays for no `createDir` path walk. This runs in every tool
+  # process of every build; the syscalls are the whole cost.
+  let existed = readLedgerFile(l, p)
   record(l, key, s, toolhash)
-  ensureDir(fragmentDir(dir))
-  writeLedgerFile(l, l.path)
+  if not existed: ensureDir(fragmentDir(dir))
+  writeLedgerFile(l, p)
 
 proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
                   toolhash: string) =
@@ -402,7 +410,9 @@ proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
   ## deliberately not bumped: the spawn is an observation *about* the sample the
   ## tool itself recorded, not a second one. Provided for phase A1d, where
   ## nifmake knows the wall time of a command and the tool's own `produce`.
-  var l = openFragment(dir, key)
+  let p = fragmentPath(dir, key)
+  var l = Ledger(path: p, entries: @[], current: toolhash, dirty: false)
+  let existed = readLedgerFile(l, p)
   var pos = 0
   if find(l, key, pos) and l.entries[pos].toolhash == toolhash:
     l.entries[pos].ewma.spawnNs = ewmaStep(l.entries[pos].ewma.spawnNs, spawnNs)
@@ -411,8 +421,8 @@ proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
     var s = default(LedgerSample)
     s.spawnNs = spawnNs
     record(l, key, s, toolhash)
-  ensureDir(fragmentDir(dir))
-  writeLedgerFile(l, l.path)
+  if not existed: ensureDir(fragmentDir(dir))
+  writeLedgerFile(l, p)
 
 proc foldFragments(l: var Ledger; dir: string) =
   var files: seq[string] = @[]

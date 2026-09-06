@@ -1,0 +1,62 @@
+Phase A1a — cost ledger overhead
+macOS 26, M5, Nim 2.2.10, 2026-09-06
+branch jit/a1a (worktree .claude/worktrees/agent-abf9be02d6d62f886)
+baseline: fast-devloop @ 4fdfdbf4, built into /tmp/a1a_base
+
+Gate (JIT_IMPL.md A1a): ledger overhead <= 1 % of a forced hello-world build.
+
+Method
+------
+  hello.nim:  import std/syncio; echo "hello"        (3 lines, 4 modules)
+  command:    bin/nimony c -f --silentMake --nimcache:<own cache> hello.nim
+  Each toolchain gets its own nimcache, warmed with one cold build and one
+  forced build before timing. The nine timed runs alternate instrumented /
+  baseline so that thermal drift hits both equally.
+
+Result
+------
+forced hello-world build, `nimony c -f --silentMake` (s)
+run           instrumented   fast-devloop
+  1              0.418          0.417
+  2              0.419          0.421
+  3              0.421          0.418
+  4              0.421          0.415
+  5              0.419          0.416
+  6              0.423          0.416
+  7              0.419          0.418
+  8              0.420          0.417
+  9              0.421          0.415
+median           0.420          0.417
+overhead      +0.78 %   (+3.3 ms)
+
+A first attempt with three runs per side and no interleaving reported +2.43 %
+with a +/-40 ms spread; the number above is the one the machine reproduces once
+it is warm. The spread across the nine runs is 5 ms on either side.
+
+Where the 3.3 ms goes
+---------------------
+Per-process microbenchmark of the pieces (1000 iterations each, release build,
+same machine, APFS):
+
+  ledger.writeFragment (read + fold + write) : 120.0 us
+    of which vfs.vfsWrite, 350 bytes         : 102.9 us
+              vfs.vfsRead, 350 bytes         :   7.9 us
+              vfs.vfsExists                  :   0.8 us
+              os.createDir on an existing dir:   4.6 us
+  ledger.toolhash(), cached                  :   0.008 us
+
+So the cost of the ledger is one atomic 350-byte file per tool process, and
+almost all of it is the temp-file-plus-rename that `vfsWrite` already performs.
+A forced hello-world build runs 47 instrumented nodes (nifler 30, nimsem 4,
+hexer 4, dceLive 1, dceEmit 4, lengc 4), i.e. 5.6 ms of serial work; 3.3 ms of
+that shows up on the wall clock because nifmake runs the tools in parallel.
+
+Two cheap savings are already in: the fragment's own presence answers whether
+its directory exists, so the steady state pays for no `createDir` path walk,
+and the read is one `vfsExists` plus one `vfsRead` rather than a stat per
+field. What is left is the atomic write itself; A1b's ArtifactStore is where a
+cheaper publish would come from.
+
+Scaling note: the overhead is per tool process, not per byte, so it shrinks as
+a share of the build as modules get bigger. A forced hello world is the worst
+case the gate could have picked.
