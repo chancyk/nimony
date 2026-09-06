@@ -232,7 +232,7 @@ const
     ## `.final2.build.nif`, `.doc.build.nif` and `.exec.build.nif` because they
     ## all end in it.
 
-  crossProcessDirs* = ["ocache", "ledger"]
+  crossProcessDirs* = ["ocache", ".ledger"]
     ## Directory names under a nimcache whose whole contents outlive the
     ## process: P0b's content-addressed object cache and A1a's cost ledger are
     ## both read by the *next* run.

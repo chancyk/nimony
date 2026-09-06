@@ -150,10 +150,17 @@ proc artifactSnapshot(cache: string): Table[string, string] =
   ## Every `.nif` under `cache`, keyed by its path relative to `cache`. The
   ## bytes rather than a digest: a difference has to be reportable, and these
   ## caches are a few hundred small files.
+  ## The cost ledger (`.ledger/*.nif`, `ledger.nif`) is excluded: it holds
+  ## the timings of the run that wrote it, which differ between any two runs
+  ## by construction and say nothing about the VFS mode.
   result = initTable[string, string]()
   for path in walkDirRec(cache):
     if path.endsWith(".nif"):
-      result[path.relativePath(cache)] = readFile(path)
+      let rel = path.relativePath(cache)
+      if rel.startsWith(".ledger") or rel.contains(DirSep & ".ledger" & DirSep) or
+          rel.endsWith("ledger.nif"):
+        continue
+      result[rel] = readFile(path)
 
 proc compileUnder(mode, cache, src: string; output: var string): bool =
   ## One `nimony c` into a freshly wiped `cache`. `NIMONY_VFS_STATS` makes
