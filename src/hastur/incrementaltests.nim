@@ -291,3 +291,109 @@ proc incrementalTests*() =
   echo "incremental: ", phases, " / ", phases, " phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."
   echo "SUCCESS."
+
+# ---- Compile-time-eval object cache ---------------------------------------
+# Every `const` that `expreval` cannot fold costs a whole sub-program, and
+# almost all of it is the `std/writenif` stdlib closure -- the same modules for
+# every sub-program in the same nimcache. `deps.buildGraph` therefore routes a
+# sub-program's non-main objects through the content-addressed
+# `<nimcache>/ocache/`. These phases assert that the second program's
+# sub-compile really reuses the first one's objects rather than recompiling
+# them into its own backend directory.
+
+proc ocacheObjects(cache: string): seq[(string, Time)] =
+  ## `(path, mtime)` of every object in the content-addressed cache, sorted.
+  ## An entry's path IS its identity, so a second build that adds no path and
+  ## touches no mtime did not run `cc` for any module it shares.
+  result = @[]
+  for f in walkFiles(cache / "ocache" / "*.o"):
+    result.add (f, getLastModificationTime(f))
+  sort result
+
+proc evalSubProgramDirs(cache: string): seq[string] =
+  ## Backend directories of compile-time-eval sub-programs.
+  ## `semos.runProgram` builds `<sfx>.p.nif` and runs
+  ## `<cache>/<sfx>/<sfx>.p`, so that executable's name is what separates a
+  ## sub-program's directory from an ordinary module's.
+  result = @[]
+  for kind, dir in walkDir(cache):
+    if kind != pcDir: continue
+    let name = dir.lastPathPart
+    if fileExists(dir / (name & ".p")):
+      result.add name
+  sort result
+
+proc countObjects(dir: string): int =
+  result = 0
+  for f in walkFiles(dir / "*.o"): inc result
+
+proc incrementalOCacheTests*() =
+  ## Compile two modules that each need a compile-time-eval sub-program into
+  ## one nimcache and assert the second one's sub-compile reused the first's
+  ## objects. The inner `nimony s` runs under `execCmdEx` and never sees
+  ## `--report`, so the assertions are on the cache directory itself.
+  let t0 = epochTime()
+  let srcA = "tests/incremental/ctfe_ocache_a.nim"
+  let srcB = "tests/incremental/ctfe_ocache_b.nim"
+  let cache = "nimcache" / "ctfe_ocache"
+  let nimony = "bin" / "nimony".addFileExt(ExeExt)
+  for f in [srcA, srcB]:
+    if not fileExists(f):
+      quit "ctfe-ocache: " & f & " missing"
+  if not fileExists(nimony):
+    quit "ctfe-ocache: " & nimony & " not found; run `hastur build nimony` first"
+  removeDir cache
+
+  var failures: seq[string] = @[]
+  template expect(cond: bool; msg: string) =
+    if not (cond): failures.add msg
+
+  proc run(src, label: string): string =
+    # `-r` so the program also runs: a wrongly reused object would either fail
+    # to link or produce the wrong number.
+    let cmd = nimony.quoteShell & " c -r --silentMake --nimcache:" &
+              cache.quoteShell & " " & src.quoteShell
+    let (output, ec) = execCmdEx(cmd)
+    if ec != 0:
+      stdout.write output
+      quit "ctfe-ocache: '" & label & "' compile failed"
+    result = output
+
+  # Phase 1: cold. The sub-program's non-main modules land in the cache.
+  let outA = run(srcA, "cold-a")
+  expect outA.contains("49"), "cold-a: expected the program to print 49, got: " & outA
+  let cachedA = ocacheObjects(cache)
+  expect cachedA.len > 0,
+         "cold-a: <nimcache>/ocache/ holds no objects; the sub-program's " &
+         "objects were not content-addressed at all"
+  let subDirsA = evalSubProgramDirs(cache)
+  expect subDirsA.len == 1,
+         "cold-a: expected 1 compile-time-eval sub-program, got " & $subDirsA.len
+
+  # Phase 2: a second program with a different `const`. Its sub-program shares
+  # every non-main module with the first one, so nothing new may be compiled:
+  # no new cache entry, no touched mtime, and one object (the main module) in
+  # the sub-program's own backend directory.
+  let outB = run(srcB, "cold-b")
+  expect outB.contains("27"), "cold-b: expected the program to print 27, got: " & outB
+  let cachedB = ocacheObjects(cache)
+  expect cachedB == cachedA,
+         "cold-b: the object cache changed (" & $cachedA.len & " -> " &
+         $cachedB.len & " entries, or an mtime moved); the second sub-program " &
+         "recompiled modules the first one had already cached"
+  let subDirsB = evalSubProgramDirs(cache)
+  expect subDirsB.len == 2,
+         "cold-b: expected 2 compile-time-eval sub-programs, got " & $subDirsB.len
+  for d in subDirsB:
+    if d in subDirsA: continue
+    let n = countObjects(cache / d)
+    expect n <= 1,
+           "cold-b: the second sub-program compiled " & $n &
+           " objects of its own; only its main module may be left"
+
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "ctfe-ocache: " & f
+    quit "FAILURE: " & $failures.len & " ctfe-ocache phase(s) failed."
+  echo "ctfe-ocache: 2 / 2 phases successful in ",
+       formatFloat(dt, ffDecimal, precision=2), "s."

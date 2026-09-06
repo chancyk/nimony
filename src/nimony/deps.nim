@@ -21,6 +21,7 @@ import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, forma
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs]
+from ".." / lib / nifchecksums import computeChecksum
 import ".." / models / nifindex_tags
 
 include ".." / lib / nifprelude
@@ -263,6 +264,16 @@ type
     bundles: seq[Bundle]
     passL: seq[string]
     passC: seq[string]
+    ocache: Table[string, string] ## modname -> `<nimcache>/ocache/<hash>`, the
+                                  ## content-addressed basename of that module's
+                                  ## `.o` (and of the `.c` kept beside it).
+                                  ## Empty for every build except a
+                                  ## compile-time-eval sub-program; see
+                                  ## `fillObjectCache`.
+    ocacheHit: HashSet[string]    ## the subset of `ocache` whose object was
+                                  ## already on disk when the graph was emitted,
+                                  ## so its `lengc` and `cc` nodes are left out
+                                  ## of the graph entirely.
 
 proc toPair(c: DepContext; f: string): FilePair =
   if f.endsWith(".nif"):
@@ -1046,8 +1057,178 @@ proc addInlineSourceInputs(b: var Builder; c: DepContext; v: Node; backend: stri
       b.withTree "input":
         b.addStrLit depNif
 
-proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, passL: string): string =
-  result = c.config.nifcachePath / c.rootNode.files[0].modname & ".final.build.nif"
+proc ccCmdTokens(c: DepContext; passC: string; nativeSysLink: bool;
+                 sysLinker: string): seq[string] =
+  ## The leading, invocation-independent tokens of the `cc` command: the driver
+  ## plus every flag that does not depend on which file is being compiled.
+  ## `generateFinalBuildFile` emits them into the `(cmd :cc …)` tree and
+  ## `fillObjectCache` folds them into the object cache key, so the key can
+  ## never disagree with the command it stands for.
+  result = @[]
+  var ccProgram = c.config.cc
+  if c.config.backend == backendLLVM:
+    ccProgram = "clang"
+  elif nativeSysLink:
+    # Compiles the `.compile`d TUs (e.g. Objective-C `.m`); same driver
+    # that links them, so the toolchain/ABI matches.
+    ccProgram = sysLinker
+  result.add ccProgram
+  result.add "-c"
+  # Suppress visibility-attribute warnings from mimalloc etc. (GCC/Clang)
+  result.add "-Wno-attributes"
+  # gcc-14 on arm64/Linux emits a stringop-overflow false positive
+  # ("writing 8 bytes into a region of size 0 ... destination object is
+  # likely at address zero") from inlined refcount updates on paths the
+  # optimizer itself proved unreachable. Same policy as #2168: silence
+  # GCC's overreach instead of contorting the codegen. Real GCC only:
+  # clang has no such warning name and would spam
+  # `-Wunknown-warning-option` into every tracked test output — and on
+  # macOS `gcc` IS clang, so gate on the target OS as well.
+  if extractCCKey(ccProgram) != "clang" and
+      c.config.targetOS notin {osMacosx, osIos}:
+    result.add "-Wno-stringop-overflow"
+  # Note on TLS for clang/Windows: clang emits native PE TLS by default,
+  # which is what we want — `__thread` access compiles to a single
+  # `gs:0x58` load instead of a `__emutls_get_address` call. ld.bfd
+  # (mingw-w64's default linker) mishandles this and produces binaries
+  # that segfault on first TLS access; we paper over that at link time
+  # by switching to LLD, see the link cmd below. No `-femulated-tls`
+  # here.
+  # Add -fPIC for shared libraries
+  if c.config.appType == appLib:
+    result.add "-fPIC"
+  # Optimization level. Even the default ("debug") gets -O1: in
+  # practice it produces code that's just as easy to step through
+  # as -O0, while letting the C compiler skip the truly silly
+  # codegen patterns (per-statement spills, dead stores, etc.).
+  case c.config.optLevel
+  of optDebug: result.add "-O1"
+  of optNone:  result.add "-O0"
+  of optSize:  result.add "-Os"
+  of optSpeed: result.add "-O3"
+  if passC.len > 0:
+    for arg in passC.split(' '):
+      if arg.len > 0:
+        result.add arg
+  for i in c.passC:
+    result.add i
+  if c.config.backend == backendC:
+    result.add "-I" & rootPath(c)
+
+type
+  FinalPhase = enum
+    ## Which slice of the backend build graph `generateFinalBuildFile` emits.
+    fpWhole    ## everything, in one graph: what every ordinary build uses
+    fpAnalysis ## hexer + split DCE only; stops before codegen, so the `.c.nif`
+               ## files exist when the second graph is emitted
+    fpCodegen  ## the whole graph again, now with the object cache resolved
+
+proc ocacheDir(config: NifConfig): string =
+  ## The content-addressed object cache of the compile-time-eval sub-programs.
+  ## It lives *inside* the build cache, so `--nimcache:<dir>` scopes it and
+  ## deleting `nimcache/` (`hastur clean`) is all the eviction there is.
+  config.nifcachePath / "ocache"
+
+proc ocacheBase(c: DepContext; f: FilePair): string =
+  ## `<nimcache>/ocache/<hash>` for a module whose object is cached, else "".
+  c.ocache.getOrDefault(f.modname, "")
+
+proc ocacheHitFor(c: DepContext; f: FilePair): bool =
+  ## True when this module's object is already in the cache. Its `lengc` and
+  ## `cc` nodes are then not emitted at all: the path is content-addressed, so
+  ## an existing entry IS the right object, and nifmake -- which decides
+  ## staleness from mtimes -- would otherwise rebuild it on every sub-program
+  ## (the freshly written `.c.nif` is always newer than a cached object).
+  c.ocacheHit.contains(f.modname)
+
+proc objFileOf(c: DepContext; f: FilePair; backend: string): string =
+  ## On a cache hit the link consumes the shared object directly. On a miss the
+  ## module is compiled to its usual place and published into the cache
+  ## afterwards (`publishObjectCache`), so no build tool ever writes into
+  ## `ocache/` -- see the concurrency note there.
+  if ocacheHitFor(c, f): ocacheBase(c, f) & ".o"
+  else: c.config.objFile(f, backend)
+
+proc fillObjectCache(c: var DepContext; backend, commandLineArgsLengc, passC: string) =
+  ## Give every non-main module of a compile-time-eval sub-program a
+  ## content-addressed `.c`/`.o` basename under `<nimcache>/ocache/`.
+  ##
+  ## This runs between the two backend graphs, so the `fpAnalysis` graph has
+  ## just written every `.c.nif` and the digest can cover the actual Leng IR
+  ## instead of the inputs it was derived from. That distinction is the whole
+  ## point: the DCE live set depends on the main module, so two sub-programs
+  ## agree on a module's object exactly when they agree on its `.c.nif`, and
+  ## the inputs cannot tell us that.
+  ##
+  ## The main module (`c.nodes[0]`) is never cached: a sub-program's main
+  ## suffix is a checksum of the evaluated expression, so its object is unique
+  ## by construction.
+  let dir = ocacheDir(c.config)
+  onRaiseQuit createDir(path(dir))
+  # Everything that is the same for every module of this build: the codegen
+  # and cc command lines, and a stamp of the tools that produce the artifacts.
+  var common = "lengc\n" & $c.config.backend & "\n" & $c.config.bits & "\n" &
+               commandLineArgsLengc & "\ncc\n"
+  # The very tokens the `(cmd :cc …)` tree is emitted from. A compile-time-eval
+  # sub-program is always the plain C backend with no `.compile`d TUs, so the
+  # `nativeSysLink` driver override cannot apply here.
+  for tok in ccCmdTokens(c, passC, false, ""):
+    common.add tok
+    common.add "\n"
+  common.add "tools\n"
+  common.add $getLastModTime(findTool("lengc"))
+  common.add "\n"
+  common.add $getLastModTime(findTool("hexer"))
+  common.add "\n"
+  for i in 1 ..< c.nodes.len:
+    let v = c.nodes[i]
+    # The inputs of this module's `lengc` node: its own Leng IR plus every
+    # imported module's, out of which lengc splices `.inline` bodies (see
+    # `addInlineSourceInputs`). All of them shape the generated `.c`.
+    var inputs = @[c.config.lengcFile(v.files[0], backend)]
+    for depIdx in v.deps:
+      inputs.add c.config.lengcFile(c.nodes[depIdx].files[0], backend)
+    var key = common
+    var seen = initHashSet[string]()
+    for f in inputs:
+      if not seen.containsOrIncl(f):
+        key.add splitModulePath(f).name
+        key.add "\n"
+        key.add onRaiseQuit(readFile(f))
+    let base = dir / computeChecksum(key)
+    c.ocache[v.files[0].modname] = base
+    if vfsExists(base & ".o"):
+      c.ocacheHit.incl v.files[0].modname
+
+proc publishObjectCache(c: DepContext; backend: string) =
+  ## Copy the objects this build had to compile into the content-addressed
+  ## cache, together with the C they were compiled from.
+  ##
+  ## nimony publishes rather than letting `cc` write into `ocache/` directly:
+  ## sub-compiles of the same outer build run concurrently, several of them can
+  ## land on one key, and `vfsWrite` goes through a temp file and an atomic
+  ## rename -- so a reader never sees a half-written object. The `.c` is
+  ## written first, so an entry that has an object also has its source.
+  for i in 1 ..< c.nodes.len:
+    let f = c.nodes[i].files[0]
+    let base = ocacheBase(c, f)
+    if base.len == 0 or c.ocacheHit.contains(f.modname): continue
+    let obj = c.config.objFile(f, backend)
+    let src = c.config.genFile(f, backend)
+    if not vfsExists(obj) or not vfsExists(src): continue
+    try:
+      vfsWrite(base & ".c", vfsRead(src))
+      vfsWrite(base & ".o", vfsRead(obj))
+    except:
+      discard  # the only consequence is a miss next time
+
+proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
+                            passC, passL: string;
+                            phase: FinalPhase = fpWhole): string =
+  var stem = ".final.build.nif"
+  if phase == fpAnalysis: stem = ".final1.build.nif"
+  elif phase == fpCodegen: stem = ".final2.build.nif"
+  result = c.config.nifcachePath / c.rootNode.files[0].modname & stem
   var b = nifbuilder.open(result)
   defer: b.close()
 
@@ -1155,55 +1336,8 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
     # Command for C/LLVM compiler (object files)
     b.withTree "cmd":
       b.addSymbolDef "cc"
-      var ccProgram = c.config.cc
-      if c.config.backend == backendLLVM:
-        ccProgram = "clang"
-      elif nativeSysLink:
-        # Compiles the `.compile`d TUs (e.g. Objective-C `.m`); same driver
-        # that links them, so the toolchain/ABI matches.
-        ccProgram = sysLinker
-      b.addStrLit ccProgram
-      b.addStrLit "-c"
-      # Suppress visibility-attribute warnings from mimalloc etc. (GCC/Clang)
-      b.addStrLit "-Wno-attributes"
-      # gcc-14 on arm64/Linux emits a stringop-overflow false positive
-      # ("writing 8 bytes into a region of size 0 ... destination object is
-      # likely at address zero") from inlined refcount updates on paths the
-      # optimizer itself proved unreachable. Same policy as #2168: silence
-      # GCC's overreach instead of contorting the codegen. Real GCC only:
-      # clang has no such warning name and would spam
-      # `-Wunknown-warning-option` into every tracked test output — and on
-      # macOS `gcc` IS clang, so gate on the target OS as well.
-      if extractCCKey(ccProgram) != "clang" and
-          c.config.targetOS notin {osMacosx, osIos}:
-        b.addStrLit "-Wno-stringop-overflow"
-      # Note on TLS for clang/Windows: clang emits native PE TLS by default,
-      # which is what we want — `__thread` access compiles to a single
-      # `gs:0x58` load instead of a `__emutls_get_address` call. ld.bfd
-      # (mingw-w64's default linker) mishandles this and produces binaries
-      # that segfault on first TLS access; we paper over that at link time
-      # by switching to LLD, see the link cmd below. No `-femulated-tls`
-      # here.
-      # Add -fPIC for shared libraries
-      if c.config.appType == appLib:
-        b.addStrLit "-fPIC"
-      # Optimization level. Even the default ("debug") gets -O1: in
-      # practice it produces code that's just as easy to step through
-      # as -O0, while letting the C compiler skip the truly silly
-      # codegen patterns (per-statement spills, dead stores, etc.).
-      case c.config.optLevel
-      of optDebug: b.addStrLit "-O1"
-      of optNone:  b.addStrLit "-O0"
-      of optSize:  b.addStrLit "-Os"
-      of optSpeed: b.addStrLit "-O3"
-      if passC.len > 0:
-        for arg in passC.split(' '):
-          if arg.len > 0:
-            b.addStrLit arg
-      for i in c.passC:
-        b.addStrLit i
-      if c.config.backend == backendC:
-        b.addStrLit "-I" & rootPath(c)
+      for tok in ccCmdTokens(c, passC, nativeSysLink, sysLinker):
+        b.addStrLit tok
       b.addKeyw "args"
       b.addKeyw "input"
       b.addStrLit "-o"
@@ -1390,7 +1524,12 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
 
       # Link executable
       var objFiles = initHashSet[string]()
-      if wasm:
+      if phase == fpAnalysis:
+        # The analysis graph stops after DCE: no codegen, no objects, nothing
+        # to link. The object cache is resolved from the `.c.nif` files this
+        # graph produces, and the `fpCodegen` graph does the rest.
+        discard
+      elif wasm:
         b.withTree "do":
           b.addIdent "ithaqua"
           proc wasmInput(c: DepContext; f: FilePair; backend: string; useOptimizer: bool): string =
@@ -1435,7 +1574,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
             let o = sharedObjFile(cfile)
             if not seenObjs.containsOrIncl(o): objs.add o
           for v in c.nodes:
-            let o = c.config.objFile(v.files[0], backend)
+            let o = objFileOf(c, v.files[0], backend)
             if not seenObjs.containsOrIncl(o): objs.add o
         var artifacts: seq[string] = @[]
         for bt in c.backendTools:
@@ -1448,7 +1587,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
         for o in objs:
           var ff: seq[string] = @[]
           for bt in c.backendTools:
-            if bt.linkFlags.len > 0 and c.config.objFile(bt.modFile, backend) == o:
+            if bt.linkFlags.len > 0 and objFileOf(c, bt.modFile, backend) == o:
               for fl in splitWhitespace(bt.linkFlags): ff.add fl
           mfiles.add ManifestFile(path: o, kind: "obj", flags: ff)
         for a in artifacts:
@@ -1559,8 +1698,9 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
                 b.addStrLit obj
 
       for i, v in pairs c.nodes:
-        if not native and not wasm:
-          let obj = c.config.objFile(v.files[0], backend)
+        if phase != fpAnalysis and not native and not wasm and
+            not ocacheHitFor(c, v.files[0]):
+          let obj = objFileOf(c, v.files[0], backend)
           if not objFiles.containsOrIncl(obj):
             b.withTree "do":
               b.addIdent "cc"
@@ -1593,7 +1733,10 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
         else:
           lengcInput = c.config.lengcFile(v.files[0], backend)
 
-        if wasm:
+        if phase == fpAnalysis or ocacheHitFor(c, v.files[0]):
+          discard  # the analysis graph stops before codegen (see above), and a
+                   # module whose object is already cached needs no C at all
+        elif wasm:
           discard  # no per-module codegen: ithaqua's single whole-program
                    # node (see "Link executable" above) consumes the .c.nif
         elif native:
@@ -2181,7 +2324,30 @@ proc buildGraph*(config: sink NifConfig; project: string;
     let backend = c.config.nifcachePath / c.config.backendDirName(c.rootNode.files[0])
     onRaiseQuit createDir(path(backend))
     onRaiseQuit createDir(path(sharedObjDir()))
-    let buildFinalFilename = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL)
+    # A compile-time-eval sub-program (`nimony s <sfx>.p.nif`, spawned by
+    # `semos.runProgram`) shares the outer nimcache with every other
+    # sub-program of the same compile, and 7 of its 8 modules are the stdlib
+    # closure of `std/writenif` -- byte-identical from one sub-program to the
+    # next, yet recompiled every time because each gets its own backend
+    # directory. Run the backend in two graphs for those: analysis first, then
+    # codegen with every non-main object resolved against the content-addressed
+    # `<nimcache>/ocache/`. Restricted to the plain C backend without the
+    # optimizer or custom `{.build.}`/`{.bundle.}` tools; anything else keeps
+    # the single graph and emits exactly the build file it emits today.
+    let useObjectCache = project.endsWith(".p.nif") and
+                         c.config.backend == backendC and
+                         c.config.optLevel notin {optSpeed, optSize} and
+                         c.backendTools.len == 0 and c.bundles.len == 0
+    if useObjectCache:
+      let analysisFile = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
+                                                fpAnalysis)
+      exec nifmakeCommand & progArg(flags, 50, 60) & quoteShell(analysisFile)
+      fillObjectCache(c, c.config.backendDirName(c.rootNode.files[0]),
+                      commandLineArgsLengc, passC)
+    var thisPhase = fpWhole
+    if useObjectCache: thisPhase = fpCodegen
+    let buildFinalFilename = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
+                                                    thisPhase)
     # second (backend) phase: 50..100%
     # Linkers (gcc/clang/ld/ar) don't auto-create the output directory.
     # When the user passes `--out:bin/foo` or `--outdir:bin`, materialise
@@ -2193,6 +2359,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
     if exeOutDir.len > 0:
       onRaiseQuit createDir(path(exeOutDir))
     exec nifmakeCommand & progArg(flags, 50, 100) & quoteShell(buildFinalFilename)
+    if useObjectCache:
+      publishObjectCache(c, c.config.backendDirName(c.rootNode.files[0]))
 
   if Stats in flags:
     # Walk every source module in the dep graph and sum line counts. Counting
