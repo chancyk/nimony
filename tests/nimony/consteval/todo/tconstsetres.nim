@@ -1,5 +1,9 @@
 import std/[syncio, assertions]
 
+# TODO: a `set` result crashes the serializer today —
+#   exprexec.nim(413, 13) `not err` [AssertionDefect]
+# from `unravelSet` (src/nimony/exprexec.nim:507). See README.md here.
+
 # A `set[T]` result. `unravelSet` does not copy the bitset: it emits a
 # `setconstr` and re-derives the members by testing every ordinal of the base
 # type against the value at run time in the sub-compile, so the size of the

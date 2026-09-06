@@ -1,5 +1,9 @@
 import std/[syncio, assertions]
 
+# TODO: an enum result crashes the serializer today —
+#   nifcore.nim(895, 3) `c.rem == 0` into: body did not consume all 14 children
+# from `unravelEnum` (src/nimony/exprexec.nim:535). See README.md here.
+
 # An enum result. `unravelEnum` does not go through the integer entry point:
 # it maps the value back to the *enum field symbol*, so the serialised NIF
 # names the field rather than its ordinal.
