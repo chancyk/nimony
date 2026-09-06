@@ -9,7 +9,7 @@
 
 import std / [parseopt, strutils, os, assertions, times]
 import bridge, configcmd
-import ".." / lib / [vfs, nimversion]
+import ".." / lib / [vfs, nimversion, ledger]
 
 include ".." / lib / compat2
 
@@ -77,7 +77,14 @@ proc handleCmdLine() =
           (not deps or (fileExists(depsNif) and getLastModificationTime(depsNif) > getLastModificationTime(inp))):
         discard "nothing to do"
       else:
+        # Cost ledger (JIT.md 5.2). nifler's load, parse, IR conversion and
+        # write all happen inside `parseFile`, so the whole call is the phase's
+        # `produce`; splitting it needs the buffer-level entry points of A2a.
+        var timer = initPhaseTimer(outp.parentDir, "nifler", moduleSuffixOf(outp))
         parseFile inp, outp, portablePaths, deps, action == "deps", preserveDocs
+        timer.noteProduce()
+        timer.noteOutput(outp)
+        timer.finish()
   of "config":
     if args.len == 0:
       quit "'config' command takes a filename"

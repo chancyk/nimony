@@ -45,7 +45,7 @@ Hexer accepts Nimony's grammar.
 import std / [parseopt, strutils, os, osproc, tables, assertions, syncio]
 import ".." / nimony / [langmodes, nifconfig]
 import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
-import ".." / lib / [vfs, nimversion]
+import ".." / lib / [vfs, nimversion, ledger]
 
 include ".." / lib / compat2
 
@@ -133,9 +133,18 @@ proc handleCmdLine*() =
   elif action.len == 0 or files.len == 0:
     writeHelp()
   else:
+    # Cost ledger (JIT.md 5.2): one fragment per (phase, module), written into
+    # the directory this invocation produces its artifacts in. The whole phase
+    # proc is `produce` -- load, serialize and write live inside it and only
+    # become separable with A2a's buffer-level entry points.
     case action
     of "c":
+      let dir = if outdir.len > 0: outdir else: files[0].parentDir
+      var timer = initPhaseTimer(dir, "hexer", moduleSuffixOf(files[0]))
       expand files[0], bits, bigEndian, flags, isMain, outdir, appType, native, isWindows
+      timer.noteProduce()
+      timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".x.nif")
+      timer.finish()
     of "d":
       deadCodeElimination(files, outdir)
     of "dl":
@@ -144,13 +153,22 @@ proc handleCmdLine*() =
       # `.live.nif`; all preceding arguments are the input `.dce.nif`s.
       if files.len < 2:
         quit "dl: expected <dce-file>... <live-output>"
+      var timer = initPhaseTimer(files[^1].parentDir, "dceLive", "")
       computeLiveSet(files.toOpenArray(0, files.len - 2), files[^1])
+      timer.noteProduce()
+      timer.noteOutput(files[^1])
+      timer.finish()
     of "de":
       # Per-module emit. Args: <M.x.nif> <main.live.nif>; outputs
       # <outdir>/<M>.c.nif.
       if files.len != 2:
         quit "de: expected <x.nif> <live.nif>"
+      let dir = if outdir.len > 0: outdir else: files[0].parentDir
+      var timer = initPhaseTimer(dir, "dceEmit", moduleSuffixOf(files[0]))
       dceEmit(files[0], files[1], outdir)
+      timer.noteProduce()
+      timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".c.nif")
+      timer.finish()
     else:
       writeHelp()
 

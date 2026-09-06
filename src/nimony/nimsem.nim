@@ -10,7 +10,7 @@ import std / [parseopt, sets, strutils, os, assertions, syncio]
 
 import ".." / gear2 / modnames
 import ".." / lib / [argsfinder, symparser, nifpools, nifreader,
-                     nifbuilder, nifindexes, tooldirs, vfs, nimversion]
+                     nifbuilder, nifindexes, tooldirs, vfs, nimversion, ledger]
 import semmain, sem, nifconfig, semos, semdata, indexgen, programs,
        derefs, deps, idetools, cli, langmodes
 
@@ -69,7 +69,16 @@ proc processModules(infiles: seq[string]; config: sink NifConfig;
     # Keeps the doc and code-gen caches separate so they don't trample each other.
     let outExt = if infile.endsWith(".pc.nif"): ".sc.nif" else: ".s.nif"
     outfiles.add infile.changeModuleExt(outExt)
+  # Cost ledger (JIT.md 5.2): the whole semantic check is this phase's
+  # `produce`; loading, serializing and writing happen inside `semcheck` and
+  # only become separable with A2a's buffer-level entry points. A cycle group
+  # is one sample keyed by its first module, with the bytes of all its outputs.
+  var timer = initPhaseTimer(outfiles[0].parentDir, "nimsem",
+                             moduleSuffixOf(outfiles[0]))
   semcheck(infiles, outfiles, ensureMove config, moduleFlags, commandLineArgs, false)
+  timer.noteProduce()
+  for outfile in outfiles: timer.noteBytes(fileSizeOrZero(outfile))
+  timer.finish()
 
 proc executeNif(files: seq[string]; config: sink NifConfig) =
   # file 0 is special as it is the main file. We need to run injectDerefs on it first.

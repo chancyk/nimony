@@ -20,7 +20,7 @@ when defined(nimony):
 import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths, algorithm]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
-import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs]
+import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs, ledger]
 from ".." / lib / nifchecksums import computeChecksum
 import ".." / models / nifindex_tags
 
@@ -2404,6 +2404,14 @@ proc buildGraph*(config: sink NifConfig; project: string;
           discard
     echo "[stats] ", nimFiles, " modules, ",
          totalLines, " LOC, ", totalBytes, " bytes"
+    # The cost ledger's per-phase table (JIT.md 5.2 "Report"): what each phase
+    # of this build cost, folded from the fragments the tools wrote. Printing
+    # it also publishes `<nimcache>/ledger.nif`, the snapshot nifmake reads.
+    var costs = openLedger(c.config.nifcachePath / "ledger.nif")
+    let table = statsTable(costs)
+    if table.len > 0:
+      echo table
+      saveLedger costs
 
   if cmd != DoCheck:
     if cmd == DoRun:

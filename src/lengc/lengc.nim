@@ -15,6 +15,7 @@ import codegen, llvmcodegen          # nifcore backends (local to shoggoth/)
 import noptions
 import ".." / lib / symparser
 import ".." / lib / vfs
+import ".." / lib / ledger
 import ".." / lib / nimversion
 
 include ".." / lib / compat2
@@ -52,6 +53,15 @@ Options:
 proc writeHelp() = quit(Usage, QuitSuccess)
 proc writeVersion() = quit(Version & "\n", QuitSuccess)
 
+proc generateTimed(s: var State; inp, outp: string; flags: set[GenFlag]) =
+  ## `generateCode` plus its cost-ledger fragment (JIT.md 5.2). The whole call
+  ## is the phase's `produce`: lengc loads, translates and writes inside it.
+  var timer = initPhaseTimer(outp.parentDir, "lengc", splitModulePath(inp).name)
+  generateCode s, inp, outp, flags
+  timer.noteProduce()
+  timer.noteOutput(outp)
+  timer.finish()
+
 proc generateBackend(s: var State; action: Action; files: seq[string]; flags: set[GenFlag]) =
   assert action in {atC, atCpp}
   if files.len == 0:
@@ -61,10 +71,10 @@ proc generateBackend(s: var State; action: Action; files: seq[string]; flags: se
   for i in 0..<files.len-1:
     let inp = files[i]
     let outp = s.config.nifcacheDir / splitModulePath(inp).name & destExt
-    generateCode s, inp, outp, {}
+    generateTimed s, inp, outp, {}
   let inp = files[^1]
   let outp = s.config.nifcacheDir / splitModulePath(inp).name & destExt
-  generateCode s, inp, outp, flags
+  generateTimed s, inp, outp, flags
 
 proc generateLLVMBackend(s: var State; files: seq[string]; flags: set[LLVMGenFlag]) =
   if files.len == 0:
