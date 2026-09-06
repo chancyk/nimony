@@ -188,3 +188,42 @@ content-addressed design makes easy:
 
 This is the same "inspect nimcache directly" style as `mainHexedPerBackend` in
 `src/hastur/incrementaltests.nim`.
+
+## 7. What it measured, after the fact
+
+Objects actually compiled on a cold nimcache (count of `.o` files written by
+`cc`, i.e. excluding the cache's published copies):
+
+| program | before | after |
+|---|---|---|
+| `tests/nimony/consteval/tconstseq.nim` (4 sub-programs) | 44 | 23 |
+| `tests/nimony/consteval/tmyops.nim` (5 sub-programs) | 52 | 35 |
+| `ctfe_ocache_a.nim` then `ctfe_ocache_b.nim` into one nimcache | 8 + 8 | 8 + 1 |
+
+`tconstseq` is the ideal case from JIT.md 3.3: all four sub-programs agree on
+all seven shared modules, so seven objects are compiled once instead of 28.
+`tmyops` is the realistic one: its five `const`s exercise different parts of
+`syncio`/`system`/`writenif`, the DCE live set genuinely differs, and the
+distinct-`.c.nif` count for those seven modules is 15 rather than 7. The cache
+delivers what the sharing actually is; making the *live set* itself
+program-independent (not DCE-ing a sub-program's stdlib closure at all) is a
+separate, larger change and is not attempted here.
+
+Wall time on this 10-core machine is a wash (2.4 s cold either way): nifmake
+already runs the `cc` fan-out in parallel and the extra nifmake process per
+sub-compile eats most of what the saved compiles return. What the cache buys
+today is CPU work and cache size (`tmyops`: 2.61 s user before, 1.91 s after),
+which is what matters once A2's in-process scheduler removes the fan-out.
+
+The ownership rule pays for itself on the seq/string cases rather than on these
+two: a `const` that builds a `seq[string]` makes the snippet main module offer
+`strlit.0.I…` instantiations that `std/syncio` also offers, and its
+`tco…`/`pro…` suffix wins the lexicographic rule. Verified on a probe module:
+before the rule, `syn1lfpjv.c.nif` inside the sub-program's directory names
+`strlit.0.I7647587183126479795.pro1EE42…`, i.e. the shared module's Leng IR
+carries the snippet's suffix; after it, no non-main `.c.nif` mentions the main
+module at all.
+
+Verified as well: for a build that is *not* a compile-time-eval sub-program the
+emitted `<main>.final.build.nif` is byte-identical to the one before this
+change.
