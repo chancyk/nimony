@@ -1,0 +1,198 @@
+Phase A1d — ledger meets store: overhead
+macOS 26, M5, Nim 2.2.10, 2026-09-06
+branch jit/a1d (worktree .claude/worktrees/agent-ad9d30b42ebcf8227)
+baseline: fast-devloop @ 400c091e (P0a, P0b, A1a, A1b, A1c), built into
+          /tmp/a1d_base by rsyncing the worktree and reverse-applying the
+          phase's own diff, so the two toolchains differ by exactly this phase
+
+Gate (JIT_IMPL.md A1d, inheriting A1a's): the nifmake recording must cost
+<= 1 % of a forced hello-world build.
+
+Result: +0.5 %, from the per-piece decomposition. Three independent 11-run A/B
+comparisons put it at -0.42 %, -0.30 % and -2.49 % of wall time, i.e. under
+this machine's noise floor in every one of them.
+
+
+What A1d adds to a build
+------------------------
+  per command, in nifmake's own process : two getMonoTime reads plus
+                                          SpawnLog.noteSpawn (a seq append)
+  per nifmake run                       : consolidate(nimcache, log)
+  per store eviction, the first only    : openLedger
+
+Nothing is added to the four tools: they wrote their fragments in A1a already
+and A1d does not touch them. The store's `load` timing is two clock reads on a
+read that just went to the filesystem, and the store is not installed at all
+under `--vfs:disk`, which is the default. The store's ledger read happens only
+when the budget is exceeded, which a 512 MB default never is on this suite.
+
+
+Per-piece cost
+--------------
+Microbenchmark in one process against a directory holding 75 fragments (60 in
+the nimcache, 15 one level down), which is what a forced hello world leaves
+behind. CPU time, 1000 iterations for the file operations and 200 for the
+folds. This is the number the gate rests on: it is CPU inside one process and
+does not move with another agent's scheduling.
+
+  ledger.noteSpawn            (per command, A1d)         < 1 us
+  ledger.recordSpawn          (the per-key file form)      134 us
+  ledger.writeFragment        (what a tool pays, A1a)      176 us
+  ledger.openLedger           (75 fragments)              1036 us
+  ledger.consolidate          (per run, A1d, 47 spawns)   1337 us
+
+A forced hello world runs 47 commands across 2 nifmake processes, so A1d costs
+
+  2 x 1337 us = 2.7 ms  on a 0.51 s build  =  +0.5 %
+
+and the figure does not grow with the command count: `consolidate` is one
+directory walk, one read per fragment and one write, whatever ran.
+
+
+Why the fold is per run and not per command
+-------------------------------------------
+The first implementation wrote a fragment per executed command, which is what
+the phase brief budgets for ("one stat and one small write per command"). It
+measured over the gate and was replaced.
+
+A fragment write is ~124-176 us: one vfsExists, one vfsRead, and the atomic
+temp-plus-rename that vfsWrite performs. A tool pays exactly the same for its
+own fragment, but it pays it *inside the tool*, so it overlaps with the rest of
+the DAG depth -- which is why A1a measured +0.78 % for 47 of them and noted
+that only 3.3 ms of its 5.6 ms of serial work reached the wall clock. nifmake's
+write is paid in nifmake's own single-threaded process, in the afterRunEvent
+callback between two spawns, and overlaps with nothing:
+
+  47 commands x 124 us = 5.8 ms of pure serial time = +1.4 %
+
+before consolidate is counted at all. Collecting the observations in memory and
+folding them once at the end gives the same numbers for a fifth of the cost.
+The trade is written down at ledger.SpawnLog: `spawn` now lives in
+<nimcache>/ledger.nif rather than in the fragments, so deleting the snapshot
+restarts the spawn averages (not `produce`, which stays the fragments'), and
+two nifmake processes consolidating one nimcache at once -- a CTFE sub-compile
+beside its parent's build -- can lose one run's observations to the other's
+write. saveLedger is atomic, so that is a lost update of an average and never a
+corrupt file.
+
+
+Wall-clock A/B
+--------------
+  hello.nim:  import std/syncio; echo "hello"        (3 lines, 4 modules)
+  command:    bin/nimony c -f --silentMake --nimcache:<own cache> hello.nim
+  Each toolchain gets its own nimcache, warmed with one cold build and one
+  forced build before timing; the timed runs alternate instrumented / baseline
+  so that thermal drift hits both equally. This is a1a.txt's protocol.
+
+  Caveat, and the reason the gate does not rest on these numbers: five other
+  agents were compiling in their own worktrees on this machine throughout the
+  phase (JIT_IMPL.md wave 3 runs the three A2a sub-tasks in parallel). The load
+  average sat between 7 and 25 for the whole session and a1a's 5 ms spread was
+  never reproducible. At 2.7 ms the effect is an order of magnitude below the
+  noise floor of a machine in that state, and all three runs duly came out at
+  or below zero.
+
+forced hello-world build, `nimony c -f --silentMake` (s)
+run 1 of 3 (the quietest; spread 0.498-0.557 on both sides)
+run           instrumented   fast-devloop
+  1              0.534          0.536
+  2              0.525          0.518
+  3              0.512          0.516
+  4              0.498          0.514
+  5              0.510          0.511
+  6              0.509          0.507
+  7              0.510          0.510
+  8              0.537          0.514
+  9              0.521          0.515
+  10             0.512          0.527
+  11             0.557          0.560
+median           0.512          0.515
+overhead      -0.42 %   (-2.1 ms)     [cpu: -0.86 %, -6.9 ms]
+
+run 2 of 3   median 0.701 vs 0.703     overhead -0.30 %   (-2.1 ms)
+run 3 of 3   median 0.598 vs 0.614     overhead -2.49 %   (-15.3 ms)
+
+CPU time (user+sys of the whole process tree, RUSAGE_CHILDREN) was collected
+alongside wall time and tracks it: -0.86 %, +3.64 %, -1.01 %. The spread of the
+CPU column across the three runs is itself larger than the effect, which is the
+same statement as the caveat above.
+
+
+An up-to-date rebuild is untouched
+----------------------------------
+`consolidate` is skipped when no command reached a process, so the no-change
+path -- 11 ms in JIT_IMPL.md section 0 and the one a dev loop hits most --
+pays nothing at all:
+
+  bin/nimony c --silentMake --nimcache:<warm> hello.nim   0.032 s total,
+                                                          0.01s user 0.01s sys
+
+
+What --stats reports now
+------------------------
+bin/nimony c -f --stats --silentMake tests/nimony/stdlib/tall.nim
+
+[stats] 99 modules, 29765 LOC, 1090162 bytes
+[stats] phase       samples   produce ms   spawn ms  ser+parse ms  write ms       bytes
+[stats] cc               99          0.0       87.3           0.0       0.0           0
+[stats] dceEmit         198          2.8       10.3           0.0       0.0     1208510
+[stats] dceLive           2         35.2        6.2           0.0       0.0      131075
+[stats] hexer           185         24.5        9.6           0.0       0.0    13667042
+[stats] lengc           198          1.5       13.3           0.0       0.0     2118959
+[stats] link              1          0.0       81.0           0.0       0.0           0
+[stats] nifler          223          1.1        7.8           0.0       0.0     2891964
+[stats] nimsem          190         19.9        6.4           0.0       0.0     8841040
+[stats] pluginbuild        3          0.0     4263.1           0.0       0.0           0
+[store] policy=disk (no artifact store installed)
+
+Reading it:
+
+- `cc` 87.3 ms and `link` 81.0 ms are whole commands, not process starts: those
+  tools report no `produce` of their own, so the wall time is all the ledger
+  can attribute. Against JIT.md 3.3's table of 54 ms and 33 ms, and both are
+  nodes that can never run in-process, so the number is the one a scheduler
+  wants either way.
+- `pluginbuild` at 5.3 s is a nested `nimony s` building a macro plugin. It is
+  the single most expensive thing in a cold stdlib build and it is exactly what
+  A2c is for.
+- The spawn figures are wall time and nimony runs nifmake with `-j`, so on a
+  wide depth they carry the fan-out's CPU contention as well as the process
+  start. That is the number A2b's rule wants -- what a process costs *in this
+  build* is what decides whether the node is worth one -- but it is not process
+  startup in isolation, and the same node reads 1.2 ms on a quiet depth and
+  tens of milliseconds on a forced whole-stdlib rebuild.
+- `ser+parse` and `write` are 0 for every phase because the four tools record
+  only `produce`: splitting a phase's load/parse/serialize/write needs A2a's
+  buffer-level entry points (notes/a1a.md 6.6, notes/a1d.md 1.2). The columns
+  are there so that A2a lights them up without another change here.
+- `[store]` says `disk` because that is still the default. Under
+  `--vfs:memory+spill` the same build prints e.g.
+
+  [store] policy=memory+spill entries=52 resident=40KB pinned=0KB reads=48
+          hits=0 mmaps=34 mmapHits=0 writes=5 through=5 spills=0 evictions=0
+          load=1.0ms verify=0 mismatches=0
+
+  and that is the *driver's* store: every tool's store lived and died inside
+  its own process, which is what NIMONY_VFS_STATS=1 dumps. `spills=0` and
+  `evictions=0` are honest -- everything the pipeline produces is written
+  through today (notes/a1b.md 3), so the budget has nothing to shed until A2b
+  starts declaring suffixes ephemeral.
+
+
+Reproducing
+-----------
+  # baseline
+  rsync -a --exclude .git --exclude bin --exclude nimcache <worktree>/ /tmp/a1d_base/
+  git diff 400c091e HEAD -- src tests > /tmp/a1d.patch
+  (cd /tmp/a1d_base && patch -p1 -R < /tmp/a1d.patch)
+  (cd /tmp/a1d_base && nim c -r src/hastur/hastur build all)
+
+  # A/B: 11 interleaved runs per side, separate nimcaches, both warmed
+  #      (the driver is 60 lines of python; see the phase's report)
+
+  # per-piece: writeFragment / recordSpawn / openLedger / consolidate over a
+  #            75-fragment directory, cpuTime, 1000 and 200 iterations
+
+  # isolate from other agents on the machine: every worktree shares
+  # ~/.cache/nim/<tool>_r, and a concurrent `nim c` of nimsem from another
+  # worktree corrupted a `hastur boot` link here once. Set XDG_CACHE_HOME.

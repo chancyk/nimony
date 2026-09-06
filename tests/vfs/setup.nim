@@ -26,9 +26,16 @@
 ##   that moved means somebody legitimately rewrote the file, and the store
 ##   drops the entry instead — and asserts the diagnostic names the path and
 ##   the first differing offset.
+## - **the spill decision** (A1d): `maySpill` is JIT.md 5.2's rule and the case
+##   is exhaustive over the three things it depends on — over/under budget,
+##   reload-cheaper/recompute-cheaper, and the three policies that can hold a
+##   resident entry — plus the boundary and the "no phase could recompute this"
+##   case. `spillCandidate` then drives the same decision through a real
+##   `ledger.nif`, which is where suffix→phase→`produce` is tested.
 
 import std / [os, strutils, times]
 import "../../src/lib/vfs"
+import "../../src/lib/ledger"
 import "../../src/lib/artifactstore"
 
 var failures = 0
@@ -252,6 +259,153 @@ proc verifyCase() =
     check storeStats().verifyMismatches >= 1, "and it is counted"
   uninstallArtifactStore()
 
+# ---- the spill decision (JIT.md 5.2, JIT_IMPL.md A1d) ----------------------
+
+proc spillDecisionCase() =
+  echo "the spill decision, exhaustively"
+  # Two costs that sit either side of the default 50 % margin, so that the only
+  # thing changing between the two columns is which is cheaper:
+  #   reload cheaper:    2 ms to reload against 100 ms to recompute (2 < 50)
+  #   recompute cheaper: 2 ms to reload against   3 ms to recompute (2 >= 1.5)
+  const
+    Reload = 2_000_000'i64
+    BigProduce = 100_000_000'i64
+    SmallProduce = 3_000_000'i64
+
+  # (over budget / under budget) x (reload cheaper / recompute cheaper)
+  #                              x (memory / memory+spill / verify)
+  #
+  # `spDisk` is not in the matrix because it installs no store at all and so
+  # has no entry to decide about.
+  for policy in [spMemory, spMemorySpill, spVerify]:
+    let name = $policy
+
+    # 1. Under the budget nothing spills, whatever it costs. Residency is what
+    #    the store is for.
+    check not maySpill(policy, false, Reload, BigProduce),
+          name & ": under budget, reload cheaper -> keep"
+    check not maySpill(policy, false, Reload, SmallProduce),
+          name & ": under budget, recompute cheaper -> keep"
+
+    # 2. Over the budget the answer is the policy's, then the ledger's.
+    #    `spMemory` has nowhere to spill TO: its memory-only entries have no
+    #    disk copy and writing one is what `memory+spill` is named after.
+    let canSpill = policy != spMemory
+    check maySpill(policy, true, Reload, BigProduce) == canSpill,
+          name & ": over budget, reload cheaper -> " & $canSpill
+    check not maySpill(policy, true, Reload, SmallProduce),
+          name & ": over budget, recompute cheaper -> keep"
+
+  # The boundary is exclusive: "below its produce cost by the margin" means
+  # strictly below, so an entry that exactly meets the margin is kept.
+  check not maySpill(spMemorySpill, true, 50_000_000, 100_000_000),
+        "reload == produce * margin is not below it"
+  check maySpill(spMemorySpill, true, 49_999_999, 100_000_000),
+        "one nanosecond below the margin is"
+
+  # A non-default margin moves the line and nothing else.
+  check maySpill(spMemorySpill, true, 60_000_000, 100_000_000, 90),
+        "a 90 % margin admits what 50 % refused"
+  check not maySpill(spMemorySpill, true, 60_000_000, 100_000_000, 50),
+        "and 50 % still refuses it"
+
+  # `produce == 0` is "no phase in the pipeline could recompute this" (a
+  # sidecar, a build file, something a plugin invented), not "cost unknown":
+  # reloading is the only way back, so spilling is always right.
+  check maySpill(spMemorySpill, true, Reload, 0),
+        "nothing can recompute it -> spill"
+  check not maySpill(spMemory, true, Reload, 0),
+        "except under `memory`, which still has nowhere to put it"
+
+proc spillLedgerCase() =
+  echo "the spill decision reads the ledger"
+  let dir = caseDir("spillledger")
+  # A ledger saying that `.x.nif` files are expensive to make (hexer, 100 ms)
+  # and `.c.nif` files are cheap (dceEmit, 1 ms). Against the ~8.5 us/KB
+  # fallback reload cost of a 512 KB NIF (4.4 ms), the first is worth spilling
+  # and the second is not.
+  var l = Ledger(path: dir / "ledger.nif", entries: @[], current: "")
+  var big = default(LedgerSample)
+  big.produceNs = 100_000_000
+  var small = default(LedgerSample)
+  small.produceNs = 1_000_000
+  record(l, LedgerKey(phase: "hexer", module: "m"), big, "0123456789")
+  record(l, LedgerKey(phase: "dceEmit", module: "m"), small, "0123456789")
+  saveLedger l
+
+  installArtifactStore(spMemorySpill, 512 * 1024 * 1024, dir)
+  var body = newStringOfCap(512 * 1024)
+  for i in 0 ..< 512 * 1024: body.add char(ord('a') + (i mod 26))
+  vfsWrite(dir / "m.x.nif", body)
+  vfsWrite(dir / "m.c.nif", body)
+  vfsWrite(dir / "m.s.deps.nif", body)
+
+  check spillCandidate(dir / "m.x.nif"),
+        "a 100 ms hexer output is cheaper to reload than to remake"
+  check not spillCandidate(dir / "m.c.nif"),
+        "a 1 ms dceEmit output is cheaper to remake than to reload"
+  check not spillCandidate(dir / "nosuchfile"),
+        "a path the store does not hold is not a candidate"
+  check spillCandidate(dir / "m.s.deps.nif"),
+        "a sidecar no phase claims can only be reloaded, so it may spill"
+  uninstallArtifactStore()
+
+proc spillPolicyBudgetCase() =
+  echo "the budget honours the policy"
+  # The same eight memory-only entries against the same 1 MB budget, once under
+  # `memory+spill` and once under `memory`. Nothing in the pipeline produces
+  # these, so the ledger says "spill" for both and the only thing left deciding
+  # is the policy.
+  var body = newStringOfCap(256 * 1024)
+  for i in 0 ..< 256 * 1024: body.add char(ord('a') + (i mod 26))
+
+  block spilling:
+    let dir = caseDir("budgetspill")
+    installArtifactStore(spMemorySpill, 1024 * 1024, dir)
+    addEphemeralSuffix ".mem.nif"
+    for i in 0 ..< 8:
+      vfsWrite(dir / ("e" & $i & ".mem.nif"), body & $i)
+    check storeStats().spills > 0,
+          "memory+spill wrote entries out to stay under the budget (" &
+            $storeStats().spills & ")"
+    check storeStats().residentBytes <= 1024 * 1024,
+          "and got under it (" & $storeStats().residentBytes & ")"
+    uninstallArtifactStore()
+
+  block notSpilling:
+    let dir = caseDir("budgetnospill")
+    installArtifactStore(spMemory, 1024 * 1024, dir)
+    addEphemeralSuffix ".mem.nif"
+    for i in 0 ..< 8:
+      vfsWrite(dir / ("e" & $i & ".mem.nif"), body & $i)
+    check storeStats().spills == 0,
+          "memory never writes a memory-only entry out"
+    check storeStats().residentBytes > 1024 * 1024,
+          "so the budget stops being enforced rather than losing the bytes"
+    for i in 0 ..< 8:
+      check vfsRead(dir / ("e" & $i & ".mem.nif")) == body & $i,
+            "and entry " & $i & " is still there"
+    uninstallArtifactStore()
+
+proc loadCostCase() =
+  echo "an entry records what it cost to load"
+  let dir = caseDir("loadcost")
+  let p = dir / "big.s.nif"
+  var body = newStringOfCap(2 * 1024 * 1024)
+  for i in 0 ..< 2 * 1024 * 1024: body.add char(ord('a') + (i mod 26))
+  writeFile(p, body)
+
+  installArtifactStore(spMemory, 512 * 1024 * 1024, dir)
+  check storeStats().loadNs == 0, "nothing has been loaded yet"
+  check vfsRead(p).len == body.len, "the miss reads the file"
+  check storeStats().loadNs > 0,
+        "and the read was timed (" & $storeStats().loadNs & " ns)"
+  let afterRead = storeStats().loadNs
+  check vfsRead(p).len == body.len, "the second read is a hit"
+  check storeStats().loadNs == afterRead, "which costs no load time at all"
+  check storeStats().readHits == 1, "and is counted as a hit"
+  uninstallArtifactStore()
+
 # ---- disk mode is not a store ---------------------------------------------
 
 proc diskCase() =
@@ -284,6 +438,10 @@ blobCase()
 spillCase()
 budgetCase()
 verifyCase()
+spillDecisionCase()
+spillLedgerCase()
+spillPolicyBudgetCase()
+loadCostCase()
 
 removeDir scratch
 

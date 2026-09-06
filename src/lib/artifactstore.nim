@@ -136,13 +136,35 @@ import std / [tables, strutils, os, syncio]
 when defined(nimony):
   # Nimony's `os` does not re-export these; `vfs.nim` splits the same way.
   import std / [envvars, dirs, paths]
-import vfs
+import std / monotimes
+import vfs, ledger
 
 const
   DefaultBudgetMB* = 512
-    ## `--vfs-budget:<MB>`. JIT.md 5.1: above it the store spills the largest
-    ## entries whose policy allows it. A1d replaces "largest" with the ledger's
-    ## "cheapest to reload".
+    ## `--vfs-budget:<MB>`. JIT.md 5.1: above it the store sheds entries.
+
+  DefaultSpillMarginPercent* = 50
+    ## `--vfs-spill-margin:<percent>`. JIT.md 5.2: "spill an artifact when its
+    ## resident size is above the store's budget and `load + parse` is below its
+    ## `produce` cost by the recorded margin; never spill something that is
+    ## cheaper to recompute than to reload." The margin is that "below ... by":
+    ## an entry is only worth spilling when getting it back costs less than
+    ## `margin` of what making it again would, so 50 means "reloading has to be
+    ## at least twice as cheap as recomputing".
+
+  NifReloadNsPerKB = 8_500'i64
+    ## The fallback reload cost of a NIF text artifact, per kilobyte, used only
+    ## while neither the entry nor the ledger has a measured `load`/`parse`
+    ## (which is every artifact until A2a's buffer-level entry points let the
+    ## tools call `PhaseTimer.noteParse`). JIT.md 5.2's worked example parses
+    ## 1.14 MB in 9.7 ms; JIT.md 3.3 measures the read itself at ~0.1 ms per MB,
+    ## which rounds away against the parse. So ~8.5 us per KB, and the number is
+    ## an order of magnitude, not a measurement -- it is what keeps the decision
+    ## from degenerating into "size alone" before A2a lands.
+
+  OpaqueReloadNsPerKB = 100'i64
+    ## The same for a file nobody parses into a `TokenBuf` -- a `.c`, a `.o`, an
+    ## executable. Reading it is all it costs: JIT.md 3.3's ~0.1 ms per MB.
 
 type
   StorePolicy* = enum
@@ -168,6 +190,19 @@ type
     generation: int64  ## `vfsNow()` at write time; the memory mtime
     diskMtime: int64   ## the mtime of the written-through copy, 0 if none
     onDisk: bool
+    cost: LedgerSample
+      ## What this entry cost to get here (JIT_IMPL.md A1d step 1). `loadNs` is
+      ## filled by the read that admitted it -- the time the disk backend spent
+      ## turning the path into these bytes -- and is 0 for an entry this process
+      ## produced rather than read.
+      ##
+      ## `parseNs` stays 0 and is summed in anyway: attributing a parse means a
+      ## `PhaseTimer.noteParse` call at the tool's parse site, and no tool has
+      ## one, because the phase procs open their own inputs from the inside
+      ## until A2a's buffer-level entry points split them (notes/a1a.md 6.6,
+      ## notes/a1d.md 1.2). The four tool files belong to A2a, so A1d records
+      ## `load` and writes the decision against `load + parse` so that A2a
+      ## lights it up without another change here.
 
   StoreStats* = object
     entries*: int
@@ -178,6 +213,7 @@ type
     mmaps*, mmapHits*: int
     spills*, evictions*: int
     verifyChecks*, verifyMismatches*: int
+    loadNs*: int64         ## time the disk backend spent answering the misses
 
   ArtifactStore* = object
     ## One per process. It has to be a module-level `var` (below) because the
@@ -187,8 +223,13 @@ type
     installed*: bool
     policy*: StorePolicy
     budgetBytes*: int
+    spillMarginPercent*: int
     lastGeneration: int64
     entries: Table[string, Payload]
+    ledgerDir: string      ## `<nimcache>`; where `ledger.nif` and `.ledger/` are
+    costs: Ledger          ## the cost ledger, read at most once per process
+    costsLoaded: bool
+    evicting: bool         ## reentrancy guard: reading the ledger writes entries
     pinned: seq[Payload]   ## one slot per live blob; the slot is the pin
     freeSlots: seq[int]
     stats*: StoreStats
@@ -413,28 +454,106 @@ proc spillEntry(path: string; p: Payload) =
   p.onDisk = true
   inc store.stats.spills
 
-proc dropLargest(): bool =
-  ## Evict one entry. Two ranks, then size within a rank: an entry that is
-  ## already on the disk costs nothing to shed, while a memory-only one has to
-  ## be written out first, so the free ones go first however large the others
-  ## are. Returns false when there is nothing left to evict, which is how the
-  ## budget stops being enforced rather than becoming a failure.
+proc maySpill*(policy: StorePolicy; overBudget: bool;
+               reloadNs, produceNs: int64;
+               marginPercent = DefaultSpillMarginPercent): bool =
+  ## The spill decision of JIT.md 5.2, as a pure function of the four things it
+  ## depends on, so that `tests/vfs` can be exhaustive over them without
+  ## building a store big enough to shed.
   ##
-  ## Size is the whole ranking here. A1d replaces it with the ledger's
-  ## "cheapest to reload": never spill what costs less to recompute.
+  ## `reloadNs` is `load + parse` -- what getting these bytes back into a usable
+  ## shape would cost. `produceNs` is what making them again would cost.
+  ##
+  ## Three gates, in this order:
+  ##
+  ## 1. **Under the budget, nothing spills.** Residency is the whole point of
+  ##    the store; spilling early would trade memory it is allowed to use for
+  ##    work it did not have to do.
+  ## 2. **`spMemory` never spills.** Its memory-only entries have no disk copy
+  ##    and writing one is precisely what `memory+spill` is named after, so the
+  ##    budget stops being enforced instead. `spVerify` writes everything
+  ##    through already, so a "spill" there is a no-op that costs nothing and is
+  ##    allowed for the same reason `spMemorySpill` allows it.
+  ## 3. **Never spill what is cheaper to recompute than to reload.** With
+  ##    `produceNs` unknown (0) there is no phase that could recompute the
+  ##    artifact at all -- a sidecar, a build file, something a plugin invented
+  ##    -- so reloading is the only way back and spilling is always right.
+  if not overBudget: return false
+  if policy == spMemory: return false
+  if produceNs <= 0: return true
+  result = reloadNs * 100 < produceNs * marginPercent
+
+proc ensureCostLedger(hint: string) =
+  ## Read `<nimcache>/ledger.nif` once per process, and only when the budget has
+  ## actually bitten: an ordinary build never reaches this. `openLedger` folds
+  ## the fragments too, which is tens of small files and tens of entries.
+  ##
+  ## `costsLoaded` is set *before* the read because `openLedger` goes through
+  ## the relays, i.e. through this store, and must not ask for itself.
+  if store.costsLoaded: return
+  store.costsLoaded = true
+  var dir = store.ledgerDir
+  # No nimcache was named (a tool that predates `NIMONY_LEDGER`, or a unit
+  # test): the directory of the artifact we are about to shed is the best guess
+  # available, and it is the right one for every front-end artifact.
+  if dir.len == 0: dir = hint.parentDir
+  if dir.len == 0: return
+  store.costs = openLedger(dir / "ledger.nif")
+
+proc defaultReloadNs(path: string; size: int): int64 =
+  ## What reading `size` bytes of `path` back would cost, when nothing has
+  ## measured it. See `NifReloadNsPerKB` for where the numbers come from.
+  let kb = int64(size) div 1024
+  if path.endsWith(".nif"): result = kb * NifReloadNsPerKB
+  else: result = kb * OpaqueReloadNsPerKB
+
+proc reloadCost(path: string; p: Payload): int64 =
+  ## Measurement first, ledger second, size last. The entry's own `loadNs` is
+  ## what *this* file took on *this* disk and beats any average; the ledger's
+  ## `load + parse` is the phase's average across runs; the size fallback is
+  ## what is left before A2a fills either of them in.
+  if p.cost.loadNs > 0: return p.cost.loadNs + p.cost.parseNs
+  let c = estimate(store.costs, artifactKey(path), "")
+  if c.loadNs > 0 or c.parseNs > 0: return c.loadNs + c.parseNs
+  result = defaultReloadNs(path, p.bytes.len)
+
+proc produceCost(path: string): int64 =
+  ## What the phase that produced `path` costs to run again, or 0 when no phase
+  ## claims the suffix -- see `ledger.phaseForArtifact`, where 0 means "nothing
+  ## could recompute this", not "unknown".
+  let key = artifactKey(path)
+  if key.phase.len == 0: return 0
+  result = estimate(store.costs, key, "").produceNs
+
+proc evictOne(): bool =
+  ## Shed one entry, largest first inside two ranks. Returns false when nothing
+  ## is left to shed, which is how the budget stops being enforced rather than
+  ## becoming a failure.
+  ##
+  ## The two ranks are two different decisions and only the second one is the
+  ## ledger's:
+  ##
+  ## - An entry that **already has a disk copy** costs nothing to shed and the
+  ##   only way back to it is a read, because the bytes are on the disk. There
+  ##   is no recompute alternative to weigh against, so it goes first however
+  ##   large the memory-only ones are.
+  ## - A **memory-only** entry has to be written out first, and the choice later
+  ##   really is between `load + parse` and `produce`. That is JIT.md 5.2's
+  ##   sentence, and `maySpill` is it: the rank of a candidate is its resident
+  ##   size times one-or-zero, and a zero is never chosen at all.
   var victim = ""
+  var victimRank = -1
   var victimSize = -1
-  var victimFree = false
   for path, p in store.entries:
-    # Under `spMemory` a memory-only entry stays put: dropping it would lose
-    # the only copy, and writing it out is what `memory+spill` is named after.
-    if not p.onDisk and store.policy == spMemory: continue
-    if victimSize < 0 or (p.onDisk and not victimFree) or
-       (p.onDisk == victimFree and p.bytes.len > victimSize):
+    let rank = if p.onDisk: 1 else: 0
+    if rank == 0 and not maySpill(store.policy, true, reloadCost(path, p),
+                                  produceCost(path), store.spillMarginPercent):
+      continue
+    if rank > victimRank or (rank == victimRank and p.bytes.len > victimSize):
       victim = path
+      victimRank = rank
       victimSize = p.bytes.len
-      victimFree = p.onDisk
-  if victimSize < 0: return false
+  if victimRank < 0: return false
   let p = entryOf(victim)
   if p == nil: return false
   spillEntry(victim, p)
@@ -444,25 +563,39 @@ proc dropLargest(): bool =
   inc store.stats.evictions
   result = true
 
-proc enforceBudget() =
+proc enforceBudget(hint: string) =
+  ## `hint` is the path whose arrival pushed the store over, used only to find
+  ## the ledger when nobody named a nimcache.
+  if store.stats.residentBytes <= store.budgetBytes: return
+  # `ensureCostLedger` and `spillEntry` both write, and a write that re-entered
+  # here would mutate `store.entries` under `evictOne`'s iteration.
+  if store.evicting: return
+  store.evicting = true
+  ensureCostLedger(hint)
   while store.stats.residentBytes > store.budgetBytes:
-    if not dropLargest(): break
+    if not evictOne(): break
+  store.evicting = false
 
 # --- the entry table ------------------------------------------------------
 
-proc putEntry(path, content: string; onDisk: bool; diskMtime: int64) =
+proc putEntry(path, content: string; onDisk: bool; diskMtime: int64;
+              loadNs = 0'i64) =
   ## Install a NEW payload. The old one, if any, is left to whatever blobs
-  ## still hold it.
+  ## still hold it. `loadNs` is what the disk backend charged for these bytes,
+  ## 0 when this process produced them rather than read them.
   let old = entryOf(path)
   if old != nil:
     store.stats.residentBytes -= old.bytes.len
     dec store.stats.entries
+  var cost = default(LedgerSample)
+  cost.loadNs = loadNs
+  cost.bytes = int64(content.len)
   let p = Payload(bytes: content, repr: erText, generation: nextGeneration(),
-                  diskMtime: diskMtime, onDisk: onDisk)
+                  diskMtime: diskMtime, onDisk: onDisk, cost: cost)
   store.entries[path] = p
   inc store.stats.entries
   store.stats.residentBytes += content.len
-  enforceBudget()
+  enforceBudget(path)
 
 # --- the seven wrappers ---------------------------------------------------
 
@@ -487,10 +620,16 @@ proc storeRead(path: string): string {.nimcall.} =
         verifyAgainstDisk(path, p)
       inc store.stats.readHits
       return p.bytes
+  # The fall-through is the entry's `load`: the time the disk backend spends
+  # turning the path into these bytes is exactly what a later re-read would
+  # cost, and it is what the spill decision weighs against `produce`.
+  let t0 = getMonoTime().ticks
   result = store.prevRead(path)
+  let loadNs = getMonoTime().ticks - t0
+  store.stats.loadNs += loadNs
   # Admit it. It came from disk, so it is on disk, and evicting it later is
   # free. `classifyPath` still decides whether a later write goes through.
-  putEntry(path, result, true, store.prevMtime(path))
+  putEntry(path, result, true, store.prevMtime(path), loadNs)
 
 proc storeOpenMmap(path: string): VfsBlob {.nimcall.} =
   inc store.stats.mmaps
@@ -503,8 +642,11 @@ proc storeOpenMmap(path: string): VfsBlob {.nimcall.} =
       return blobOver(p)
   # Not resident: let the disk backend map it. Mapping is already cheap
   # (JIT.md 3.3: ~0.1 ms per MB) and copying the bytes into the store to hand
-  # back a pointer into them would cost more than it saves.
+  # back a pointer into them would cost more than it saves -- which is also why
+  # there is no entry here to hang the `load` on, only the running total.
+  let t0 = getMonoTime().ticks
   result = store.prevOpenMmap(path)
+  store.stats.loadNs += getMonoTime().ticks - t0
 
 proc storeExists(path: string): bool {.nimcall.} =
   let p = entryOf(path)
@@ -535,14 +677,23 @@ proc addEphemeralSuffix*(suffix: string) =
     store.ephemeral.add suffix
 
 proc installArtifactStore*(policy: StorePolicy;
-                           budgetBytes = DefaultBudgetMB * 1024 * 1024) =
+                           budgetBytes = DefaultBudgetMB * 1024 * 1024;
+                           ledgerDir = "";
+                           spillMarginPercent = DefaultSpillMarginPercent) =
   ## Capture the seven relays and put the store in front of them. `spDisk`
   ## installs nothing — that is the escape hatch, and it must leave the process
   ## byte-identical to one that never called this.
+  ##
+  ## `ledgerDir` is the nimcache, i.e. where `ledger.nif` and the `.ledger/`
+  ## fragments live. It is only ever read if the budget is exceeded; an empty
+  ## one makes the store guess from the path it is about to shed.
   if policy == spDisk or store.installed: return
   store.installed = true
   store.policy = policy
   store.budgetBytes = budgetBytes
+  store.ledgerDir = ledgerDir
+  store.spillMarginPercent =
+    if spillMarginPercent > 0: spillMarginPercent else: DefaultSpillMarginPercent
   store.entries = initTable[string, Payload]()
   store.prevOpenMmap = openMmapRelay
   store.prevRead = readBytesRelay
@@ -590,12 +741,20 @@ const
   VfsPolicyEnv* = "NIMONY_VFS"
   VfsBudgetEnv* = "NIMONY_VFS_BUDGET"
   VfsStatsEnv* = "NIMONY_VFS_STATS"
+  VfsMarginEnv* = "NIMONY_VFS_SPILL_MARGIN"
+  LedgerDirEnv* = "NIMONY_LEDGER"
+    ## The nimcache, so a child process can find the cost ledger. It travels the
+    ## same way the policy does and for the same reason (see the block comment
+    ## above): a flag spliced into the `.build.nif` would make two `--vfs` modes
+    ## emit different build graphs.
 
 type
   StoreRequest = object
     ## What the command line asked for, before the environment is consulted.
     policy: string
     budgetMB: int
+    marginPercent: int
+    ledgerDir: string
 
 var request: StoreRequest
 
@@ -623,6 +782,16 @@ proc requestStoreBudgetMB*(mb: int) =
   ## `--vfs-budget:<MB>`. Zero or less leaves the default in place.
   if mb > 0: request.budgetMB = mb
 
+proc requestSpillMargin*(percent: int) =
+  ## `--vfs-spill-margin:<percent>`. Zero or less leaves the default in place.
+  if percent > 0: request.marginPercent = percent
+
+proc requestLedgerDir*(dir: string) =
+  ## Where `<nimcache>/ledger.nif` is. `nimony` calls this with
+  ## `config.nifcachePath` before it installs the store; every child process
+  ## inherits the answer through `LedgerDirEnv`.
+  if dir.len > 0: request.ledgerDir = dir
+
 proc applyRequestedStore*() =
   ## Install what the flag, or failing that the environment, asked for, and
   ## export the answer so every child process inherits it. Called once by each
@@ -637,9 +806,32 @@ proc applyRequestedStore*() =
     let fromEnv = getEnv(VfsBudgetEnv)
     if fromEnv.len > 0: mb = parseBudgetMB(fromEnv)
   if mb <= 0: mb = DefaultBudgetMB
+  var margin = request.marginPercent
+  if margin <= 0:
+    let fromEnv = getEnv(VfsMarginEnv)
+    if fromEnv.len > 0: margin = parseBudgetMB(fromEnv)
+  if margin <= 0: margin = DefaultSpillMarginPercent
+  var ledgerDir = request.ledgerDir
+  if ledgerDir.len == 0: ledgerDir = getEnv(LedgerDirEnv)
   setEnvVar(VfsPolicyEnv, $p)
   setEnvVar(VfsBudgetEnv, $mb)
-  installArtifactStore(p, mb * 1024 * 1024)
+  setEnvVar(VfsMarginEnv, $margin)
+  if ledgerDir.len > 0: setEnvVar(LedgerDirEnv, ledgerDir)
+  installArtifactStore(p, mb * 1024 * 1024, ledgerDir, margin)
+
+proc spillCandidate*(path: string): bool =
+  ## Would the ledger let the store spill this resident entry, if it were over
+  ## its budget? The plumbing behind `evictOne`'s second rank, exposed because
+  ## the interesting half of the decision -- suffix to phase, phase to ledger
+  ## entry, entry to `produce` -- is otherwise only reachable by building a
+  ## store big enough to shed, and because everything the pipeline produces is
+  ## written through today (notes/a1b.md 3), so an end-to-end eviction never
+  ## reaches this rank at all until A2b declares suffixes ephemeral.
+  let p = entryOf(path)
+  if p == nil: return false
+  ensureCostLedger(path)
+  result = maySpill(store.policy, true, reloadCost(path, p), produceCost(path),
+                    store.spillMarginPercent)
 
 proc storeInstalled*(): bool = store.installed
 proc storePolicy*(): StorePolicy = store.policy
@@ -648,7 +840,14 @@ proc storeStats*(): StoreStats = store.stats
 # --- reporting ------------------------------------------------------------
 
 proc storeStatsLine*(): string =
-  ## One line for `--stats` (A1d prints it beside the phase table).
+  ## One line for `--stats`, printed beside the phase table (A1d).
+  ##
+  ## The store it describes is *this* process's. In a build the driver is one
+  ## process of a dozen and the tools' stores die with them, which is what
+  ## `NIMONY_VFS_STATS=1` is for; under `--vfs:disk` there is no store at all
+  ## and the line says so rather than printing a table of zeros.
+  if not store.installed:
+    return "[store] policy=disk (no artifact store installed)"
   let s = store.stats
   result = "[store] policy=" & $store.policy &
     " entries=" & $s.entries &
@@ -658,6 +857,7 @@ proc storeStatsLine*(): string =
     " mmaps=" & $s.mmaps & " mmapHits=" & $s.mmapHits &
     " writes=" & $s.writes & " through=" & $s.writeThroughs &
     " spills=" & $s.spills & " evictions=" & $s.evictions &
+    " load=" & formatMs(s.loadNs) & "ms" &
     " verify=" & $s.verifyChecks & " mismatches=" & $s.verifyMismatches
 
 # --- spilling -------------------------------------------------------------

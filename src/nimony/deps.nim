@@ -21,6 +21,7 @@ import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat,
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs, ledger]
+from ".." / lib / artifactstore import storeStatsLine
 from ".." / lib / nifchecksums import computeChecksum
 import ".." / models / nifindex_tags
 
@@ -2411,6 +2412,11 @@ proc buildGraph*(config: sink NifConfig; project: string;
     if table.len > 0:
       echo table
       saveLedger costs
+    # And the artifact store beside it (JIT_IMPL.md A1d step 3). This is the
+    # driver's own store: the tools' stores lived and died inside their own
+    # processes, which is what `NIMONY_VFS_STATS=1` reports. Under the default
+    # `--vfs:disk` the line says there is no store rather than printing zeros.
+    echo storeStatsLine()
 
   if cmd != DoCheck:
     if cmd == DoRun:
