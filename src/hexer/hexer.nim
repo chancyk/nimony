@@ -247,43 +247,46 @@ proc runHexer*(args: seq[string]): int =
     # path-based wrappers rather than everything landing in `produce`.
     #
     # `status` is how a phase reports an I/O failure it used to `quit` on, so
-    # that a library caller keeps its process. The message and the code below
-    # are the ones the CLI printed before A2a.
+    # that a library caller keeps its process. The message and the code are
+    # the ones the CLI printed before A2a, and a failed run publishes no
+    # ledger fragment -- the pre-A2a code quit before `timer.finish`, and a
+    # phase that did not produce its output must not move its average.
     var status = HexerStatus(msg: "")
-    block:
-      case action
-      of "c":
-        let dir = if outdir.len > 0: outdir else: files[0].parentDir
-        var timer = initPhaseTimer(dir, "hexer", moduleSuffixOf(files[0]))
-        expand files[0], bits, bigEndian, flags, isMain, outdir, timer, status, appType, native, isWindows
-        timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".x.nif")
-        timer.finish()
-      of "d":
-        deadCodeElimination(files, outdir, status)
-      of "dl":
-        # Compute the global live set + resolve table from a list of
-        # per-module `.dce.nif` analyses. Last argument is the output
-        # `.live.nif`; all preceding arguments are the input `.dce.nif`s.
-        if files.len < 2:
-          return fail "dl: expected <dce-file>... <live-output>"
-        var timer = initPhaseTimer(files[^1].parentDir, "dceLive", "")
-        computeLiveSet(files.toOpenArray(0, files.len - 2), files[^1], timer)
-        timer.noteOutput(files[^1])
-        timer.finish()
-      of "de":
-        # Per-module emit. Args: <M.x.nif> <main.live.nif>; outputs
-        # <outdir>/<M>.c.nif.
-        if files.len != 2:
-          return fail "de: expected <x.nif> <live.nif>"
-        let dir = if outdir.len > 0: outdir else: files[0].parentDir
-        var timer = initPhaseTimer(dir, "dceEmit", moduleSuffixOf(files[0]))
-        dceEmit(files[0], files[1], outdir, timer, status)
-        timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".c.nif")
-        timer.finish()
-      else:
-        return writeHelp()
-    if status.failed:
-      return fail status.msg
+    case action
+    of "c":
+      let dir = if outdir.len > 0: outdir else: files[0].parentDir
+      var timer = initPhaseTimer(dir, "hexer", moduleSuffixOf(files[0]))
+      expand files[0], bits, bigEndian, flags, isMain, outdir, timer, status,
+             appType, native, isWindows
+      if status.failed: return fail status.msg
+      timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".x.nif")
+      timer.finish()
+    of "d":
+      deadCodeElimination(files, outdir, status)
+      if status.failed: return fail status.msg
+    of "dl":
+      # Compute the global live set + resolve table from a list of
+      # per-module `.dce.nif` analyses. Last argument is the output
+      # `.live.nif`; all preceding arguments are the input `.dce.nif`s.
+      if files.len < 2:
+        return fail "dl: expected <dce-file>... <live-output>"
+      var timer = initPhaseTimer(files[^1].parentDir, "dceLive", "")
+      computeLiveSet(files.toOpenArray(0, files.len - 2), files[^1], timer)
+      timer.noteOutput(files[^1])
+      timer.finish()
+    of "de":
+      # Per-module emit. Args: <M.x.nif> <main.live.nif>; outputs
+      # <outdir>/<M>.c.nif.
+      if files.len != 2:
+        return fail "de: expected <x.nif> <live.nif>"
+      let dir = if outdir.len > 0: outdir else: files[0].parentDir
+      var timer = initPhaseTimer(dir, "dceEmit", moduleSuffixOf(files[0]))
+      dceEmit(files[0], files[1], outdir, timer, status)
+      if status.failed: return fail status.msg
+      timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".c.nif")
+      timer.finish()
+    else:
+      return writeHelp()
   result = QuitSuccess
 
 proc handleCmdLine*() =
