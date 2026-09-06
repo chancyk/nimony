@@ -140,3 +140,24 @@ run-1 '+15 %' was contention and there is no stdlib regression above the
 noise floor (~5 %). Keep it in every run. The CTFE loop: a fresh nimcache with
 5 consts 2.4x faster, forced 3.7x, the 14-const benchmark cold 3.5x and edit
 3.6x; nothing changed for hello world, as expected before A2b.
+
+## Run 2b: interleaved A/B on the one open question (stdlib.forced), 5 rounds
+
+`bench/devloop_ab.sh /tmp/devloop_base . stdlib.forced 5` (A = base f69b8afc,
+B = head 9aa41488; two agents building in the background, which an
+interleaved run tolerates):
+
+```
+round 0  A  wall 2.749  cpu 10.017      B  wall 3.479  cpu 10.690
+round 1  A  wall 3.883  cpu 10.742      B  wall 3.666  cpu 11.201
+round 2  A  wall 2.929  cpu 10.437      B  wall 2.700  cpu 10.514
+round 3  A  wall 2.506  cpu 10.048      B  wall 2.769  cpu 10.329
+round 4  A  wall 3.552  cpu 10.855      B  wall 2.796  cpu 10.484
+A cpu median 10.437 min 10.017 | B cpu median 10.514 min 10.329
+B/A cpu: 1.007 (median), 1.031 (min)
+```
+
+Verdict: no stdlib-wide regression from the merged phases (≤ 3 %, inside the
+round-to-round spread). The monotonic rise across run 2's three block passes
+was drift between passes, which is why the 5 % question is answered with the
+interleaved script and the 2x questions with the table.
