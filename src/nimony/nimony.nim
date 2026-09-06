@@ -247,10 +247,20 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
         else:
           # Handle nimony-specific options
           case keyNorm
-          of "forcebuild", "f": c.buildFlags.incl ForceRebuild
+          of "forcebuild", "f":
+            # NOT forwarded: `-f` is an instruction about THIS build graph, not
+            # about the sub-builds this compile spawns. Forwarding it put
+            # `--force` on the `nimony s` of every CTFE sub-program (see
+            # `semos.runEval`), where it deleted and rebuilt all 30-odd nodes
+            # per const evaluation. A sub-program is content-addressed — its
+            # module suffix is a checksum of the expression — so there is
+            # nothing to force: the same name always means the same input.
+            c.buildFlags.incl ForceRebuild
+            forwardArg = false
           of "ff":
             c.fullRebuild = true
             c.buildFlags.incl ForceRebuild
+            forwardArg = false
           of "run", "r":
             c.doRun = true
             if c.cmd == FullProject and c.args.len >= 1:

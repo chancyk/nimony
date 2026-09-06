@@ -133,7 +133,14 @@ proc handleCmdLine() =
         discard "handled by common CLI parser"
       else:
         case normalize(key)
-        of "forcebuild", "f", "ff": forceRebuild = true
+        of "forcebuild", "f", "ff":
+          # Accepted so a hand-run `nimsem m -f` does not die on an unknown
+          # option, but never forwarded: `commandLineArgs` is what
+          # `semos.runProgram`/`selfExec` splice onto the CTFE sub-compiles,
+          # and forcing those throws away a content-addressed cache. Same
+          # reasoning as the matching branch in `nimony.nim`.
+          forceRebuild = true
+          forwardArg = false
         else: writeHelp()
       if forwardArg:
         commandLineArgs.add " --" & key
