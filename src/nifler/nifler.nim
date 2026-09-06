@@ -7,7 +7,7 @@
 ## Nifler is a simple tool that parses Nim code and outputs NIF code.
 ## No semantic checking is done and no symbol lookups are performed.
 
-import std / [parseopt, strutils, os, assertions, times]
+import std / [parseopt, strutils, os, assertions]
 import bridge, configcmd
 import ".." / lib / [vfs, artifactstore, nimversion]
 

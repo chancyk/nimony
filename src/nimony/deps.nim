@@ -17,7 +17,7 @@
 when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
-import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths, algorithm]
+import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat, dirs, paths, algorithm]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs]
@@ -686,9 +686,9 @@ proc processDeps(c: var DepContext; n: Cursor; current: Node) =
         processDep c, n, current
 
 proc getLastModTime(path: string): int64 =
-  ## `getLastModificationTime` raises on transient I/O errors. We only use
-  ## the result for staleness comparisons, so any failure should fall through
-  ## to "rebuild needed" — returning -1 makes that automatic: `-1 > anything`
+  ## `vfsMtime` raises on transient I/O errors (and on a missing file). We
+  ## only use the result for staleness comparisons, so any failure should fall
+  ## through to "rebuild needed" — returning -1 makes that automatic: `-1 > anything`
   ## is false (so we don't skip rebuilds), and `-1 == -1` (when both paths
   ## fail) is also not `>`, so we still rebuild.
   ## Through `vfsMtime`, so an artifact the store holds answers with its

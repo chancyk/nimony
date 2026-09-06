@@ -98,6 +98,13 @@ Options:
   --inlineframes:on|off     record which template an expansion came from, so a
                             debug build shows template calls as inlined frames
                             (default: off)
+  --vfs:MODE                where build artifacts live: disk (the default; no
+                            artifact store at all), memory, memory+spill, or
+                            verify (memory, written through, every read
+                            compared against the disk copy). The mode reaches
+                            every tool of the build through the environment.
+  --vfs-budget:MB           how much the artifact store may hold resident
+                            before it sheds entries (default: 512)
   --novalidate              skip running the plugin validator on plugin sources
   --verbose                 dump Final IR (and other diagnostics) on contract
                             analysis failures

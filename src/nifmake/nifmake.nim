@@ -740,6 +740,10 @@ Options:
                         --report). The optional LO:HI range remaps the bar so a
                         caller running several builds can show one continuous
                         0..100% bar across them.
+  --vfs:MODE            Artifact store policy: disk (default), memory,
+                        memory+spill or verify. Normally inherited from the
+                        environment, which is how nimony hands it down.
+  --vfs-budget:MB       Resident budget for the artifact store (default 512).
   --profile             Print timing profile of executed commands to stderr.
   --report              Print machine-readable per-command invocation
                         counts to stdout, e.g.

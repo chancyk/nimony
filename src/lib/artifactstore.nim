@@ -21,8 +21,9 @@
 ## ============== ==========================================================
 ## `spDisk`       the adapter is not installed. Today's behaviour.
 ## `spMemory`     entries are resident; a *cross-process* path is still
-##                written through to disk (see the table below), an
-##                *ephemeral* one is not.
+##                written through to disk (which is every path, until a
+##                suffix is declared ephemeral -- see below), an *ephemeral*
+##                one is not.
 ## `spMemorySpill` `spMemory` plus: `storeFlush` writes every memory-only
 ##                entry out, and the budget spills instead of dropping.
 ## `spVerify`     everything is written through, and every read that the
@@ -60,9 +61,22 @@
 ## ==================== ===================================================
 ##
 ## That the list is "everything" is the finding, not an oversight: a store per
-## process buys a read cache and nothing more until phases share a process.
-## A2b and A2c move suffixes out of this table as the phases behind them move
-## in-process; the table is why that is a one-line change.
+## process buys a read cache and a write coalescer, and nothing more, until
+## phases share a process.
+##
+## Which is why `classifyPath` does not consult that table to decide. It
+## answers `pcCrossProcess` by DEFAULT and consults an exception list —
+## `addEphemeralSuffix`, empty today — to say otherwise. Getting the default
+## the other way round would make a suffix nobody remembered to list into a
+## silently stale build, the "high, silent" risk of JIT.md 10; this way it
+## costs a write nobody needed. A2b and A2c grow the exception list as the
+## phases behind those suffixes move into one process.
+##
+## A written-through entry can be rewritten by somebody else — a spawned
+## `nimony s`, a plugin, a concurrent build — so the store records the disk
+## mtime it wrote and drops the entry when the real one has moved. That check
+## is a `stat`, which is the syscall `vfsExists`/`vfsMtime` were going to make
+## anyway.
 ##
 ## Paths intentionally outside the store
 ## -------------------------------------
@@ -225,9 +239,22 @@ proc classifyPath*(path: string): PathClass =
   ## stale build — the "high, silent" risk in JIT.md 10. `crossProcessSuffixes`
   ## above is therefore documentation of what the pipeline produces, not the
   ## thing that decides.
+  var declared = false
   for e in store.ephemeral:
-    if path.endsWith(e): return pcEphemeral
-  result = pcCrossProcess
+    if path.endsWith(e): declared = true; break
+  if not declared: return pcCrossProcess
+  # A suffix the pipeline is documented to hand to another process outranks
+  # the declaration: this is what keeps `crossProcessSuffixes` load-bearing
+  # rather than a comment that drifts, and it is the guard rail A2b writes
+  # against when it starts moving suffixes off the disk.
+  for suffix in crossProcessSuffixes:
+    if path.endsWith(suffix): return pcCrossProcess
+  for d in crossProcessDirs:
+    if path.startsWith(d & "/") or path.contains("/" & d & "/"): return pcCrossProcess
+    when DirSep != '/':
+      if path.startsWith(d & DirSep) or path.contains(DirSep & d & DirSep):
+        return pcCrossProcess
+  result = pcEphemeral
 
 # --- policy ---------------------------------------------------------------
 

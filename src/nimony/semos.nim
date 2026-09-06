@@ -7,7 +7,7 @@
 ## Path handling and `exec` like features as `sem.nim` needs it.
 
 from std / strutils import multiReplace, startsWith, split
-import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths, times]
+import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths]
 from std / osproc import execCmdEx
 
 include ".." / lib / nifprelude
@@ -310,9 +310,10 @@ proc replaceSubs*(fmt, currentFile: string; config: NifConfig): string =
 # ------------------ include/import handling ------------------------
 
 proc lastModTimeOrStale(path: string): int64 =
-  ## `getLastModificationTime` raises on transient I/O errors. The result is
-  ## only used for staleness comparisons, so any failure must fall through to
-  ## "regenerate": -1 makes that automatic, since `-1 > anything` is false.
+  ## `vfsMtime` raises on transient I/O errors (and on a missing file). The
+  ## result is only used for staleness comparisons, so any failure must fall
+  ## through to "regenerate": -1 makes that automatic, `-1 > anything` being
+  ## false.
   ## Mirrors `deps.getLastModTime`. Through `vfsMtime`, so an artifact the
   ## store holds answers with its generation rather than with a stat of a copy
   ## that may not be on disk at all.
@@ -613,10 +614,12 @@ proc addPluginBody(dest: var TokenBuf; o: var PluginOutput) =
 proc memoIsStale(outputFile: string; deps: seq[string]): bool =
   ## True when a file the cached output depended on has changed or vanished
   ## since it was written. A vanished file forces exactly one rerun: the plugin
-  ## no longer finds it and so no longer reports it. `vfsMtime` rather than
-  ## `lastModTimeOrStale`, which is whole seconds on host Nim: a data file
-  ## edited in the same second as the output would tie and read as unchanged.
-  ## nifmake compares nanoseconds for the same reason.
+  ## no longer finds it and so no longer reports it. `vfsMtime` directly
+  ## rather than through `lastModTimeOrStale`: a missing dependency has to be
+  ## a rerun, not the `-1` that helper substitutes, and the `vfsExists` above
+  ## is what says so. Both are nanoseconds — a data file edited in the same
+  ## second as the output would tie and read as unchanged otherwise, which is
+  ## why nifmake compares nanoseconds too.
   result = false
   let written = vfsMtime(outputFile)
   for d in deps:
