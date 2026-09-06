@@ -13,7 +13,7 @@ import std / [assertions, syncio, os]
 
 import compiler / [ast, options, pathutils, renderer, lineinfos, syntaxes, llstream, idents, msgs]
 
-import ".." / lib / nifbuilder
+import ".." / lib / [nifbuilder, vfs]
 import ".." / models / nifler_tags
 
 proc nodeKindTranslation(k: TNodeKind): NiflerKind =
@@ -108,6 +108,15 @@ template withTree(b: var Builder; tag: NiflerKind; body: untyped) =
   b.endTree()
 
 type
+  ParsedModule* = object
+    ## What nifler produces for one file before anything is written: the
+    ## `.p.nif` bytes and, when asked for, the `.p.deps.nif` bytes.
+    code*: string   ## empty for the `deps` command, which discards it
+    deps*: string   ## empty unless deps were requested
+    ok*: bool
+    msg*: string    ## what to print when `ok` is false; empty when the Nim
+                    ## parser already reported the errors itself
+
   TranslationContext = object
     conf: ConfigRef
     section: NiflerKind
@@ -871,11 +880,15 @@ proc toNif*(n, parent: PNode; c: var TranslationContext; allowEmpty = false) =
       toNif(n[i], n, c)
     c.b.endTree()
 
-proc initTranslationContext*(conf: ConfigRef; outfile: string; portablePaths, depsEnabled: bool;
-                              depsOnly = false; preserveDocs = false): TranslationContext =
-  result = TranslationContext(conf: conf,
+proc initContextFields(conf: ConfigRef; portablePaths, depsEnabled, depsOnly,
+                       preserveDocs: bool): TranslationContext =
+  TranslationContext(conf: conf,
     portablePaths: portablePaths, depsEnabled: depsEnabled or depsOnly, lineInfoEnabled: not depsOnly,
     preserveDocs: preserveDocs)
+
+proc initTranslationContext*(conf: ConfigRef; outfile: string; portablePaths, depsEnabled: bool;
+                              depsOnly = false; preserveDocs = false): TranslationContext =
+  result = initContextFields(conf, portablePaths, depsEnabled, depsOnly, preserveDocs)
   # nifler opts into OnlyIfChanged: when a re-parse produces byte-identical
   # output (e.g. `touch foo.nim` with no real edit, or comment-only edits
   # that the parser strips), keep the old mtime on `.p.nif` / `.p.deps.nif`
@@ -890,6 +903,16 @@ proc initTranslationContext*(conf: ConfigRef; outfile: string; portablePaths, de
       result.deps = nifbuilder.open(outfile.changeFileExt(".deps.nif"),
                                      writeMode = OnlyIfChanged)
 
+proc initMemoryContext(conf: ConfigRef; portablePaths, depsEnabled, depsOnly,
+                       preserveDocs: bool): TranslationContext =
+  ## `initTranslationContext` with both builders in memory: same bytes, no
+  ## destination. A file-mode `Builder` accumulates in memory anyway and only
+  ## flushes at `close`, so the produced NIF cannot differ between the two.
+  result = initContextFields(conf, portablePaths, depsEnabled, depsOnly, preserveDocs)
+  result.b = nifbuilder.open(1024)
+  if result.depsEnabled:
+    result.deps = nifbuilder.open(1024)
+
 proc close*(c: var TranslationContext; depsOnly = false) =
   if depsOnly:
     discard "discard main output"
@@ -898,6 +921,15 @@ proc close*(c: var TranslationContext; depsOnly = false) =
   if c.depsEnabled:
     c.deps.endTree()
     c.deps.close()
+
+proc takeOutputs(c: var TranslationContext; depsOnly: bool; m: var ParsedModule) =
+  ## `close` for a memory context: the same finished bytes, moved out instead of
+  ## written. `depsOnly` discards the main output exactly as `close` does.
+  if not depsOnly:
+    m.code = extract(move c.b)
+  if c.depsEnabled:
+    c.deps.endTree()
+    m.deps = extract(move c.deps)
 
 proc moduleToIr*(n: PNode; c: var TranslationContext) =
   c.b.addHeader "Nifler", "nim-parsed"
@@ -919,26 +951,61 @@ template bench(task, body) =
   else:
     body
 
-proc parseFile*(thisfile, outfile: string; portablePaths, depsEnabled, depsOnly: bool;
-                preserveDocs: bool = false) =
+proc parseToBuf*(thisfile: string; portablePaths, depsEnabled, depsOnly: bool;
+                 preserveDocs: bool = false): ParsedModule =
+  ## Parse `thisfile` and hand back the NIF bytes without touching an output
+  ## file (`JIT.md` 6.1). The buffers are strings, not `TokenBuf`s: nifler
+  ## emits through `nifbuilder.Builder`, i.e. it renders NIF text directly and
+  ## never builds a token buffer. A caller that wants tokens parses `code` with
+  ## `nifpools.parseFromBuffer`.
+  result = ParsedModule(code: "", deps: "", ok: false, msg: "")
   let stream = llStreamOpen(AbsoluteFile thisfile, fmRead)
   if stream == nil:
-    quit "cannot open file: " & thisfile
-  else:
-    var conf = createConf()
-    let fileIdx = fileInfoIdx(conf, AbsoluteFile thisfile)
-    var parser: Parser = default(Parser)
-    syntaxes.openParser(parser, fileIdx, stream, newIdentCache(), conf)
-    bench "parseAll":
-      let fullTree = parseAll(parser)
+    result.msg = "cannot open file: " & thisfile
+    return
+  var conf = createConf()
+  let fileIdx = fileInfoIdx(conf, AbsoluteFile thisfile)
+  var parser: Parser = default(Parser)
+  syntaxes.openParser(parser, fileIdx, stream, newIdentCache(), conf)
+  bench "parseAll":
+    let fullTree = parseAll(parser)
 
-    if conf.errorCounter > 0:
-      closeParser(parser)
-      quit QuitFailure
-
-    var tc = initTranslationContext(conf, outfile, portablePaths, depsEnabled, depsOnly, preserveDocs)
-
-    bench "moduleToIr":
-      moduleToIr(fullTree, tc)
+  if conf.errorCounter > 0:
     closeParser(parser)
-    tc.close(depsOnly)
+    # The parser already reported every error on stderr; `msg` stays empty.
+    return
+
+  var tc = initMemoryContext(conf, portablePaths, depsEnabled, depsOnly, preserveDocs)
+
+  bench "moduleToIr":
+    moduleToIr(fullTree, tc)
+  closeParser(parser)
+  takeOutputs(tc, depsOnly, result)
+  result.ok = true
+
+proc writeIfChanged(filename, content: string) =
+  ## `nifbuilder.Builder.close`'s `OnlyIfChanged` file path, for bytes that are
+  ## already in a string.
+  if vfsExists(filename) and vfsRead(filename) == content: discard
+  else: vfsWrite(filename, content)
+
+proc writeParsed*(m: ParsedModule; outfile: string; depsEnabled, depsOnly: bool) =
+  ## Put a `parseToBuf` result where `parseFile` used to put it: for the `deps`
+  ## command the deps ARE the output file, otherwise the module is the output
+  ## file and the deps sit next to it as `.deps.nif`.
+  if depsOnly:
+    writeIfChanged(outfile, m.deps)
+  else:
+    writeIfChanged(outfile, m.code)
+    if depsEnabled:
+      writeIfChanged(outfile.changeFileExt(".deps.nif"), m.deps)
+
+proc parseFile*(thisfile, outfile: string; portablePaths, depsEnabled, depsOnly: bool;
+                preserveDocs: bool = false) =
+  ## Parse and write, i.e. `parseToBuf` plus `writeParsed`. Kept for callers
+  ## that want the tool's process-shaped behaviour: it `quit`s on a parse error.
+  let m = parseToBuf(thisfile, portablePaths, depsEnabled, depsOnly, preserveDocs)
+  if not m.ok:
+    if m.msg.len > 0: quit m.msg
+    quit QuitFailure
+  writeParsed(m, outfile, depsEnabled, depsOnly)

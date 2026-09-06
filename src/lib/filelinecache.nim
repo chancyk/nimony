@@ -26,6 +26,14 @@ type
 var
   gFileLineCache: FileLineCache
 
+proc resetFileLineCache*() =
+  ## Forget every cached file. The cache is keyed by path and holds the
+  ## content read the first time a diagnostic quoted that file, so a process
+  ## that compiles the same path twice (the in-process dev loop of `JIT.md`
+  ## 6.1, where the file may have been edited in between) would otherwise
+  ## quote the stale source. Reset here: `gFileLineCache`.
+  gFileLineCache = FileLineCache()
+
 proc loadFile*(filename: string) {.canRaise.} =
   var entry = CachedFile(content: readFile(filename), lineStarts: @[0])
   var nl = find(entry.content, '\n')

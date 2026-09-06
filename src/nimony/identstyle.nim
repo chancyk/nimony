@@ -108,3 +108,16 @@ proc pragmaKindByStyle*(name: StrId): NimonyPragma {.sideEffect.} =
   ensurePragmaStyleIndex()
   let norm = pool.strings.getOrIncl(normalizeStyleFull(pool.strings[name]))
   result = pragmaStyleIndex.getOrDefault(norm, NoPragma)
+
+proc resetStyleTables*() =
+  ## Drop both lazy indexes. Both are keyed by `StrId`s of the global
+  ## `nifpools.pool`, so they MUST be reset together with it (`resetPools`):
+  ## `styleHighWaterMark` is a raw index into `pool.strings`, and a fresh
+  ## smaller pool would leave it past the end — `ensureStyleGroups` would then
+  ## never index another string and `ignoreStyle` lookups would silently stop
+  ## finding siblings. `semmain.resetFrontendGlobals` calls both.
+  ##
+  ## Reset here: `styleGroups`, `styleHighWaterMark`, `pragmaStyleIndex`.
+  styleGroups = initTable[StrId, seq[StrId]]()
+  styleHighWaterMark = 0
+  pragmaStyleIndex = initTable[StrId, NimonyPragma]()

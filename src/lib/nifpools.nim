@@ -77,6 +77,27 @@ var pool*: Pool = newPool()
 nifcore.fallbackPool = pool
 nifcore.fallbackTags = globalTags
 
+proc resetPools*() =
+  ## Put the process back into the state it had at module init: a fresh `pool`
+  ## (empty `strings`/`syms`/`filenames`) and a fresh `globalTags` re-seeded in
+  ## `TagEnum` order, with `nifcore.fallbackPool`/`fallbackTags` re-pointed at
+  ## them. The frontend is architected around one global pool per compiled
+  ## module (`JIT.md` 3.1); a process that runs two phases back to back calls
+  ## this between them so the second module's interned ids start at 1 again and
+  ## its output cannot depend on what the first module happened to intern.
+  ##
+  ## `Pool`/`TagPool` are refs and every `TokenBuf` holds the one it was
+  ## created with, so buffers made BEFORE the reset keep decoding against the
+  ## old pool and stay self-consistent. What is not allowed is mixing: a
+  ## `StrId`/`SymId`/`TagId` from before the reset means something else after
+  ## it. Everything that caches ids or buffers across a reset must be reset
+  ## too — `programs.resetProgram` and `identstyle.resetStyleTables` are the
+  ## two in this repo, and `semmain.resetFrontendGlobals` calls all three.
+  pool = newPool()
+  globalTags = createMasterTagPool()
+  nifcore.fallbackPool = pool
+  nifcore.fallbackTags = globalTags
+
 # ── Type aliases ─────────────────────────────────────────────────────────
 
 # ── Buffer construction: thread the global pool + tags ───────────────────
@@ -318,13 +339,22 @@ when defined(nimony):
 else:
   {.pragma: canRaise.}
 
-proc writeFile*(b: var TokenBuf; filename: string; mode: FileWriteMode = AlwaysWrite) {.canRaise.} =
-  ## Serialize the buffer to a textual `.nif` module file (nifcore renderer).
-  let content = nifcoreparse.toModuleString(b, "." & nifreader.extractModuleSuffix(filename))
+proc renderModule*(b: var TokenBuf; filename: string): string =
+  ## The exact bytes `writeFile(b, filename, …)` puts on disk: the module
+  ## rendered with the suffix `filename` implies. Split out so a phase can
+  ## produce its output without deciding where — or whether — it is stored.
+  nifcoreparse.toModuleString(b, "." & nifreader.extractModuleSuffix(filename))
+
+proc writeRendered*(filename, content: string; mode: FileWriteMode = AlwaysWrite) {.canRaise.} =
+  ## `writeFile` for a module that is already rendered.
   if mode == OnlyIfChanged:
     let existingContent = try: vfsRead(filename) except: ""
     if existingContent == content: return
   vfsWrite(filename, content)
+
+proc writeFile*(b: var TokenBuf; filename: string; mode: FileWriteMode = AlwaysWrite) {.canRaise.} =
+  ## Serialize the buffer to a textual `.nif` module file (nifcore renderer).
+  writeRendered(filename, renderModule(b, filename), mode)
 
 proc parseFromFile*(filename: string; sizeHint = 100): TokenBuf =
   ## Whole-file read (classic nifcursors.parseFromFile) via the nifcore reader.
