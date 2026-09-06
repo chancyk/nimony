@@ -2362,6 +2362,16 @@ proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int) =
     # line it could not complete. In-process there is no command line for the
     # graph, and `runDag` has already named the node that failed, so the build
     # file is the useful identifier.
+    #
+    # Flush first. A failing node's diagnostics went to THIS process's stdout,
+    # which is block-buffered when the compiler's output is a pipe, while
+    # `quit` writes its message straight to stderr -- so without this the
+    # trailer arrives before the error it is a trailer for. The spawned form
+    # got the ordering for free because the child exited (and flushed) before
+    # `exec` returned, and `hastur`'s `removeMakeErrors` strips exactly the
+    # last `nifmake:`/`FAILURE:` lines, so the ordering is what every `.msgs`
+    # golden of a failing compile depends on.
+    stdout.flushFile()
     quit "FAILURE: build graph " & buildFile
 
 proc buildGraph*(config: sink NifConfig; project: string;

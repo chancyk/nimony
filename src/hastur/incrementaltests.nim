@@ -546,3 +546,204 @@ proc incrementalOCacheTests*(mode = "") =
     quit "FAILURE: " & $failures.len & " ctfe-ocache phase(s) failed."
   echo "ctfe-ocache", modeLabel(mode), ": 2 / 2 phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."
+
+# ---- The in-process scheduler (JIT_IMPL.md A2b) ---------------------------
+# `nimony` runs its build graphs in its own process and calls the registered
+# phases as procs (`src/nimony/phases.nim`). Three things have to hold and none
+# of them is visible from a compile's exit code:
+#
+# 1. `--report`'s new `inproc=` field says how many nodes never reached a
+#    process, and for an edit of one module of a small program every node
+#    before `cc` is one of them.
+# 2. The artifacts are the same bytes either way. That is the whole safety
+#    argument for the phase: a reset that misses a global, or a pool whose
+#    interning order differs, shows up as a differing `.nif` and nowhere else.
+# 3. A compile-time evaluation's own sub-compile is spawn-free before `cc`
+#    too. Its `--report` is not forwarded (P0a made the inner compile silent on
+#    purpose), so the evidence is the cost ledger: a phase that ran in a
+#    process leaves a `spawn` sample, and one that never did leaves none.
+
+proc ledgerSpawnedPhases*(cache: string): seq[string] =
+  ## Phases with a non-zero `spawn` sample in `<cache>/ledger.nif`.
+  ##
+  ## Read by scanning the text rather than through `src/lib/ledger.nim`: the
+  ## file is a flat `(entry (phase "x") ... (spawn ns N) ...)` list, the scan is
+  ## six lines, and the test then depends on the file the compiler wrote
+  ## instead of on the reader it wrote it with.
+  result = @[]
+  let p = cache / "ledger.nif"
+  if not fileExists(p): return
+  var phase = ""
+  for line in readFile(p).splitLines:
+    let s = line.strip
+    if s.startsWith("(phase \""):
+      var rest = s["(phase \"".len .. ^1]
+      let q = rest.find('"')
+      if q >= 0: rest = rest[0 ..< q]
+      phase = rest
+    elif s.startsWith("(spawn ns ") and phase.len > 0:
+      let v = s["(spawn ns ".len .. ^1]
+      var num = ""
+      for c in v:
+        if c in {'0'..'9'}: num.add c
+        else: break
+      if num.len > 0 and num != "0" and phase notin result:
+        result.add phase
+  sort result
+
+proc buildArtifacts*(cache: string): seq[string] =
+  ## Relative paths of every `.nif` and `.c` under `cache`, minus the ones that
+  ## record HOW the build ran rather than what it produced: the ledger snapshot
+  ## and the per-directory `.ledger/` fragments hold timings, and timings are
+  ## exactly what changes when a phase stops being a process.
+  result = @[]
+  let frag = DirSep & ".ledger" & DirSep
+  for f in walkDirRec(cache, relative = true):
+    if f.startsWith(".ledger" & DirSep) or f.contains(frag): continue
+    if f.lastPathPart == "ledger.nif": continue
+    let ext = f.splitFile.ext
+    if ext == ".nif" or ext == ".c": result.add f
+  sort result
+
+proc normalizedArtifact*(cache, rel: string): string =
+  ## An artifact's bytes with its own nimcache path replaced by a placeholder.
+  ## `*.build.nif` names every input and output absolutely and a `.c` can carry
+  ## the directory in a `#line`, so two runs into two directories differ there
+  ## and only there -- the comparison would be worthless if it either kept
+  ## those bytes or skipped those files.
+  result = readFile(cache / rel)
+  result = result.replace(absolutePath(cache), "<nimcache>")
+  result = result.replace(cache, "<nimcache>")
+
+proc incrementalInprocTests*() =
+  ## `--report`'s `inproc` field, byte identity against `--spawn:always`, and a
+  ## compile-time evaluation whose sub-compile spawns nothing before `cc`.
+  let t0 = epochTime()
+  let src = "tests/incremental/sample.nim"
+  let ctfeSrc = "tests/incremental/ctfedep.nim"
+  let nimony = "bin" / "nimony".addFileExt(ExeExt)
+  if not fileExists(src):
+    quit "inproc: " & src & " missing"
+  if not fileExists(nimony):
+    quit "inproc: " & nimony & " not found; run `hastur build nimony` first"
+  var failures: seq[string] = @[]
+  template expect(cond: bool; msg: string) =
+    if not cond: failures.add msg
+  var phases = 0
+
+  let originalSrc = readFile(src)
+  proc restoreSources() = writeFile(src, originalSrc)
+
+  proc compile(cache, file, extra: string): seq[seq[ReportEntry]] =
+    let cmd = nimony.quoteShell & " c --silentMake --report" & extra &
+              " --nimcache:" & cache.quoteShell & " " & file.quoteShell
+    let (output, ec) = execCmdEx(cmd)
+    if ec != 0:
+      stdout.write output
+      restoreSources()
+      quit "inproc: `" & cmd & "` failed"
+    result = parseNifmakeReports(output)
+
+  let cache = "nimcache" / "inproc"
+  removeDir cache
+
+  # Phase 1: a cold build runs most of the graph without a process.
+  block:
+    inc phases
+    let r = compile(cache, src, "")
+    expect r.len == 2, "cold: expected 2 build graphs, got " & $r.len
+    if r.len == 2:
+      let inproc = reportField(r[0], "inproc") + reportField(r[1], "inproc")
+      expect inproc >= 5,
+             "cold: only " & $inproc & " node(s) ran in-process; the " &
+             "scheduler is not routing the frontend and backend phases"
+      expect reportField(r[1], "cc") >= 1,
+             "cold: the backend graph ran no `cc`, so this phase proves nothing"
+
+  # Phase 2: a one-line edit. Every node of the frontend graph that runs is a
+  # registered phase, and in the backend graph the only processes left are the
+  # C compiler and the linker.
+  #
+  # `nifler` is subtracted rather than expected to be absent: it is the one
+  # frontend phase that is still a process (it links Nim's own parser, which
+  # cannot go into nimony -- see the header of `src/nimony/phases.nim`), and
+  # whether it appears in the graph at all depends on whether
+  # `deps.execNifler` already re-parsed the edited module during dependency
+  # discovery.
+  block:
+    inc phases
+    writeFile(src, originalSrc & "\necho \"inproc-edit\"\n")
+    let r = compile(cache, src, "")
+    expect r.len == 2, "edit: expected 2 build graphs, got " & $r.len
+    if r.len == 2:
+      let feTotal = reportField(r[0], "total")
+      let feSpawned = feTotal - reportField(r[0], "inproc") -
+                      reportField(r[0], "nifler")
+      expect feTotal > 0, "edit: the frontend graph re-ran nothing"
+      expect feSpawned == 0,
+             "edit: the frontend graph spawned " & $feSpawned &
+             " node(s) that are not nifler"
+      let beTotal = reportField(r[1], "total")
+      let beInproc = reportField(r[1], "inproc")
+      let spawnable = reportField(r[1], "cc") + reportField(r[1], "link")
+      expect beTotal - beInproc == spawnable,
+             "edit: the backend graph spawned " & $(beTotal - beInproc) &
+             " node(s) but only " & $spawnable & " are cc/link"
+      expect beInproc >= 3,
+             "edit: only " & $beInproc & " backend node(s) ran in-process"
+  restoreSources()
+
+  # Phase 3: the same source built cold into two nimcaches, once with the
+  # scheduler and once with `--spawn:always`. Every `.nif` and every `.c` must
+  # match byte for byte with the nimcache path normalised away. This is the
+  # phase that would catch a reset that missed a global: the pool's interning
+  # order is what `.dce.nif` and `.live.nif` serialise.
+  block:
+    inc phases
+    let cacheA = "nimcache" / "inproc-auto"
+    let cacheB = "nimcache" / "inproc-spawn"
+    removeDir cacheA
+    removeDir cacheB
+    discard compile(cacheA, src, "")
+    discard compile(cacheB, src, " --spawn:always")
+    let a = buildArtifacts(cacheA)
+    let b = buildArtifacts(cacheB)
+    expect a.len > 0, "identity: no artifacts under " & cacheA
+    expect a == b,
+           "identity: the two modes produced different artifact SETS (" &
+           $a.len & " vs " & $b.len & ")"
+    var differing: seq[string] = @[]
+    for rel in a:
+      if rel notin b: continue
+      if normalizedArtifact(cacheA, rel) != normalizedArtifact(cacheB, rel):
+        differing.add rel
+    expect differing.len == 0,
+           "identity: " & $differing.len & " artifact(s) differ between the " &
+           "scheduler and --spawn:always: " & differing.join(", ")
+
+  # Phase 4: a compile-time evaluation. Its sub-compile is a whole second
+  # `nimony s` process with its own two build graphs, and those have to be
+  # spawn-free before `cc` as well. The inner `--report` is deliberately not
+  # forwarded (P0a), so the ledger is the witness: `runDag` folds a `spawn`
+  # sample for every node that reached a process, and a phase that never did
+  # has none.
+  if fileExists(ctfeSrc):
+    inc phases
+    let ctfeCache = "nimcache" / "inproc-ctfe"
+    removeDir ctfeCache
+    discard compile(ctfeCache, ctfeSrc, "")
+    let spawned = ledgerSpawnedPhases(ctfeCache)
+    for p in ["nimsem", "hexer", "dce", "dceLive", "dceEmit", "lengc"]:
+      expect p notin spawned,
+             "ctfe: `" & p & "` has a spawn sample in the ledger, so some " &
+             "build -- the outer one or a sub-program's -- ran it as a process"
+    expect "cc" in spawned or "link" in spawned,
+           "ctfe: the ledger recorded no spawn at all, so this phase cannot " &
+           "tell a spawn-free frontend from a build that never happened"
+
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "inproc: " & f
+    quit "FAILURE: " & $failures.len & " inproc phase(s) failed."
+  echo "inproc: ", phases, " / ", phases, " phases successful in ",
+       formatFloat(dt, ffDecimal, precision=2), "s."

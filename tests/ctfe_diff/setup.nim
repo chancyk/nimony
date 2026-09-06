@@ -35,6 +35,15 @@ if failures > 0:
 # the corpus.
 if "--self-test" notin commandLineParams():
   failures += ctfeDiff(@["tests/nimony/consteval"], "--vfs:disk", "--vfs:memory+spill")
+  # A2b: the same corpus with every build-graph node in its own process
+  # (`--spawn:always`, the escape hatch) against the default, where nimony
+  # calls nimsem, hexer and lengc as procs in its own address space. What this
+  # pair is really comparing is a fresh process per phase against a reset of
+  # the globals a phase leaves behind (`resetFrontendGlobals`), so a reset that
+  # misses one shows up here as a differing `.out.nif` -- and a compile-time
+  # evaluation is where it would show up first, since the sub-program is
+  # produced by the very phases being reset.
+  failures += ctfeDiff(@["tests/nimony/consteval"], "--spawn:always", "")
   # B2: the same corpus with the sub-program COMPILED AND LINKED against the
   # same sub-program RUN FROM NIMSEM'S OWN MEMORY. Two entirely different ways
   # of producing a `.out.nif`, so this is the strongest statement the harness
