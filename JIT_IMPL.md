@@ -661,7 +661,7 @@ Gate: B3's numbers on each platform.
 | A1c | merged (13 new consteval tests, `tests/ctfe_diff` harness; 4 CTFE bugs documented in `tests/nimony/consteval/todo/README.md`: enum/set results crash the serializer, distinct loses its conversion, `seq[UserObject]` unresolved, failed evaluations have no diagnostic) | merged from jit/a1c |
 | A1d | planned | |
 | A2a-lengc | merged (`runLengc`, `resetLengcGlobals` (nothing to reset: audited), `generateCode` over `TokenBuf`/`MainModule`, `translate`/`serialize`/`writeGenerated` split, all five ledger buckets; `tests/inproc/lengc`) | merged from jit/a2a-lengc |
-| A2a-hexer | running | |
+| A2a-hexer | merged (`runHexer`, `resetHexerGlobals` (prog, pool/fallbackPool, inliner stats), `expand`/`computeLiveSet`/`dceEmit` over buffers with `ExpandInput`/`ExpandResult`/`DceInputs`/`LiveSet`, `hexerio.nim`; `tests/inproc/hexer`; finding: `TypeCache` must be built before parse or SymIds shift) | merged from jit/a2a-hexer |
 | A2a-front | running | |
 | A2b | planned | |
 | A2c | planned | |
