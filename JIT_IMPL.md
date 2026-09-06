@@ -653,7 +653,7 @@ Gate: B3's numbers on each platform.
 
 | phase | status | commit |
 |---|---|---|
-| P0a | planned | |
+| P0a | merged (`-f` no longer forwarded; `runEval` memo with `.out.nif.reads` sidecar from `std/writenif`; `-d:vfsProfile` builds; `bench/ctfe_bench.nim` + `bench/ctfe_latency.sh`; tmyops forced 3.63 s -> 0.91 s, edit-rebuild 0.194 s -> 0.092 s; 793/793 tests, boot byte-identical) | merged from jit/p0a |
 | P0b | merged (ocache under `nimcache/ocache/`; main module never owns a shared instantiation; second sub-program compiles 1 object instead of 8; `tmyops` user CPU 2.61 s -> 1.91 s) | merged from jit/p0b |
 | B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | planned | |
