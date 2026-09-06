@@ -45,6 +45,7 @@ Hexer accepts Nimony's grammar.
 import std / [parseopt, strutils, os, osproc, tables, assertions, syncio]
 import ".." / nimony / [langmodes, nifconfig]
 import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
+import hexerio
 import ".." / lib / [vfs, artifactstore, nimversion, ledger]
 from ".." / nimony / programs import prog, Program
 from ".." / lib / nifpools import pool, newPool, fallbackPool
@@ -244,16 +245,21 @@ proc runHexer*(args: seq[string]): int =
     # phase procs are split into load/parse/produce/serialize/write, so every
     # bucket the ledger carries is filled by the `note*` calls inside the
     # path-based wrappers rather than everything landing in `produce`.
-    try:
+    #
+    # `status` is how a phase reports an I/O failure it used to `quit` on, so
+    # that a library caller keeps its process. The message and the code below
+    # are the ones the CLI printed before A2a.
+    var status = HexerStatus(msg: "")
+    block:
       case action
       of "c":
         let dir = if outdir.len > 0: outdir else: files[0].parentDir
         var timer = initPhaseTimer(dir, "hexer", moduleSuffixOf(files[0]))
-        expand files[0], bits, bigEndian, flags, isMain, outdir, timer, appType, native, isWindows
+        expand files[0], bits, bigEndian, flags, isMain, outdir, timer, status, appType, native, isWindows
         timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".x.nif")
         timer.finish()
       of "d":
-        deadCodeElimination(files, outdir)
+        deadCodeElimination(files, outdir, status)
       of "dl":
         # Compute the global live set + resolve table from a list of
         # per-module `.dce.nif` analyses. Last argument is the output
@@ -271,16 +277,13 @@ proc runHexer*(args: seq[string]): int =
           return fail "de: expected <x.nif> <live.nif>"
         let dir = if outdir.len > 0: outdir else: files[0].parentDir
         var timer = initPhaseTimer(dir, "dceEmit", moduleSuffixOf(files[0]))
-        dceEmit(files[0], files[1], outdir, timer)
+        dceEmit(files[0], files[1], outdir, timer, status)
         timer.noteOutput(dir / moduleSuffixOf(files[0]) & ".c.nif")
         timer.finish()
       else:
         return writeHelp()
-    except CatchableError:
-      # The phase procs report an I/O failure by raising rather than by
-      # quitting, so that a library caller keeps its process. The message and
-      # the code are the ones the CLI used to print.
-      return fail getCurrentExceptionMsg()
+    if status.failed:
+      return fail status.msg
   result = QuitSuccess
 
 proc handleCmdLine*() =

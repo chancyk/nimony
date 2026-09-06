@@ -33,6 +33,26 @@ include ".." / lib / compat2
 from ".." / lib / nifcoreparse import nil
 import ".." / lib / [vfs, ledger]
 
+type
+  HexerStatus* = object
+    ## What a path-based wrapper answers instead of calling `quit`, so that a
+    ## library caller keeps its process (JIT_IMPL.md A2a). An empty `msg` is
+    ## success; otherwise `msg` is exactly the line the CLI printed on stderr
+    ## before exiting 1, and `runHexer` prints it and answers 1.
+    ##
+    ## A status object rather than an exception because hexer is compiled by
+    ## BOTH Nim and nimony (`hastur boot`), and nimony's `raise` carries an
+    ## `ErrorCode`, not a message -- `newException(IOError, msg)` does not
+    ## exist in that dialect.
+    msg*: string
+
+proc fail*(s: var HexerStatus; msg: string) =
+  ## Record the first failure; later ones do not overwrite it, so the caller
+  ## reports the cause rather than a consequence.
+  if s.msg.len == 0: s.msg = msg
+
+proc failed*(s: HexerStatus): bool {.inline.} = s.msg.len > 0
+
 proc loadAndParse*(filename: string; t: var PhaseTimer; sizeHint = 100): TokenBuf =
   ## `nifpools.parseFromFile` with the two halves timed apart: opening the
   ## reader (an mmap through the VFS relay) is `load`, building the tokens is
@@ -52,9 +72,14 @@ proc serializeModule*(b: var TokenBuf; filename: string): string =
   result = nifcoreparse.toModuleString(b, "." & nifreader.extractModuleSuffix(filename))
 
 proc writeSerialized*(content: string; filename: string;
-                      mode: FileWriteMode = AlwaysWrite) {.canRaise.} =
-  ## The write half of `nifpools.writeFile`, `OnlyIfChanged` included.
+                      mode: FileWriteMode; s: var HexerStatus) =
+  ## The write half of `nifpools.writeFile`, `OnlyIfChanged` included. A
+  ## failure becomes `s`'s message -- the same "could not write file: <path>"
+  ## the CLI printed before A2a -- rather than a `quit`.
   if mode == OnlyIfChanged:
     let existingContent = try: vfsRead(filename) except: ""
     if existingContent == content: return
-  vfsWrite(filename, content)
+  try:
+    vfsWrite(filename, content)
+  except:
+    s.fail "could not write file: " & filename

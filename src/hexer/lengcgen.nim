@@ -2826,18 +2826,21 @@ type
     modName*: string
     dir*: string
 
-proc expandDir*(infile, outdir: string): string =
+proc expandDir*(infile, outdir: string; s: var HexerStatus): string =
   ## Where a `hexer c` invocation writes. `--outdir` wins; otherwise the
   ## input's own directory, and the working directory for a bare file name.
   let mp = splitModulePath(infile)
-  if outdir.len > 0: outdir
+  if outdir.len > 0:
+    result = outdir
   elif mp.dir.len == 0:
-    try: getCurrentDir()
-    except: raise newException(IOError, "cannot get current working directory")
-  else: mp.dir
+    result = "."
+    try: result = getCurrentDir()
+    except: s.fail "cannot get current working directory"
+  else:
+    result = mp.dir
 
 proc loadExpandInput*(infile, outdir: string; bits: int;
-                      t: var PhaseTimer): ExpandInput {.canRaise.} =
+                      t: var PhaseTimer; s: var HexerStatus): ExpandInput =
   ## The `read` half of the path-based `expand`. `setupProgram` opens the
   ## reader, folds in the embedded and the `.s.idx.nif` index and parses the
   ## module in one call, so the whole of it is charged to `parse`; splitting
@@ -2854,7 +2857,7 @@ proc loadExpandInput*(infile, outdir: string; bits: int;
   ## buffer path and the file path interning in the same order as each other
   ## and as the pre-A2a code.
   let mp = splitModulePath(infile)
-  let dir = expandDir(infile, outdir)
+  let dir = expandDir(infile, outdir, s)
   result = ExpandInput(buf: createTokenBuf(0), modName: mp.name, ext: mp.ext,
                        dir: dir, bits: bits,
                        typeCache: createTypeCache(bits),
@@ -2949,32 +2952,34 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
 proc xnifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".x.nif"
 proc dcenifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".dce.nif"
 
-proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer) {.canRaise.} =
+proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer;
+                        s: var HexerStatus) =
   ## The `write` half of the path-based `expand`: render the `.x.nif`, publish
   ## it, then publish the `.dce.nif` analysis beside it.
   let destfileName = xnifPath(r)
   let content = serializeModule(r.x, destfileName)
   t.noteSerialize()
-  try:
-    writeSerialized(content, destfileName, OnlyIfChanged)
-  except:
-    raise newException(IOError, "could not write file: " & destfileName)
-  writeAnalysis(dcenifPath(r), r.dce, "." & r.modName)
+  writeSerialized(content, destfileName, OnlyIfChanged, s)
+  if not s.failed:
+    writeAnalysis(dcenifPath(r), r.dce, "." & r.modName)
   t.noteWrite()
 
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
              isMain: bool; outdir: string; t: var PhaseTimer;
-             appType = appConsole; native = false;
-             isWindows = defined(windows)) {.canRaise.} =
+             s: var HexerStatus; appType = appConsole; native = false;
+             isWindows = defined(windows)) =
   ## Path-based wrapper: read -> the buffer-level `expand` -> write.
-  var input = loadExpandInput(infile, outdir, bits, t)
+  var input = loadExpandInput(infile, outdir, bits, t, s)
+  if s.failed: return
   var r = expand(input, bigEndian, flags, isMain, appType, native, isWindows)
   t.noteProduce()
-  writeExpandResult(r, t)
+  writeExpandResult(r, t, s)
 
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
-             isMain: bool; outdir: string; appType = appConsole;
-             native = false; isWindows = defined(windows)) {.canRaise.} =
-  ## Untimed path-based wrapper (the pre-A2a signature).
+             isMain: bool; outdir: string; s: var HexerStatus;
+             appType = appConsole; native = false;
+             isWindows = defined(windows)) =
+  ## Untimed path-based wrapper (the pre-A2a signature plus its status).
   var t = initPhaseTimer("", "", "")
-  expand(infile, bits, bigEndian, flags, isMain, outdir, t, appType, native, isWindows)
+  expand(infile, bits, bigEndian, flags, isMain, outdir, t, s, appType, native,
+         isWindows)

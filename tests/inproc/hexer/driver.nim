@@ -73,12 +73,16 @@ resetHexerGlobals()
 # the file path render the same bytes.
 
 var t = initPhaseTimer("", "", "")
-var input = loadExpandInput(sA, bufDir, sizeof(int) * 8, t)
+var status = HexerStatus(msg: "")
+var input = loadExpandInput(sA, bufDir, sizeof(int) * 8, t, status)
 var r = expand(input, false, DefaultSettings, false,
                appConsole, false, defined(windows))
 let dest = bufDir / r.modName & ".x.nif"
 let content = serializeModule(r.x, dest)
-writeSerialized(content, dest, AlwaysWrite)
+writeSerialized(content, dest, AlwaysWrite, status)
+if status.failed:
+  write stderr, "driver: " & status.msg & "\n"
+  quit 1
 
 # The `.dce.nif` side output is an OBJECT in the buffer path, so write it out
 # too: proving it renders the same bytes proves the in-process pipeline can

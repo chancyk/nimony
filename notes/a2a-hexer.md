@@ -139,21 +139,26 @@ type
     dce*: ModuleAnalysis      ## what `.dce.nif` serializes
     modName*, dir*: string
 
-proc expandDir*(infile, outdir: string): string
-proc loadExpandInput*(infile, outdir: string; t: var PhaseTimer): ExpandInput
-proc expand*(input: var ExpandInput; bits: int; bigEndian: bool;
-             flags: set[CheckMode]; isMain: bool; appType = appConsole;
-             native = false; isWindows = defined(windows)): ExpandResult
+proc expandDir*(infile, outdir: string; s: var HexerStatus): string
+proc loadExpandInput*(infile, outdir: string; bits: int; t: var PhaseTimer;
+                      s: var HexerStatus): ExpandInput
+proc expand*(input: var ExpandInput; bigEndian: bool; flags: set[CheckMode];
+             isMain: bool; appType = appConsole; native = false;
+             isWindows = defined(windows)): ExpandResult
 proc xnifPath*(r: ExpandResult): string
 proc dcenifPath*(r: ExpandResult): string
-proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer)
+proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer; s: var HexerStatus)
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
-             isMain: bool; outdir: string; t: var PhaseTimer;
+             isMain: bool; outdir: string; t: var PhaseTimer; s: var HexerStatus;
              appType = appConsole; native = false; isWindows = defined(windows))
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
-             isMain: bool; outdir: string; appType = appConsole;
-             native = false; isWindows = defined(windows))   # pre-A2a signature
+             isMain: bool; outdir: string; s: var HexerStatus;
+             appType = appConsole; native = false; isWindows = defined(windows))
 ```
+
+`ExpandInput` carries `bits`, the `TypeCache` and the `LiftingCtx` because
+`loadExpandInput` has to build the type cache BEFORE it parses the module --
+see "Two decisions worth stating" below.
 
 `src/hexer/dce1.nim`:
 
@@ -190,9 +195,12 @@ proc readLiveFile*(infile: string; t: var PhaseTimer): LiveSet
 proc liveOf*(ls: LiveSet; modName: string): HashSet[SymId]
 proc rewriteBuf*(xbuf: var TokenBuf; live: HashSet[SymId]; resolved: ResolveTable): TokenBuf
 proc emitOutPath*(xnif, outdir: string): string
-proc dceEmit*(xnif: string; ls: LiveSet; outdir: string; t: var PhaseTimer)
-proc dceEmit*(xnif, liveFile, outdir: string; t: var PhaseTimer)
-proc dceEmit*(xnif, liveFile, outdir: string)
+proc dceEmit*(xnif: string; ls: LiveSet; outdir: string; t: var PhaseTimer;
+              s: var HexerStatus)
+proc dceEmit*(xnif, liveFile, outdir: string; t: var PhaseTimer; s: var HexerStatus)
+proc dceEmit*(xnif, liveFile, outdir: string; s: var HexerStatus)
+proc deadCodeElimination*(files: openArray[string]; outdir: string;
+                          s: var HexerStatus)
 ```
 
 `src/hexer/hexer.nim`:
@@ -203,8 +211,28 @@ proc resetHexerGlobals*()
 proc handleCmdLine*()          ## the CLI shell: runHexer(commandLineParams())
 ```
 
-`src/hexer/hexerio.nim` (new): `loadAndParse`, `serializeModule`,
-`writeSerialized` — see section 6.
+`src/hexer/hexerio.nim` (new):
+
+```nim
+type
+  HexerStatus* = object
+    msg*: string          ## "" is success; otherwise the CLI's stderr line
+
+proc fail*(s: var HexerStatus; msg: string)
+proc failed*(s: HexerStatus): bool
+proc loadAndParse*(filename: string; t: var PhaseTimer; sizeHint = 100): TokenBuf
+proc serializeModule*(b: var TokenBuf; filename: string): string
+proc writeSerialized*(content: string; filename: string; mode: FileWriteMode;
+                      s: var HexerStatus)
+```
+
+`HexerStatus` and not an exception because hexer is compiled by BOTH Nim and
+nimony (`hastur boot` self-hosts it), and nimony's `raise` carries an
+`ErrorCode`, not a message: `newException(IOError, msg)` does not exist in
+that dialect. This was found the hard way — the first implementation raised
+and `hastur boot` stage 1 rejected it with *"expected: typedesc[T] but got:
+ErrorCode"*. A status object is also the shape `JIT_IMPL.md` names first
+("becomes a returned error") and is AGENTS.md's explicit-state-object rule.
 
 ## Two decisions worth stating
 
@@ -217,8 +245,27 @@ the `.dce.nif` bytes are unchanged.
 
 **`LiveSet` is the cacheable object A2c wants.** `ResolveTable` is now
 exported, `readLiveFile` is separate from `parseLiveSet`, and
-`dceEmit(xnif, ls, outdir, t)` takes the object — so one `.live.nif` read
+`dceEmit(xnif, ls, outdir, t, s)` takes the object — so one `.live.nif` read
 serves N modules in one process instead of N reads.
+
+**The `TypeCache` is built before the parse, and that is load-bearing.**
+`ExpandInput` carries it because `builtintypes.createBuiltinTypes` interns
+`StringName` (`src/nimony/builtintypes.nim:146`). Pre-A2a, `expand` built its
+`EContext` (and therefore the type cache) and only then called
+`setupProgram`; the obvious refactor — "read the file, then run the phase" —
+inverts that, `StringName` lands after every symbol of the module, and every
+`SymId` shifts by one. Nothing about the `.x.nif` changes (it renders names),
+but `.dce.nif` and `.live.nif` serialize `HashSet[SymId]` and
+`Table[_, SymId]` in hash order, so the same symbols come out SHUFFLED.
+Caught by a direct comparison against a pre-A2a binary, not by any existing
+test — worth knowing for A2a-lengc and A2a-front, which have the same shape
+of seam.
+
+**The pool has to be reset between two in-process runs, for the same reason.**
+`resetHexerGlobals` therefore does `pool = newPool(); fallbackPool = pool`
+beside `prog = default(Program)`. `tests/inproc/hexer` fails two of its nine
+checks without it — the second `hexer c` and the `dl` — and passes all nine
+with it. JIT.md 6.1 already named `pool` in the reset set; this is why.
 
 ## The ledger split
 
@@ -237,6 +284,11 @@ change in section 6.
 
 ## Deviations from the plan
 
+- **The pre-A2a signatures gained a `HexerStatus` parameter.** They could not
+  keep their exact shape and stop calling `quit`: the failure has to leave the
+  proc somehow, and in the nimony dialect it cannot ride an exception. Nothing
+  outside `hexer.nim` called any of the four procs, so no call site outside
+  this phase's owner files is affected.
 - **`expand`'s buffer overload takes an `ExpandInput`, not a bare `Cursor`.**
   `JIT.md` 6.1 sketches `expand(Cursor): TokenBuf`. A bare cursor is not
   enough: `setupProgram` also registers the module in `prog` so that
@@ -247,8 +299,13 @@ change in section 6.
 - **`EContext.error` still calls `quit 1`.** It is the compiler's own
   diagnostic path (`hexer_context.nim:94-107`, `{.noreturn.}`), reached from
   ~200 call sites deep inside the passes, not the CLI path. Turning it into a
-  raise is a phase of its own; until then a malformed input kills a caller
-  that runs hexer in-process. Recorded as a risk, not fixed here.
+  status return is a phase of its own; until then a malformed input kills a
+  caller that runs hexer in-process. Same for `nifreader.open`'s
+  `quit "cannot open: <path>"` (`src/lib/nifreader.nim:569`), which is what a
+  missing input file hits. Recorded as risks, not fixed here.
+- **`hexer dl` has no `HexerStatus`.** `writeLiveFile` publishes through
+  `nifbuilder.close`, which is exactly what it did before A2a; adding a status
+  there would mean changing `nifbuilder`, which is `src/lib`.
 
 ---
 
@@ -294,7 +351,23 @@ duplicate or a remaining seam.
    reach, and turning it into a `CatchableError` touches every pass. Left for
    its own phase.
 
-## 7. Tests
+## 7. Verified byte-identity
+
+Against a `bin/hexer` built from `fast-devloop` at `400c091e`, on the fixtures
+`tests/inproc/hexer` builds:
+
+- `hexer c` on both modules: `.x.nif` and `.dce.nif` identical.
+- `hexer dl` over the five-module closure: `.live.nif` identical.
+- `hexer de` on both modules: `.c.nif` identical.
+- 15 CLI cases — `--help`, `-h`, `--version`, `-v`, no arguments, an unknown
+  flag, an unknown action, each of `--bits`/`--cpu`/`--app`/`--vfs`/
+  `--vfs-budget` with a bad value, `c` with two files, `dl` with one, `de`
+  with one — identical in stdout, stderr AND exit code. Plus the two failure
+  paths that used to `quit` from inside a phase: a missing input
+  (`[Error] cannot open: …`, 1) and an unwritable `--outdir`
+  (`could not write file: …`, 1).
+
+## 8. Tests
 
 `tests/inproc/hexer/setup.nim` builds two small modules' `.s.nif` inputs with
 `bin/nimony c --nimcache:<tmp>`, then:

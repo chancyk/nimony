@@ -210,7 +210,7 @@ proc emitOutPath*(xnif, outdir: string): string =
     xnif.changeModuleExt ".c.nif"
 
 proc rewriteModule(file: string; live: HashSet[SymId]; resolved: ResolveTable;
-                   outdir: string; t: var PhaseTimer) {.canRaise.} =
+                   outdir: string; t: var PhaseTimer; s: var HexerStatus) =
   ## Path-based wrapper: read -> `rewriteBuf` -> serialize -> write, with each
   ## step charged to its own ledger bucket.
   var buf = loadAndParse(file, t)
@@ -219,13 +219,11 @@ proc rewriteModule(file: string; live: HashSet[SymId]; resolved: ResolveTable;
   let outPath = emitOutPath(file, outdir)
   let content = serializeModule(dest, outPath)
   t.noteSerialize()
-  try:
-    writeSerialized(content, outPath, OnlyIfChanged)
-  except:
-    raise newException(IOError, "could not write file: " & outPath)
+  writeSerialized(content, outPath, OnlyIfChanged, s)
   t.noteWrite()
 
-proc deadCodeElimination*(files: openArray[string]; outdir: string) {.canRaise.} =
+proc deadCodeElimination*(files: openArray[string]; outdir: string;
+                          s: var HexerStatus) =
   ## Single-shot DCE: read all .dce.nif analyses, compute global liveness,
   ## then sequentially rewrite each module's .x.nif to .c.nif. Kept for
   ## the single-process API; the build pipeline now goes through the split
@@ -243,8 +241,9 @@ proc deadCodeElimination*(files: openArray[string]; outdir: string) {.canRaise.}
   let live = markLive(graphs, resolved)
   var t = initPhaseTimer("", "", "")
   for file in files:
+    if s.failed: return
     let modName = splitModulePath(file).name
-    rewriteModule(file, live.getOrQuit(modName), resolved, outdir, t)
+    rewriteModule(file, live.getOrQuit(modName), resolved, outdir, t, s)
 
 # ---- Split DCE: liveness computation and per-module emit -----------------
 
@@ -415,21 +414,22 @@ proc liveOf*(ls: LiveSet; modName: string): HashSet[SymId] =
   else: initHashSet[SymId]()
 
 proc dceEmit*(xnif: string; ls: LiveSet; outdir: string;
-              t: var PhaseTimer) {.canRaise.} =
+              t: var PhaseTimer; s: var HexerStatus) =
   ## Per-module emit against a `LiveSet` the caller already holds. This is the
   ## overload A2b/A2c use: the `.live.nif` is read once and N modules are
   ## emitted from it.
   rewriteModule(xnif, liveOf(ls, splitModulePath(xnif).name), ls.resolved,
-                outdir, t)
+                outdir, t, s)
 
-proc dceEmit*(xnif, liveFile, outdir: string; t: var PhaseTimer) {.canRaise.} =
+proc dceEmit*(xnif, liveFile, outdir: string; t: var PhaseTimer;
+              s: var HexerStatus) =
   ## Per-module emit: read `M.x.nif` plus the shared `liveFile`, write
   ## `M.c.nif`. Multiple invocations run in parallel under the build
   ## scheduler.
   let ls = readLiveFile(liveFile, t)
-  dceEmit(xnif, ls, outdir, t)
+  dceEmit(xnif, ls, outdir, t, s)
 
-proc dceEmit*(xnif, liveFile, outdir: string) {.canRaise.} =
-  ## Untimed path-based wrapper (the pre-A2a signature).
+proc dceEmit*(xnif, liveFile, outdir: string; s: var HexerStatus) =
+  ## Untimed path-based wrapper (the pre-A2a signature plus its status).
   var t = initPhaseTimer("", "", "")
-  dceEmit(xnif, liveFile, outdir, t)
+  dceEmit(xnif, liveFile, outdir, t, s)
