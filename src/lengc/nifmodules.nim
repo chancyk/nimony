@@ -19,8 +19,6 @@
 ## embedded index is read at the raw-token level with no pool involvement.
 
 import std / [assertions, tables, syncio] # syncio: `quit`
-from std / os import fileExists           # NOT a whole `os` import: it exports a
-                                          # `FileId` that collides with nifcore's
 import ".." / "lib" / nifcoreparse        # re-exports nifcore + parse
 import ".." / "lib" / nifcdecl              # stmtKind/symKind/pragmaKind, decls
 import ".." / "lib" / nifreader as rd       # Reader, jumpTo, indexStartsAt
@@ -84,6 +82,28 @@ proc loadForeign(c: var MainModule; s: SplittedSymName): Cursor =
   if not hasDecl(m, key):
     raiseAssert "Symbol not found in NIF module: " & key
   result = getDecl(m, key, c.tags, c.pool)   # share the main module's pool (SymId-keyed)
+
+proc registerForeignModule*(c: var MainModule; module: string; m: ForeignModule) =
+  ## Pre-register a foreign module under its bare suffix, so `loadForeign` and
+  ## `canLoadForeign` find it in the cache and never build a path for it. This is
+  ## the seam a caller that already holds the imported module's bytes uses; the
+  ## path-based lazy loading above stays the default and the fallback.
+  c.prog.mods[module] = m
+
+proc foreignModuleFromBuf*(content: sink string; module: string): ForeignModule =
+  ## The buffer twin of `foreignmodules.openForeignModule`. Same shape: keep the
+  ## reader open over the bytes and read the embedded index, so declarations are
+  ## still materialized one at a time by index offset. Binary modules are not
+  ## supported here — `bif` is mmap-only — and a caller holding bif bytes
+  ## registers them through the path loader instead.
+  ## Local to lengc until `src/lib/foreignmodules.nim` grows the twin; see
+  ## `notes/a2a-lengc.md` section 6.
+  result = ForeignModule(r: rd.openFromBuffer(ensureMove content, module),
+                         index: initTable[string, int](),
+                         decls: initTable[string, Cursor]())
+  if indexStartsAt(result.r) > 0:
+    result.hasEmbeddedIndex = true
+    result.index = readEmbeddedIndex(result.r)
 
 proc firstChild(c: Cursor): Cursor {.inline.} =
   result = c
@@ -317,32 +337,30 @@ proc densify(dest: var TokenBuf; n: var Cursor; cur: var NifLineInfo;
   of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi:
     inc n  # absorbed into the head token's own value/info; never freestanding
 
-proc load*(filename: string): MainModule =
-  ## Load the main module, sniffing the file header for the actual format:
-  ## filenames stay `.nif` throughout the pipeline, the content decides.
-  ## Text is parsed with a canonical Leng tag pool so interned TagIds equal the
-  ## master ordinals that `stmtKind`/`typeKind`/`symKind` decode against; a
-  ## `.bif` is loaded zero-copy with its own fresh pools (the bif INVARIANT)
-  ## and translated to the canonical pools during the densify copy below.
-  let fromBif = isBifFile(filename)
-  var raw = default(TokenBuf)
-  if fromBif:
-    var bm = bif.load(filename)  # mmap; the index is not needed here, we rescan
-    raw = ensureMove bm.buf
-  else:
-    var r = rd.open(filename)
-    case rd.processDirectives(r)
-    of rd.Success: discard
-    of rd.WrongHeader: quit "nif files must start with Version directive"
-    of rd.WrongMeta: quit "the format of meta information is wrong!"
-    let nodeCount = rd.fileSize(r) div 7
-    raw = createTokenBuf(nodeCount, nil, createLengTagPool())
-    nifcoreparse.parse(r, raw)
-    rd.close(r)
-  # Densify line info so `info(n)` is valid at every node (see `densify`). The
-  # densified buffer shares `raw`'s pool/tags in the text case; in the bif case
-  # it gets its own canonical pools and `DensifyRemap` translates the raw ids
-  # (tags, line-info FileIds) — strings/symbols re-intern by value anyway.
+proc looksLikeBif*(content: string): bool =
+  ## `bif.isBifFile` over bytes we already hold. The file probe opens the path
+  ## with the raw `syncio` API, so it cannot answer for a buffer at all; it
+  ## compares the same six magic name bytes and deliberately ignores
+  ## endianness/version so a wrong-version binary module still reaches `load`
+  ## and gets its precise diagnostic. See `notes/a2a-lengc.md` section 6 for the
+  ## shared-library version this wants to become.
+  const Magic = "NIFBIN"
+  result = content.len >= Magic.len
+  if result:
+    for i in 0 ..< Magic.len:
+      if content[i] != Magic[i]: return false
+
+proc loadFromBuf*(raw: var TokenBuf; filename: string; fromBif = false): MainModule =
+  ## The buffer half of `load`: everything after the input has been parsed into
+  ## `raw`. `filename` is the module's *logical* path — it names the module
+  ## (`splitModulePath`) and, through `prog.scheme`, the directory and extension
+  ## every foreign module is looked for under, so a caller working entirely from
+  ## buffers still passes the path the input would have had.
+  ##
+  ## Densifies line info so `info(n)` is valid at every node (see `densify`).
+  ## The densified buffer shares `raw`'s pool/tags in the text case; in the bif
+  ## case it gets its own canonical pools and `DensifyRemap` translates the raw
+  ## ids (tags, line-info FileIds) — strings/symbols re-intern by value anyway.
   result = MainModule(current: TypeScope(locals: initTable[SymId, Cursor]()),
                       filename: filename,
                       prog: NifProgram(scheme: splitModulePath(filename)))
@@ -358,3 +376,52 @@ proc load*(filename: string): MainModule =
   result.pool = result.src.pool
   result.tags = result.src.tags
   detectToplevelDecls(result)
+
+proc parseFromBuf*(content: sink string; filename: string): TokenBuf =
+  ## Parse textual NIF held in memory. The tag pool is the canonical Leng one so
+  ## interned TagIds equal the master ordinals that `stmtKind`/`typeKind`/
+  ## `symKind` decode against — the same invariant the file path relies on.
+  let nodeCount = content.len div 7
+  var r = rd.openFromBuffer(ensureMove content, rd.extractModuleSuffix(filename))
+  case rd.processDirectives(r)
+  of rd.Success: discard
+  of rd.WrongHeader: quit "nif files must start with Version directive"
+  of rd.WrongMeta: quit "the format of meta information is wrong!"
+  result = createTokenBuf(nodeCount, nil, createLengTagPool())
+  nifcoreparse.parse(r, result)
+  rd.close(r)
+
+proc readSource*(filename: string): string =
+  ## The module's bytes, kept apart from the parse so a driver can time loading
+  ## and parsing separately (`JIT_IMPL.md` A2a). A binary module comes back as
+  ## the empty string: `bif.load` mmaps the file itself, zero-copy, and reading
+  ## it here would only cost a second copy — `parseSource` re-opens it by path.
+  if not vfsExists(filename):
+    # The same diagnostic `nifreader.open` gave when it did the opening.
+    quit "[Error] cannot open: " & filename
+  if isBifFile(filename): result = ""
+  else: result = vfsRead(filename)
+
+proc parseSource*(content: sink string; filename: string): MainModule =
+  ## The parse half of `load`, over bytes `readSource` produced. An empty
+  ## `content` for an existing binary module means "mmap it yourself".
+  var fromBif = false
+  var raw = default(TokenBuf)
+  if content.len == 0 and isBifFile(filename):
+    fromBif = true
+    var bm = bif.load(filename)  # mmap; the index is not needed here, we rescan
+    raw = ensureMove bm.buf
+  elif looksLikeBif(content):
+    # A binary module handed over as bytes: bif's own loader is path-based, so
+    # spill it back through the mmap route rather than decode it here.
+    fromBif = true
+    var bm = bif.load(filename)
+    raw = ensureMove bm.buf
+  else:
+    raw = parseFromBuf(ensureMove content, filename)
+  result = loadFromBuf(raw, filename, fromBif)
+
+proc load*(filename: string): MainModule =
+  ## Load the main module, sniffing the file header for the actual format:
+  ## filenames stay `.nif` throughout the pipeline, the content decides.
+  result = parseSource(readSource(filename), filename)

@@ -834,56 +834,116 @@ proc writeLineDir(f: var CppFile, c: var GeneratedCode) =
     write f, def
     write f, "\n"
 
-proc generateCode*(s: var State, inp, outp: string; flags: set[GenFlag]) =
-  var m = load(inp)
-  m.config = s.config
-  var c = initGeneratedCode(m, flags, s.bits)
-  c.m.openScope()
+type
+  Translation* = object
+    ## One module's finished token streams, before anything is rendered to C
+    ## text. Splitting this from `serialize` is what lets a driver time the
+    ## translation and the rendering apart (`JIT_IMPL.md` A2a); it is also the
+    ## natural handoff point for a caller that wants the tokens rather than a
+    ## file.
+    c: GeneratedCode
+    body: seq[Token]       ## the module's own code, moved out of `c.code`
+    typeDecls: seq[Token]  ## the type declarations, likewise
+    bits: int
 
-  var n = beginRead(c.m.src)
-  traverseCode c, n
+  CodegenResult* = object
+    ## What one module compiles to, in memory. `header` is the `.h` the
+    ## `(header …)` sections asked for; `hasHeader` distinguishes "no header"
+    ## from "an empty one", because only the former must leave the file alone.
+    code*: string
+    header*: string
+    hasHeader*: bool
 
-  let realCode = move c.code
+proc translate*(s: var State; m: sink MainModule; flags: set[GenFlag];
+                t: var Translation) =
+  ## The `produce` half of `generateCode`: walk the module and emit tokens.
+  ## Touches no file. `t` is filled in place rather than returned: the cursors
+  ## in `MainModule` point into its own `src` buffer, so the module is moved
+  ## into the `GeneratedCode` and never copied out of it again.
+  var mm = m
+  mm.config = s.config
+  t.bits = s.bits
+  t.c = initGeneratedCode(mm, flags, s.bits)
+  t.c.m.openScope()
+
+  var n = beginRead(t.c.m.src)
+  traverseCode t.c, n
+
+  t.body = move t.c.code
   # now that we have seen the full code, we also know all the involved types:
   var co = TypeOrder()
-  traverseTypes(c.m, co)
+  traverseTypes(t.c.m, co)
 
-  generateTypes(c, co)
-  let typeDecls = move c.code
+  generateTypes(t.c, co)
+  t.typeDecls = move t.c.code
 
+  t.c.m.closeScope()
+
+proc serialize*(t: var Translation): CodegenResult =
+  ## The `serialize` half: render the token streams of `translate` into the C
+  ## translation unit and, when the module exported one, its header. Still
+  ## touches no file.
   var f = CppFile()
-  f.write "#define NIM_INTBITS " & $s.bits & "\n"
+  f.write "#define NIM_INTBITS " & $t.bits & "\n"
   f.write Prelude
-  if gfMainModule in c.flags:
+  if gfMainModule in t.c.flags:
     f.write $ThreadVarToken & "NB8 " & $ErrToken & $Semicolon & "\n"
 
-  writeTokenSeq f, c.includes, c
-  if optLineDir in c.m.config.options:
-    writeLineDir f, c
-  writeTokenSeq f, typeDecls, c
+  writeTokenSeq f, t.c.includes, t.c
+  if optLineDir in t.c.m.config.options:
+    writeLineDir f, t.c
+  writeTokenSeq f, t.typeDecls, t.c
   # so that v-tables can be generated protos must be written before data:
-  writeTokenSeq f, c.protos, c
-  writeTokenSeq f, c.data, c
-  writeTokenSeq f, realCode, c
+  writeTokenSeq f, t.c.protos, t.c
+  writeTokenSeq f, t.c.data, t.c
+  writeTokenSeq f, t.body, t.c
 
-  if c.init.len > 0:
+  if t.c.init.len > 0:
     f.write "static void __attribute__((constructor)) init(void) {"
-    if c.currentProc.needsOverflowFlag:
-      let ovfDecl = overflowDeclTokens(c)
-      c.init.insert(ovfDecl, 0)
-    writeTokenSeq f, c.init, c
+    if t.c.currentProc.needsOverflowFlag:
+      let ovfDecl = overflowDeclTokens(t.c)
+      t.c.init.insert(ovfDecl, 0)
+    writeTokenSeq f, t.c.init, t.c
     f.write "}\n\n"
 
-  if vfsExists(outp) and vfsRead(outp) == f.buf:
+  result = CodegenResult(code: move f.buf, header: "",
+                         hasHeader: t.c.headerFile.len > 0)
+  if result.hasHeader:
+    for x in items(t.c.headerFile):
+      result.header.add t.c.tokens[x]
+
+proc generateCode*(s: var State; m: sink MainModule; flags: set[GenFlag]): CodegenResult =
+  ## Buffer-level entry point: a loaded module in, the generated C out, no file
+  ## touched at either end. `nifmodules.loadFromBuf` builds the module from a
+  ## `TokenBuf`, and `nifmodules.registerForeignModule` pre-registers whatever
+  ## imported modules the caller already holds.
+  var t = default(Translation)
+  translate(s, m, flags, t)
+  result = serialize(t)
+
+proc generateCode*(s: var State; input: var TokenBuf; inp: string;
+                   flags: set[GenFlag]): CodegenResult =
+  ## The same, one step earlier: a parsed `.c.nif` buffer in, the generated C
+  ## out. `inp` is the module's logical path — it names the module and, through
+  ## `prog.scheme`, the directory foreign modules are resolved against, so a
+  ## caller working from buffers still says where the input would have lived.
+  var m = loadFromBuf(input, inp)
+  result = generateCode(s, m, flags)
+
+proc writeGenerated*(r: CodegenResult; outp: string) =
+  ## The `write` half: the `.c`/`.cpp` and, if there is one, the `.h` beside it.
+  ## An unchanged output keeps its mtime, which is what makes the incremental
+  ## build skip the `cc` node behind it.
+  if vfsExists(outp) and vfsRead(outp) == r.code:
     discard "unchanged, keep mtime for incremental builds"
   else:
-    vfsWrite outp, f.buf
+    vfsWrite outp, r.code
 
-  if c.headerFile.len > 0:
-    let selectHeader = outp.changeFileExt(".h")
-    var hbuf = ""
-    for x in items(c.headerFile):
-      hbuf.add c.tokens[x]
-    vfsWrite selectHeader, hbuf
+  if r.hasHeader:
+    vfsWrite outp.changeFileExt(".h"), r.header
 
-  c.m.closeScope()
+proc generateCode*(s: var State, inp, outp: string; flags: set[GenFlag]) =
+  ## The path-based entry point: read, generate, write.
+  var m = load(inp)
+  let r = generateCode(s, m, flags)
+  writeGenerated r, outp
