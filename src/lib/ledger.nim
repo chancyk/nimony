@@ -141,6 +141,38 @@ proc moduleSuffixOf*(path: string): string =
     result.add path[j]
     inc j
 
+proc phaseForArtifact*(path: string): string =
+  ## Which phase produces a file with this suffix, or `""` when nothing in the
+  ## pipeline claims it.
+  ##
+  ## This is the other direction of the key: a tool naming its *own* fragment
+  ## knows its phase, while a consumer holding only a path -- the artifact store
+  ## deciding whether an entry is cheaper to recompute than to reload (A1d) --
+  ## has to read it off the name. The table is the one in `deps.nim`'s file
+  ## naming procs, in the order the pipeline produces them.
+  ##
+  ## An unclaimed suffix answers `""` on purpose, and the caller must read that
+  ## as "there is no phase that could recompute this", not as "cost unknown":
+  ## the sidecars (`.deps.nif`, `.s.idx.nif`), the build files and anything a
+  ## plugin invented have no producing phase in the ledger's sense, so the only
+  ## way back to their bytes is to read them.
+  if path.endsWith(".p.nif") or path.endsWith(".pc.nif"): result = "nifler"
+  elif path.endsWith(".s.nif") or path.endsWith(".sc.nif"): result = "nimsem"
+  elif path.endsWith(".x.nif") or path.endsWith(".dce.nif"): result = "hexer"
+  elif path.endsWith(".live.nif"): result = "dceLive"
+  elif path.endsWith(".c.nif") or path.endsWith(".oc.nif"): result = "dceEmit"
+  elif path.endsWith(".c") or path.endsWith(".cpp") or path.endsWith(".ll") or
+       path.endsWith(".asm.nif"): result = "lengc"
+  elif path.endsWith(".o") or path.endsWith(".obj"): result = "cc"
+  else: result = ""
+
+proc artifactKey*(path: string): LedgerKey =
+  ## The ledger key of the phase that produced `path`. `phase == ""` means
+  ## nothing did; see `phaseForArtifact`.
+  let phase = phaseForArtifact(path)
+  if phase.len == 0: LedgerKey(phase: "", module: "")
+  else: LedgerKey(phase: phase, module: moduleSuffixOf(path))
+
 # --- keys and samples ------------------------------------------------------
 
 proc `<`(a, b: LedgerKey): bool =
@@ -228,18 +260,29 @@ proc record*(l: var Ledger; key: LedgerKey; s: LedgerSample; toolhash: string) =
       insertAt(l, pos, e)
   l.dirty = true
 
+proc stampMatches(entryHash, wanted: string): bool {.inline.} =
+  ## An empty `wanted` accepts any stamp. That is the door notes/a1a.md §6.4
+  ## describes: every tool has its own executable and therefore its own
+  ## toolhash, so a process asking what a *different* tool's phase costs -- the
+  ## artifact store weighing an entry against the phase that produced it, the
+  ## A2b scheduler weighing a spawn -- would filter every entry out if it had to
+  ## name a stamp. Asking about oneself still names one and still gets the
+  ## reset-on-rebuild behaviour.
+  wanted.len == 0 or entryHash == wanted
+
 proc estimate*(l: Ledger; key: LedgerKey; toolhash: string): LedgerSample =
   ## What `key` is expected to cost: its own average, else the average of the
-  ## phase across every module, else the table from JIT.md 3.3.
+  ## phase across every module, else the table from JIT.md 3.3. Only entries
+  ## stamped with `toolhash` count; an empty `toolhash` counts all of them.
   var pos = 0
   if find(l, key, pos) and l.entries[pos].samples > 0 and
-      l.entries[pos].toolhash == toolhash:
+      stampMatches(l.entries[pos].toolhash, toolhash):
     return l.entries[pos].ewma
   var acc = default(LedgerSample)
   var n = 0
   for i in 0 ..< l.entries.len:
     if l.entries[i].key.phase == key.phase and l.entries[i].samples > 0 and
-        l.entries[i].toolhash == toolhash:
+        stampMatches(l.entries[i].toolhash, toolhash):
       acc.produceNs += l.entries[i].ewma.produceNs
       acc.serializeNs += l.entries[i].ewma.serializeNs
       acc.writeNs += l.entries[i].ewma.writeNs
@@ -404,23 +447,87 @@ proc writeFragment*(dir: string; key: LedgerKey; s: LedgerSample;
   if not existed: ensureDir(fragmentDir(dir))
   writeLedgerFile(l, p)
 
-proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
-                  toolhash: string) =
-  ## Attach a spawn cost to a key another process measured. The sample count is
-  ## deliberately not bumped: the spawn is an observation *about* the sample the
-  ## tool itself recorded, not a second one. Provided for phase A1d, where
-  ## nifmake knows the wall time of a command and the tool's own `produce`.
-  let p = fragmentPath(dir, key)
-  var l = Ledger(path: p, entries: @[], current: toolhash, dirty: false)
-  let existed = readLedgerFile(l, p)
+proc foldSpawn(l: var Ledger; key: LedgerKey; spawnNs: int64; observer: string) =
+  ## Blend a spawn observation into `key`'s entry, creating one under the
+  ## observer's stamp only when there is nothing to blend into.
   var pos = 0
-  if find(l, key, pos) and l.entries[pos].toolhash == toolhash:
-    l.entries[pos].ewma.spawnNs = ewmaStep(l.entries[pos].ewma.spawnNs, spawnNs)
+  if find(l, key, pos):
+    if l.entries[pos].ewma.spawnNs == 0:
+      # First observation for this key. Zero is not a measurement -- no process
+      # has ever started in zero nanoseconds -- it is the tool saying "I do not
+      # measure this about myself", so the observation seeds the average
+      # instead of being blended against it. Blending would start every key a
+      # factor of three low and take a dozen builds to converge.
+      l.entries[pos].ewma.spawnNs = spawnNs
+    else:
+      l.entries[pos].ewma.spawnNs = ewmaStep(l.entries[pos].ewma.spawnNs, spawnNs)
     l.entries[pos].updated = vfsNow()
+    l.dirty = true
   else:
     var s = default(LedgerSample)
     s.spawnNs = spawnNs
-    record(l, key, s, toolhash)
+    record(l, key, s, observer)
+
+proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
+                  observer: string) =
+  ## Attach a spawn cost to a key another process measured. The sample count is
+  ## deliberately not bumped: the spawn is an observation *about* the sample the
+  ## tool itself recorded, not a second one.
+  ##
+  ## `observer` is the toolhash of whoever is *watching* -- nifmake, not the
+  ## tool -- and it is used only to stamp an entry this call has to create from
+  ## nothing (`cc` and `link` report no `produce` of their own). An entry that
+  ## already exists keeps the toolhash of the process that measured it, whatever
+  ## that is. Restamping it would be a lie about who took the measurement, and
+  ## restarting its average would throw away the tool's numbers on every build:
+  ## an observer's hash can never match the observed tool's.
+  let p = fragmentPath(dir, key)
+  var l = Ledger(path: p, entries: @[], current: observer, dirty: false)
+  let existed = readLedgerFile(l, p)
+  foldSpawn(l, key, spawnNs, observer)
+  if not existed: ensureDir(fragmentDir(dir))
+  writeLedgerFile(l, p)
+
+proc recordSpawnWall*(dir: string; phase, module: string; wallNs: int64;
+                      observer: string) =
+  ## What a *command* cost, as seen from outside it: `spawn` is the wall time
+  ## the process took minus the `produce` the tool inside it reported.
+  ##
+  ## This is nifmake's half of JIT.md 5.2. It runs once per executed command, so
+  ## it is one `vfsExists` plus one `vfsRead` plus one atomic write -- the same
+  ## budget `writeFragment` costs the tool itself.
+  ##
+  ## Two keys are probed before anything is created. A whole-program node keys
+  ## its own fragment with an empty module (`dceLive` does), while an observer
+  ## outside the tool can only derive a module suffix from the node's output
+  ## file. Probing `(phase, module)` and then `(phase, "")` lands the spawn on
+  ## the sample the tool actually took instead of opening a second entry beside
+  ## it; the extra probe is one `vfsExists` and only on the nodes that need it.
+  ##
+  ## The `produce` subtracted is the fragment's running average, not this run's
+  ## raw measurement: a separate process cannot see the latter, and the tool has
+  ## just folded the latter into the former. The difference is damped again by
+  ## the EWMA the spawn itself goes through. When no fragment exists at all --
+  ## `cc`, `link`, and anything else that is not one of our instrumented tools
+  ## -- the whole wall time is the spawn cost, which is the honest answer for a
+  ## node that can never run in-process.
+  var key = LedgerKey(phase: phase, module: module)
+  var p = fragmentPath(dir, key)
+  var l = Ledger(path: p, entries: @[], current: observer, dirty: false)
+  var existed = readLedgerFile(l, p)
+  if not existed and module.len > 0:
+    let whole = LedgerKey(phase: phase, module: "")
+    let wp = fragmentPath(dir, whole)
+    if readLedgerFile(l, wp):
+      key = whole
+      p = wp
+      existed = true
+  var produceNs = 0'i64
+  var pos = 0
+  if find(l, key, pos): produceNs = l.entries[pos].ewma.produceNs
+  var spawnNs = wallNs - produceNs
+  if spawnNs < 0: spawnNs = 0
+  foldSpawn(l, key, spawnNs, observer)
   if not existed: ensureDir(fragmentDir(dir))
   writeLedgerFile(l, p)
 
@@ -525,13 +632,26 @@ proc statsTable*(l: Ledger): string =
   result = ""
   let rows = phaseTotals(l)
   if rows.len == 0: return
+  ##
+  ## `spawn ms` is what the process behind the phase cost on top of the work it
+  ## did: nifmake measures the wall time of the command and subtracts the
+  ## `produce` the tool reported from inside it (A1d). For `cc` and `link`,
+  ## which report no `produce` of their own, it is the whole command.
+  ##
+  ## It is wall time, and nimony runs nifmake with `-j`, so on a wide DAG depth
+  ## it also carries the CPU contention of the fan-out. That is the number the
+  ## scheduler wants -- what a process costs *in this build* is what decides
+  ## whether the node is worth one -- but it is not process startup in
+  ## isolation, and a busy depth reads higher than an idle one.
   result = "[stats] " & padTo("phase", 10, false) & padTo("samples", 9, true) &
-           padTo("produce ms", 13, true) & padTo("ser+parse ms", 14, true) &
+           padTo("produce ms", 13, true) & padTo("spawn ms", 11, true) &
+           padTo("ser+parse ms", 14, true) &
            padTo("write ms", 10, true) & padTo("bytes", 12, true)
   for i in 0 ..< rows.len:
     result.add "\n[stats] " & padTo(rows[i].phase, 10, false) &
       padTo($rows[i].samples, 9, true) &
       padTo(formatMs(rows[i].produceNs), 13, true) &
+      padTo(formatMs(rows[i].spawnNs), 11, true) &
       padTo(formatMs(rows[i].serializeNs + rows[i].parseNs), 14, true) &
       padTo(formatMs(rows[i].writeNs), 10, true) &
       padTo($rows[i].bytes, 12, true)

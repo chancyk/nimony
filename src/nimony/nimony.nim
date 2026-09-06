@@ -105,6 +105,9 @@ Options:
                             every tool of the build through the environment.
   --vfs-budget:MB           how much the artifact store may hold resident
                             before it sheds entries (default: 512)
+  --vfs-spill-margin:PCT    over the budget, only spill an artifact when
+                            reloading it costs less than PCT percent of
+                            recomputing it (default: 50)
   --novalidate              skip running the plugin validator on plugin sources
   --verbose                 dump Final IR (and other diagnostics) on contract
                             analysis failures
@@ -291,6 +294,18 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
           of "stats":
             c.buildFlags.incl Stats
             forwardArg = false
+          of "vfs-spill-margin", "vfsspillmargin":
+            # The artifact store's spill decision (JIT.md 5.2). Parsed here
+            # rather than in `cli.parseCommonOption` beside `--vfs` because the
+            # tools that share that parser are the ones that never see the flag
+            # anyway: like the policy and the budget it travels to every child
+            # in the environment, so that two settings still emit
+            # byte-identical `*.build.nif` files.
+            let pct = parseBudgetMB(val)
+            if pct <= 0 or pct > 100:
+              quit "invalid value for --vfs-spill-margin; expected a percentage"
+            requestSpillMargin pct
+            forwardArg = false
           of "ischild":
             # undocumented command line option, by design
             c.isChild = true
@@ -449,6 +464,12 @@ when isMainModule:
   # The store, if any, has to exist before the first artifact is touched and
   # after `--vfs` has been seen. Every child process inherits the mode through
   # the environment (`artifactstore.applyRequestedStore`).
+  #
+  # The nimcache goes the same way: it is where the cost ledger lives, and the
+  # store reads the ledger to decide what is cheaper to reload than to
+  # recompute (A1d). The driver is the only process that knows the directory
+  # from a command line rather than from a path it was handed.
+  requestLedgerDir(c.config.nifcachePath)
   applyRequestedStore()
   compileProgram(c)
   storeFlush()

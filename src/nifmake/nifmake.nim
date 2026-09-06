@@ -10,7 +10,7 @@
 
 import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes, sets, parseopt, syncio, osproc, algorithm, terminal]
 import ".." / lib / [bitabs, lineinfos, nifreader, tooldirs, argsfinder, vfs, artifactstore,
-                     nifpools, nimversion]
+                     nifpools, nimversion, ledger]
 
 # Inspired by https://gittup.org/tup/build_system_rules_and_algorithms.pdf
 #[
@@ -73,6 +73,12 @@ type
     maxDepth*: int    # maximum depth in the DAG
     commands*: seq[Command]  # bidirectional mapping of commands
     baseDir*: string
+    nimcache*: string
+      ## The directory the build file itself lives in, which is the nimcache.
+      ## See `ledgerTargetOf` for why that identity holds and what it is for.
+      ## Deliberately NOT `baseDir`: that one is the `.args` search root
+      ## (`expandCommand` is its only reader) and has nothing to do with where
+      ## artifacts land.
 
   CliCommand = enum
     cmdRun, cmdMakefile, cmdHelp, cmdVersion
@@ -341,6 +347,56 @@ proc offerNode(name, command: string; node: Node; baseDir: string): RunNodeStatu
     name: name, command: command, inputs: node.inputs,
     outputs: node.outputs, args: node.args, baseDir: baseDir))
 
+# --- the cost ledger ------------------------------------------------------
+#
+# JIT.md 5.2 gives every artifact a `spawn` cost, and nifmake is the only
+# process that can measure one: it knows the wall time of a command, and the
+# tool inside that command has just written down what its own work cost. The
+# difference is the process -- fork, exec, dyld, the tool's own startup, and on
+# macOS the Gatekeeper tax that JIT.md 3.3 measures separately.
+#
+# The cost of collecting it is one `getMonoTime` pair per command plus, after
+# the command, one `vfsExists` + `vfsRead` + one atomic write of a ~350-byte
+# fragment (`ledger.recordSpawnWall`). Against a process spawn that is noise,
+# and it is the same budget the tool inside already pays for its own fragment.
+
+proc ledgerTargetOf(dag: Dag; node: Node): (string, string) =
+  ## Where a node's spawn sample goes: `(fragment directory, module suffix)`.
+  ##
+  ## The directory is the one the node's first output lands in, which is by
+  ## construction the directory the tool wrote into -- nifler's `--nimcache`,
+  ## hexer's `--outdir`, lengc's backend directory -- so nifmake folds its
+  ## observation into the very fragment the tool just published rather than
+  ## opening a second one beside it.
+  ##
+  ## Two guards keep every fragment inside the nimcache and reachable:
+  ##
+  ## - `openLedger` folds `<nimcache>/.ledger/` and `<nimcache>/*/.ledger/`,
+  ##   which is exactly the two levels the pipeline writes into. A fragment any
+  ##   deeper would be written and never read again.
+  ## - A node can name an output outside the nimcache altogether -- `link` under
+  ##   `--out:` puts the executable wherever the user asked. Writing a `.ledger/`
+  ##   into somebody's source directory is not this tool's business.
+  ##
+  ## In both cases the sample lands at the nimcache root instead. The module
+  ## suffix is kept either way: it is what names the sample, not where it lives.
+  if node.outputs.len == 0: return (dag.nimcache, "")
+  let out0 = node.outputs[0]
+  let dir = out0.parentDir
+  let module = moduleSuffixOf(out0)
+  if dag.nimcache.len == 0 or dir == dag.nimcache or
+     dir.parentDir == dag.nimcache:
+    result = (dir, module)
+  else:
+    result = (dag.nimcache, module)
+
+proc recordSpawnSample(dir, cmdName, module: string; start: MonoTime) =
+  ## One executed command's spawn cost. Called once the process has exited, so
+  ## the tool's own fragment is already on the disk and `recordSpawnWall` can
+  ## subtract the `produce` it reported.
+  let wallNs = (getMonoTime() - start).inNanoseconds
+  recordSpawnWall(dir, cmdName, module, wallNs, toolhash())
+
 proc failed(arg: string) =
   stdout.write "nifmake: "
   stdout.writeLine arg
@@ -419,6 +475,9 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
             progressLo = 0; progressHi = 100): bool =
   ## Execute the DAG in topological order
   result = true
+  var executed = 0
+    ## Commands that actually reached a process. Only a run that spawned
+    ## something has anything new to consolidate.
   let sortStart = if profile != nil: getMonoTime() else: MonoTime()
   let sortedNodes = topologicalSort(dag)
   if profile != nil:
@@ -442,6 +501,11 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
       var nodeIds: seq[int] = @[]
       var cmdNames: seq[string] = @[]
       var labels: seq[string] = @[]  # captured by afterRunEvent (can't capture `dag`)
+      # Same shape and the same reason: `afterRunEvent` sees an index, not a
+      # node, so where this node's ledger fragment goes has to be resolved
+      # before the batch runs.
+      var ledgerDirs: seq[string] = @[]
+      var modules: seq[string] = @[]
 
       # Collect all commands at the current depth
       while i < sortedNodes.len and dag.nodes[sortedNodes[i]].depth == currentDepth:
@@ -461,6 +525,10 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
             nodeIds.add(sortedNodes[i])
             cmdNames.add(cmdName)
             labels.add(nodeLabel(dag, node[]))
+            let (ldir, lmod) = ledgerTargetOf(dag, node[])
+            ledgerDirs.add(ldir)
+            modules.add(lmod)
+            inc executed
           of RunHandledOk:
             # An in-process node still counts as an executed command, so
             # `--report` keeps meaning what it meant. Its duration is zero
@@ -482,18 +550,22 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
       # Execute all commands at this depth in parallel
       if commands.len > 0:
         var progress = newSeq[CmdStatus](commands.len)
-        var startTimes = if profile != nil: newSeq[MonoTime](commands.len) else: @[]
-        if profile != nil: startTimes.setLen(commands.len)
+        # The clock reads are unconditional now: the ledger wants every
+        # command's wall time, not only a `--profile` run's. Two `getMonoTime`
+        # calls against a process spawn is three orders of magnitude apart.
+        var startTimes = newSeq[MonoTime](commands.len)
         let depthStart = if profile != nil: getMonoTime() else: MonoTime()
 
         proc beforeRunEvent(idx: int) =
           progress[idx] = Running
-          if profile != nil: startTimes[idx] = getMonoTime()
+          startTimes[idx] = getMonoTime()
 
         proc afterRunEvent(idx: int; p: Process) =
           progress[idx] = Finished
           inc prog.done
           prog.draw(labels[idx])
+          recordSpawnSample(ledgerDirs[idx], cmdNames[idx], modules[idx],
+                            startTimes[idx])
           if profile != nil:
             let sec = toSeconds(getMonoTime() - startTimes[idx])
             profile[].recordCmdTime(cmdNames[idx], sec)
@@ -528,12 +600,19 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
         if Verbose in opt:
           echo "Command: ", expandedCmd
         let cmdName = dag.commands[node.cmdIdx].name
-        let start = if profile != nil: getMonoTime() else: MonoTime()
+        let start = getMonoTime()
+        let status = offerNode(cmdName, expandedCmd, node[], dag.baseDir)
         let ok =
-          case offerNode(cmdName, expandedCmd, node[], dag.baseDir)
+          case status
           of RunSpawn: executeCommand(expandedCmd)
           of RunHandledOk: true
           of RunHandledFailed: false
+        if status == RunSpawn:
+          inc executed
+          # Even a failed command spawned a process, and what that cost is worth
+          # knowing: the next run will decide whether to spawn it again.
+          let (ldir, lmod) = ledgerTargetOf(dag, node[])
+          recordSpawnSample(ldir, cmdName, lmod, start)
         if not ok:
           if profile != nil:
             profile[].recordCmdTime(cmdName, toSeconds(getMonoTime() - start))
@@ -553,6 +632,14 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           echo "Up to date: ", node.outputs.join(", ")
 
   prog.finish()
+
+  # Fold this run's fragments into `<nimcache>/ledger.nif` (JIT_IMPL.md A1d).
+  # The snapshot is what a later process reads without walking the directory,
+  # and this is the last moment in a build at which every tool has finished
+  # writing. Skipped when nothing ran: an up-to-date build has nothing new to
+  # fold and must stay as close to free as it is today.
+  if executed > 0:
+    consolidate(dag.nimcache)
 
 proc mescape(p: string): string =
   when defined(windows):
@@ -684,7 +771,7 @@ proc parseDoRule(n: var Cursor; dag: var Dag) =
 
 proc parseNifFile(filename: string; baseDir: sink string): Dag =
   ## Parse a .nif file and build the DAG
-  result = Dag(baseDir: baseDir)
+  result = Dag(baseDir: baseDir, nimcache: filename.parentDir)
 
   if not vfsExists(filename):
     quit "File not found: " & filename
