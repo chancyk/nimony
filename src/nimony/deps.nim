@@ -1180,6 +1180,10 @@ proc fillObjectCache(c: var DepContext; backend, commandLineArgsLengc, passC: st
   common.add "\n"
   common.add $getLastModTime(findTool("hexer"))
   common.add "\n"
+  # The C compiler too: `ccCmdTokens[0]` names it, but a driver upgrade behind
+  # the same name must not serve objects compiled by the old one.
+  common.add $getLastModTime(findExe(ccCmdTokens(c, passC, false, "")[0]))
+  common.add "\n"
   # Every module's Leng IR appears in its own key and in the key of everything
   # that imports it, so digest each file once rather than re-reading it per
   # importer.

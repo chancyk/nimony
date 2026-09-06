@@ -52,8 +52,10 @@ Toolchain facts the phases rely on (verified in source):
   `memoIsStale` (line 614) and `runPlugin` (line 636) are the memo model.
 - `src/nimony/exprexec.nim:728` `executeExpr` is the CTFE seam; it ends in
   `rewriteSymsToIdents` + `runEval`.
-- `src/nimony/deps.nim:1911` `buildGraphForEval` emits the sub-program's
-  build graph; `src/nifmake/nifmake.nim:220` `needsRebuild` is the only
+- CTFE sub-programs are built by `semos.runProgram` spawning `nimony s
+  <sfx>.p.nif`, which goes through the ordinary `deps.buildGraph` and
+  `generateFinalBuildFile` (`buildGraphForEval` is only reachable from the
+  unused `nimsem e`; P0b verified this); `src/nifmake/nifmake.nim:220` `needsRebuild` is the only
   staleness check and it uses `vfsMtime`/`vfsExists` exclusively.
 - Tool entry points: `semmain.semcheck(infiles, outfiles, config, ...)`,
   `lengcgen.expand(infile, bits, ..., outdir)`, `dce2.computeLiveSet`,
@@ -531,7 +533,7 @@ Goal (JIT.md 6.3): a `const` costs no spawn before `cc`.
 
 Owner files: `src/nimony/exprexec.nim`, `src/nimony/semos.nim`
 (`runEval`, `runProgram`, `prepareEval`), `src/nimony/macro_plugin.nim`,
-`src/nimony/deps.nim` (`buildGraphForEval` → library call), `tests/ctfe_diff/**`.
+`src/nimony/deps.nim` (`buildGraph` for `.p.nif` projects → library call), `tests/ctfe_diff/**`.
 
 Steps:
 
@@ -652,7 +654,7 @@ Gate: B3's numbers on each platform.
 | phase | status | commit |
 |---|---|---|
 | P0a | planned | |
-| P0b | planned | |
+| P0b | merged (ocache under `nimcache/ocache/`; main module never owns a shared instantiation; second sub-program compiles 1 object instead of 8; `tmyops` user CPU 2.61 s -> 1.91 s) | merged from jit/p0b |
 | B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | planned | |
 | A1b | planned | |
