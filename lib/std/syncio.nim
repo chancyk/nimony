@@ -415,11 +415,30 @@ else:
 
   const IOFBF = 0'i32  ## _IOFBF; 0 on glibc/musl, Darwin and Windows alike
 
+type
+  FileReadLog* = object
+    ## An opt-in record of the files this process opened for reading. It exists
+    ## for compile-time evaluation: the compiler memoizes the result of a
+    ## `const` it had to compile and run as a program (`semos.runEval`), and
+    ## that memo is only sound if it knows which files the *running program*
+    ## read — a `readFile` in a `const` initializer is an ordinary call, so no
+    ## compiler phase ever sees the path. `std/writenif` turns the log on
+    ## around such an evaluation and reports the paths back, which is the same
+    ## channel `plugins.dependsOn` gives a plugin.
+    ##
+    ## Off by default: the cost to every other program is one `bool` test per
+    ## successful open.
+    enabled*: bool
+    paths*: string ## the recorded paths, one per line, in open order
+
+var fileReadLog* = FileReadLog(enabled: false, paths: "")
+
 proc open*(f: out File; filename: string;
            mode: FileMode = fmRead;
            bufSize: int = -1): bool =
   ## Opens a file with specified mode and buffer size (`bufSize`; use `-1` for default buffering).
   ## Returns whether the open succeeded.
+  ## Every read-mode open is appended to `fileReadLog` while that log is on.
   when defined(nimNativeIo) and defined(windows):
     # `bufSize` is advisory only: the buffers are `seq[char]` and grow on demand.
     var desiredAccess, shareMode, disposition: DWORD
@@ -496,6 +515,12 @@ proc open*(f: out File; filename: string;
         discard c_setvbuf(f, nil, IOFBF, cast[uint](bufSize))
     else:
       result = false
+
+  # Single choke point: `readFile`, `readLines` and the `lines` iterator all
+  # come through here, so recording it once covers the whole read API.
+  if result and mode == fmRead and fileReadLog.enabled:
+    fileReadLog.paths.add filename
+    fileReadLog.paths.add '\n'
 
 proc open*(filename: string,
             mode: FileMode = fmRead, bufSize: int = -1): File =
