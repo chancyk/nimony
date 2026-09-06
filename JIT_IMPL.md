@@ -660,7 +660,9 @@ Gate: B3's numbers on each platform.
 | A1b | merged (`src/lib/artifactstore.nim`; `--vfs:disk\|memory\|memory+spill\|verify`, `--vfs-budget`, policy handed to children via `NIMONY_VFS` env; 36 direct call sites converted; `nifmake.runNodeRelay` tri-state seam; whole tree green under `--vfs:memory+spill`; verify mode 0 mismatches) | merged from jit/a1b |
 | A1c | merged (13 new consteval tests, `tests/ctfe_diff` harness; 4 CTFE bugs documented in `tests/nimony/consteval/todo/README.md`: enum/set results crash the serializer, distinct loses its conversion, `seq[UserObject]` unresolved, failed evaluations have no diagnostic) | merged from jit/a1c |
 | A1d | planned | |
-| A2a | planned | |
+| A2a-lengc | merged (`runLengc`, `resetLengcGlobals` (nothing to reset: audited), `generateCode` over `TokenBuf`/`MainModule`, `translate`/`serialize`/`writeGenerated` split, all five ledger buckets; `tests/inproc/lengc`) | merged from jit/a2a-lengc |
+| A2a-hexer | running | |
+| A2a-front | running | |
 | A2b | planned | |
 | A2c | planned | |
 | B1 (nativenif half) | done on `../nativenif` branch `jit/b1` (10 commits from pin d0781a48): `generateAsmBuf`, `AsmSession`/`emitRoots`, `AsmError`, `image/memory.nim` + `hostfixup.nim`, `core/hostsyms.nim`, `hostrun.nim` + `tools/nifrun`, `--dev-single-thread`; refactor gate byte-identical; 234/234 memory-vs-file code hash checks; CTFE sub-program runs from memory in ~8 ms with byte-identical `.out.nif` (reproduced by the integrator). Not yet: x64 `&threadvar` lowering (arkham side), Windows `runImage`, the nimony-side `nimony r`, re-pin of `src/nativenif.commit` | nativenif e368478 |
