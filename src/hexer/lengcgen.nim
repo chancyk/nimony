@@ -18,8 +18,8 @@ include ".." / lib / compat2
 import ".." / lib / [symparser, intrinsics]
 import ".." / models / tags
 import ".." / nimony / [nimony_model, programs, typenav, expreval, xints, decls, builtintypes, sizeof, typeprops, langmodes, typekeys, nifconfig]
-import hexer_context, pipeline, dce1, lifter
-import  ".." / lib / [stringtrees]
+import hexer_context, pipeline, dce1, lifter, hexerio
+import  ".." / lib / [stringtrees, ledger]
 
 proc skipExportMarker(c: var EContext; n: var Cursor) =
   if n.isDotToken:
@@ -2795,17 +2795,93 @@ proc trToplevel(c: var EContext; dest: var TokenBuf; n: var Cursor) =
         trStmt c, dest, n, TraverseAll
         swap dest, c.initBody
 
-proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode]; isMain: bool; outdir: string; appType = appConsole; native = false; isWindows = defined(windows)) =
+type
+  ExpandInput* = object
+    ## Everything `expand` needs that comes from a file (JIT_IMPL.md A2a).
+    ## `loadExpandInput` fills it; the buffer-level `expand` below reads
+    ## nothing else, so A2b/A2c can hand hexer a module that is already in
+    ## memory.
+    ##
+    ## Caveat, and the one thing this phase could not finish: `programs.
+    ## setupProgram` is what parses `buf`, and it ALSO registers the module in
+    ## the process-global `prog` so that `tryLoadSym` can jump into the
+    ## module's own `.s.nif` through its index. `NifModule` and `Program.mods`
+    ## are private to `src/nimony/programs.nim`, which A2a-hexer may not edit,
+    ## so filling `buf` from a caller's buffer still needs the shared change
+    ## listed in `notes/a2a-hexer.md`.
+    buf*: TokenBuf            ## the parsed `.s.nif`
+    modName*: string          ## module suffix, i.e. `splitModulePath(infile).name`
+    ext*: string
+    dir*: string              ## where this run's artifacts belong
+    bits*: int                ## target word size; shapes `typeCache`'s builtins
+    typeCache*: TypeCache     ## see `loadExpandInput` -- built BEFORE the parse
+    liftingCtx*: ref LiftingCtx
+
+  ExpandResult* = object
+    ## What one `hexer c` produces, before anything is serialized.
+    x*: TokenBuf              ## the `.x.nif` module
+    dce*: ModuleAnalysis      ## what `.dce.nif` serializes; `computeLiveSet`
+                              ## takes this object directly, so the in-process
+                              ## path never round-trips it through a file
+    modName*: string
+    dir*: string
+
+proc expandDir*(infile, outdir: string): string =
+  ## Where a `hexer c` invocation writes. `--outdir` wins; otherwise the
+  ## input's own directory, and the working directory for a bare file name.
   let mp = splitModulePath(infile)
-  let dir =
-    if outdir.len > 0: outdir
-    elif mp.dir.len == 0:
-      try: getCurrentDir()
-      except: quit "cannot get current working directory"
-    else: mp.dir
-  var c = EContext(dir: dir, ext: mp.ext, main: mp.name,
+  if outdir.len > 0: outdir
+  elif mp.dir.len == 0:
+    try: getCurrentDir()
+    except: raise newException(IOError, "cannot get current working directory")
+  else: mp.dir
+
+proc loadExpandInput*(infile, outdir: string; bits: int;
+                      t: var PhaseTimer): ExpandInput {.canRaise.} =
+  ## The `read` half of the path-based `expand`. `setupProgram` opens the
+  ## reader, folds in the embedded and the `.s.idx.nif` index and parses the
+  ## module in one call, so the whole of it is charged to `parse`; splitting
+  ## `load` out of it needs the `programs.nim` change in `notes/a2a-hexer.md`.
+  ##
+  ## The `TypeCache` is built HERE, before the parse, and not inside `expand`,
+  ## and the order is load-bearing rather than stylistic:
+  ## `builtintypes.createBuiltinTypes` interns `StringName`
+  ## (`src/nimony/builtintypes.nim:146`), so whether it runs before or after
+  ## the module is parsed decides whether that symbol gets id 1 or an id after
+  ## every symbol of the module. `SymId`s are what `.dce.nif` and `.live.nif`
+  ## hash their sets by, so getting this backwards changes their byte ORDER --
+  ## the same symbols, shuffled. Keeping the cache with the input keeps the
+  ## buffer path and the file path interning in the same order as each other
+  ## and as the pre-A2a code.
+  let mp = splitModulePath(infile)
+  let dir = expandDir(infile, outdir)
+  result = ExpandInput(buf: createTokenBuf(0), modName: mp.name, ext: mp.ext,
+                       dir: dir, bits: bits,
+                       typeCache: createTypeCache(bits),
+                       liftingCtx: createLiftingCtx(mp.name, bits))
+  var owningBuf = createTokenBuf(300)
+  discard setupProgram(infile, infile.changeModuleExt ".x.nif", owningBuf, true)
+  t.noteParse()
+  result.buf = ensureMove owningBuf
+
+proc expand*(input: var ExpandInput; bigEndian: bool;
+             flags: set[CheckMode]; isMain: bool; appType = appConsole;
+             native = false; isWindows = defined(windows)): ExpandResult =
+  ## The buffer-level entry point: Leng in, Leng out, no file touched. The
+  ## `.dce.nif` analysis comes back as an object beside the `.x.nif` buffer
+  ## because it is a second *output* of this phase, not a second phase.
+  ##
+  ## `input` is consumed: its buffer, type cache and lifting context are moved
+  ## into the run's `EContext`.
+  let bits = input.bits
+  let dir = input.dir
+  let ext = input.ext
+  let modName = input.modName
+  let liftingCtx = input.liftingCtx        # a `ref`, so this is not a copy
+  var typeCache = move(input.typeCache)
+  var c = EContext(dir: dir, ext: ext, main: modName,
     nestedIn: @[(StmtsS, SymId(0))],
-    typeCache: createTypeCache(bits),
+    typeCache: ensureMove typeCache,
     pending: createTokenBuf(),
     strLitBuf: createTokenBuf(),
     bits: bits,
@@ -2814,15 +2890,13 @@ proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode]; 
     isWindows: isWindows,
     localDeclCounters: 1000,
     activeChecks: flags,
-    liftingCtx: createLiftingCtx(mp.name, bits)
+    liftingCtx: liftingCtx
   )
   c.typeCache.openScope()
 
-  var owningBuf = createTokenBuf(300)
-
-  var c0 = setupProgram(infile, infile.changeModuleExt ".x.nif", owningBuf, true)
+  var c0 = beginRead(input.buf)
   let cBits = c.bits
-  var dest = transform(c, c0, mp.name, cBits)
+  var dest = transform(c, c0, modName, cBits)
 
   var n = beginRead(dest)
   let rootInfo = n.info
@@ -2861,15 +2935,46 @@ proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode]; 
     genMainProc(c, cdest, rootInfo, isWindows)
 
   # the module's close was consumed by `trToplevel`
-  let destfileName = c.dir / c.main & ".x.nif"
-
   var outputBuf = makeOutput(c, cdest, rootInfo)
   optimizeLengOutput(outputBuf, c.main, c.bits)
-  try:
-    writeFile outputBuf, destfileName, OnlyIfChanged
-  except:
-    quit "could not write file: " & destfileName
   c.typeCache.closeScope()
 
-  # Use the in-memory buffer to avoid re-reading the file we just wrote
-  writeDceOutput outputBuf, c.dir / c.main & ".dce.nif", "." & c.main
+  # Analyse the buffer we just built rather than re-reading the file we are
+  # about to write, exactly as the pre-A2a code did.
+  result = ExpandResult(x: createTokenBuf(0),
+                        dce: analyzeModule(beginRead(outputBuf)),
+                        modName: c.main, dir: c.dir)
+  result.x = ensureMove outputBuf
+
+proc xnifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".x.nif"
+proc dcenifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".dce.nif"
+
+proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer) {.canRaise.} =
+  ## The `write` half of the path-based `expand`: render the `.x.nif`, publish
+  ## it, then publish the `.dce.nif` analysis beside it.
+  let destfileName = xnifPath(r)
+  let content = serializeModule(r.x, destfileName)
+  t.noteSerialize()
+  try:
+    writeSerialized(content, destfileName, OnlyIfChanged)
+  except:
+    raise newException(IOError, "could not write file: " & destfileName)
+  writeAnalysis(dcenifPath(r), r.dce, "." & r.modName)
+  t.noteWrite()
+
+proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
+             isMain: bool; outdir: string; t: var PhaseTimer;
+             appType = appConsole; native = false;
+             isWindows = defined(windows)) {.canRaise.} =
+  ## Path-based wrapper: read -> the buffer-level `expand` -> write.
+  var input = loadExpandInput(infile, outdir, bits, t)
+  var r = expand(input, bigEndian, flags, isMain, appType, native, isWindows)
+  t.noteProduce()
+  writeExpandResult(r, t)
+
+proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];
+             isMain: bool; outdir: string; appType = appConsole;
+             native = false; isWindows = defined(windows)) {.canRaise.} =
+  ## Untimed path-based wrapper (the pre-A2a signature).
+  var t = initPhaseTimer("", "", "")
+  expand(infile, bits, bigEndian, flags, isMain, outdir, t, appType, native, isWindows)
