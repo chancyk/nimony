@@ -1,0 +1,29 @@
+OK   src/lib/argsfinder.nim
+OK   src/lib/bitabs.nim
+OK   src/nimony/features.nim
+OK   src/nimony/intervals.nim
+OK   src/models/nifler_tags.nim
+OK   src/nimony/inferle.nim
+OK   src/nimony/deferstmts.nim
+OK   src/nimony/cli.nim
+OK   src/nimony/pragmacanon.nim
+OK   src/nimony/semborrow.nim
+OK   src/nimony/semuntyped.nim
+OK   src/nimony/enumtostr.nim
+OK   src/nimony/derefs.nim
+OK   src/nimony/module_plugins.nim
+OK   src/hexer/inliner.nim
+OK   src/hexer/lambdalifting.nim
+OK   src/hexer/cps.nim
+OK   src/hexer/constparams.nim
+OK   src/hexer/vtables_backend.nim
+OK   src/hexer/dce2.nim
+OK   src/hexer/hexer.nim
+OK   src/nimony/indexgen.nim
+OK   src/nimony/idetools.nim
+OK   src/nimony/sem.nim
+OK   src/nimony/deps.nim
+OK   src/nimony/nimony.nim
+OK   src/lengc/lengc.nim
+0 / 27 bootstrap regressions in 72.62s.
+SUCCESS.

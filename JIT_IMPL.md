@@ -652,7 +652,7 @@ Gate: B3's numbers on each platform.
 |---|---|---|
 | P0a | planned | |
 | P0b | planned | |
-| B0 | planned | |
+| B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | planned | |
 | A1b | planned | |
 | A1c | planned | |

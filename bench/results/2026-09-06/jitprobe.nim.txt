@@ -1,0 +1,79 @@
+## B0 step 5: can an UNSIGNED binary built by plain `nim c` make memory
+## executable on macOS 26 / arm64, (a) via plain RW -> mprotect RX and
+## (b) via MAP_JIT + pthread_jit_write_protect_np?
+## The payload is arm64 `mov w0, #42; ret`.
+import std/[os, strutils]
+
+{.passC: "-Wno-deprecated-declarations".}
+{.emit: """
+#include <sys/mman.h>
+#include <pthread.h>
+#include <libkern/OSCacheControl.h>
+#include <errno.h>
+#include <string.h>
+""".}
+
+proc mmapC(a: pointer; len: csize_t; prot, flags, fd: cint; off: int): pointer
+  {.importc: "mmap", nodecl.}
+proc mprotectC(a: pointer; len: csize_t; prot: cint): cint
+  {.importc: "mprotect", nodecl.}
+proc icacheInvalidate(a: pointer; len: csize_t)
+  {.importc: "sys_icache_invalidate", nodecl.}
+proc jitWriteProtect(enabled: bool)
+  {.importc: "pthread_jit_write_protect_np", nodecl.}
+proc strerrorC(e: cint): cstring {.importc: "strerror", nodecl.}
+var errnoC {.importc: "errno", nodecl.}: cint
+
+const
+  PROT_NONE  = cint(0)
+  PROT_READ  = cint(1)
+  PROT_WRITE = cint(2)
+  PROT_EXEC  = cint(4)
+  MAP_PRIVATE = cint(0x0002)
+  MAP_ANON    = cint(0x1000)
+  MAP_JIT     = cint(0x0800)
+  MAP_FAILED  = cast[pointer](-1)
+  # mov w0, #42 ; ret
+  Payload = [0x40'u8, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]
+
+type Fn = proc (): cint {.cdecl.}
+
+proc err(): string = $strerrorC(errnoC)
+
+proc run(useJit: bool) =
+  let sz = csize_t(16384)
+  var flags = MAP_PRIVATE or MAP_ANON
+  if useJit: flags = flags or MAP_JIT
+  let p = mmapC(nil, sz, PROT_READ or PROT_WRITE or (if useJit: PROT_EXEC else: cint 0),
+                flags, cint(-1), 0)
+  if p == MAP_FAILED:
+    echo "  mmap FAILED: ", err(); quit 2
+  echo "  mmap ok at 0x", cast[uint](p).toHex
+  if useJit:
+    jitWriteProtect(false)          # W: writable, not executable, this thread
+    echo "  pthread_jit_write_protect_np(false) returned"
+  copyMem(p, unsafeAddr Payload[0], Payload.len)
+  echo "  payload written"
+  if useJit:
+    jitWriteProtect(true)           # X: executable again
+    echo "  pthread_jit_write_protect_np(true) returned"
+  else:
+    if mprotectC(p, sz, PROT_READ or PROT_EXEC) != 0:
+      echo "  mprotect(RX) FAILED: ", err(); quit 3
+    echo "  mprotect(RX) ok"
+  icacheInvalidate(p, sz)
+  echo "  sys_icache_invalidate ok"
+  let f = cast[Fn](p)
+  let r = f()
+  echo "  called -> ", r
+  if r == 42: echo "  RESULT: OK" else: echo "  RESULT: WRONG VALUE"
+
+let mode = if paramCount() >= 1: paramStr(1) else: "a"
+case mode
+of "a":
+  echo "(a) plain anonymous mmap RW -> mprotect RX -> sys_icache_invalidate -> call"
+  run(false)
+of "b":
+  echo "(b) MAP_JIT + pthread_jit_write_protect_np(false/true) -> call"
+  run(true)
+else: quit "usage: jitprobe a|b"
