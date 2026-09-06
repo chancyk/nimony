@@ -327,3 +327,175 @@ Not A1d's, and being edited in parallel by the A2a agents: `src/hexer/**`,
 `src/lengc/**`, `src/nimony/nimsem.nim`, `src/nimony/semmain.nim`,
 `src/nifler/**`, `src/nimony/programs.nim`, `src/lib/nifpools.nim`,
 `src/lib/nifcore.nim`. That is what forces §1.2's "`load` only".
+
+---
+
+# Phase A1d — what was built
+
+## nifmake's half
+
+`runDag` measures every command it spawns and folds the result into the
+fragment the tool inside it just wrote.
+
+- The two `getMonoTime()` calls are unconditional now. They were `--profile`
+  only; the ledger wants every build's numbers, and two clock reads against a
+  process spawn are three orders of magnitude apart.
+- The parallel path carries `ledgerDirs` and `modules` alongside the existing
+  `cmdNames`/`labels`, for the same reason those exist: `afterRunEvent` is
+  handed an index, not a node.
+- The sequential path records for `RunSpawn` nodes only. A node the A2b relay
+  ran in-process had no process to charge for, and the existing comment already
+  says the relay reports its own timings.
+- A command that *failed* is still recorded. It cost a process, and what that
+  cost is exactly what the next run's scheduler wants to know.
+
+`ledger.recordSpawnWall(dir, phase, module, wall, observer)` is the new entry
+point. One `vfsExists` + one `vfsRead` + one atomic ~350-byte write, the same
+budget the tool inside already pays for its own fragment.
+
+### The consolidation rule
+
+> **The nimcache is `parentDir` of the build file nifmake was handed**, and
+> `consolidate` runs there at the end of a `runDag` that spawned at least one
+> command.
+
+`Dag.nimcache` is set once, in `parseNifFile`. Why the DAG file's directory is
+the nimcache, exactly: every `.build.nif` nimony generates is written into
+`config.nifcachePath` (`deps.nim:907` doc, `:1237-1242` final/final1/final2,
+`:1916` frontend, `:2075` exec). `--base` is not it -- that is the `.args`
+search root and `expandCommand` is its only reader.
+
+`openLedger` folds `<nimcache>/.ledger/` and `<nimcache>/*/.ledger/`, which is
+the two levels the pipeline writes into, so one `consolidate` there sees the
+whole build. `ledgerTargetOf` keeps that true from the other side: a node whose
+first output is neither in the nimcache nor one level below it -- `link` under
+`--out:`, pointed at the user's own source directory -- has its sample written
+at the nimcache root instead of creating a `.ledger/` where it does not belong.
+
+`executed > 0` gates the consolidation. An up-to-date rebuild is 11 ms today
+(JIT_IMPL.md 0) and has nothing new to fold; making it pay for a directory walk
+would be a bigger regression than the phase is a win.
+
+## The keys, and the one that did not line up
+
+`(phase = the DAG's `cmd` name, module = `moduleSuffixOf(outputs[0])`)`. Seven
+of the eight node kinds agree with the key the tool wrote (table in §2.3
+above). `dceLive` does not: `hexer.nim:164` keys it with an empty module
+because it is a whole-program node, while an observer outside the process can
+only read a module suffix off `<main>.live.nif`. `recordSpawnWall` therefore
+probes `(phase, module)` and then `(phase, "")` before it creates anything, so
+the spawn lands on the sample the tool took. Verified on a real build: the
+fragment directory holds `dceLive_.nif` and no `dceLive_<main>.nif`.
+
+`cc` and `link` have no fragment at all, so their whole wall time is the spawn
+cost. Measured on `tests/ledger/hello.nim`: `cc` 48.7 ms, `link` 31.4 ms,
+against JIT.md 3.3's table of 54 ms and 33 ms.
+
+## Two bugs in `recordSpawn`, fixed before it could be called
+
+1. **The observer restamped the entry.** `recordSpawn` compared the entry's
+   `toolhash` against the caller's, and nifmake's can never equal the tool's, so
+   `record`'s else branch overwrote the tool's `produce`/`bytes`/`samples` with
+   a spawn-only sample on every build. An entry now keeps the stamp of whoever
+   measured it; the caller's is used only for an entry created from nothing.
+2. **The first observation blended against a zero that was not a
+   measurement.** The tool creates the entry with `spawnNs = 0` because it does
+   not measure its own process. Blending 4 ms into that gives 1.2 ms and takes a
+   dozen builds to converge. A first observation now seeds the average -- no
+   process has ever started in zero nanoseconds, so 0 is unambiguously "unset".
+
+## The store's half
+
+- `Payload.cost: LedgerSample`. `storeRead`'s fall-through to the disk backend
+  is timed and the result hangs on the payload it admits; `storeOpenMmap`'s is
+  timed into `StoreStats.loadNs` only, because a served mmap creates no entry.
+- `parse` stays 0. `PhaseTimer.noteParse` has no call site in the tree and the
+  four files that would add one are A2a's (§1.2). The decision is written
+  against `load + parse` so A2a lights it up without another change here.
+
+### The spill decision
+
+`maySpill(policy, overBudget, reloadNs, produceNs, marginPercent)` is JIT.md
+5.2's rule as a pure function, which is what makes the unit test exhaustive
+over its inputs rather than over a store big enough to shed. Three gates:
+
+| gate | answer | why |
+|---|---|---|
+| under the budget | keep | residency is what the store is for |
+| policy is `memory` | keep | it has nowhere to spill to; `memory+spill` is named after having one |
+| `reload * 100 >= produce * margin` | keep | JIT.md 5.2: never spill what is cheaper to recompute than to reload |
+
+`produce == 0` means "no phase in the pipeline claims this suffix", not "cost
+unknown": a sidecar, a build file, something a plugin invented. Nothing could
+recompute it, so reloading is the only way back and spilling is always right.
+
+`evictOne` keeps two ranks and only the second is the ledger's:
+
+- An entry that **already has a disk copy** costs nothing to shed and has no
+  recompute alternative -- the bytes are on the disk, so the way back is a read
+  whatever the ledger says. It stays free and first.
+- A **memory-only** entry is the one JIT.md 5.2 legislates about, and its rank
+  is `size * maySpill(...)`, i.e. size when spilling is allowed and never
+  chosen when it is not.
+
+`reloadCost` is measurement first: the entry's own `loadNs` if a read filled
+it, then the ledger's `load + parse`, then a size-derived fallback
+(`NifReloadNsPerKB`, from JIT.md 5.2's 1.14 MB / 9.7 ms parse and 3.3's ~0.1 ms
+per MB read). The fallback exists because both measured sources are zero until
+A2a; without it the decision would degenerate into "size alone", which is what
+A1d was supposed to replace.
+
+`ensureCostLedger` reads `<nimcache>/ledger.nif` at most once per process and
+only from inside `enforceBudget`, i.e. only when the budget has actually bitten.
+An ordinary build with the default 512 MB never reads it. `costsLoaded` is set
+*before* the read and `enforceBudget` carries an `evicting` guard, because
+`openLedger` goes through the relays -- through this store -- and must neither
+recurse nor mutate `store.entries` under `evictOne`'s iteration.
+
+The nimcache reaches the store the way the policy does: `nimony.nim` calls
+`requestLedgerDir(c.config.nifcachePath)` before `applyRequestedStore()`, which
+exports `NIMONY_LEDGER` for every child. A process that was given none guesses
+from the path it is about to shed.
+
+## `--vfs-spill-margin`
+
+Parsed in `nimony.nim`'s own option loop rather than beside `--vfs` in
+`cli.parseCommonOption`, because the tools that share that parser are the ones
+that never see the flag anyway: like the policy and the budget it travels in
+the environment (`NIMONY_VFS_SPILL_MARGIN`), so two settings still emit
+byte-identical `*.build.nif` files. `cli.nim` is also not this phase's file.
+
+## `--stats`
+
+`statsTable` gains a `spawn ms` column between `produce ms` and
+`ser+parse ms`; `deps.nim`'s `Stats` block prints `storeStatsLine()` after the
+table. Under `--vfs:disk` that line says there is no store rather than printing
+a table of zeros, and the store it describes is the *driver's*: the tools'
+stores lived and died in their own processes, which is what
+`NIMONY_VFS_STATS=1` is for.
+
+## Caveat on the spawn number
+
+It is wall time, and nimony runs nifmake with `-j`. On a wide DAG depth it
+therefore carries the CPU contention of the fan-out as well as the process
+start. That is the number A2b's rule wants -- what a process costs *in this
+build* is what decides whether the node is worth one -- but it is not process
+startup in isolation, and a busy depth reads higher than an idle one. Visible
+in the two `--stats` runs recorded in `bench/results/2026-09-06/a1d.txt`: the
+same hexer node reads 1.2 ms on a quiet depth and tens of milliseconds on a
+forced whole-stdlib rebuild.
+
+## What is deliberately not here
+
+- **`parse`.** A2a's problem, above.
+- **A ledger-driven eviction in a real build.** Everything the pipeline
+  produces is written through (notes/a1b.md §3), so every entry is rank 1 and
+  the second rank is never reached. `spillCandidate` exists so the plumbing --
+  suffix to phase to `produce` to decision -- is still tested end to end
+  through a real `ledger.nif`. A2b and A2c populate `addEphemeralSuffix`, and
+  that is when the rank starts firing.
+- **A per-run `produce` channel.** `recordSpawnWall` subtracts the fragment's
+  running average, because a separate process cannot see this run's raw
+  measurement. The residual is damped again by the EWMA the spawn itself goes
+  through. A tool that wanted to hand its exact `produce` to its parent would
+  need a channel that does not exist, and the number does not justify one.
