@@ -827,7 +827,7 @@ proc writeEvalImports(c: var SemContext; depsFile: string) {.canRaise.} =
   deps.addParRi()
   writeFileIfChanged(depsFile, toString(deps, true))
 
-proc addImportedSemOutputs(res: var seq[string]; buf: TokenBuf; n: var Cursor;
+proc addImportedSemOutputs(res: var seq[string]; n: var Cursor;
                            paths: openArray[string]; nifcachePath: string) =
   ## One `(import …)` section: a flat list of module source paths, except that
   ## a module reached through a plugin is wrapped as `(pragmax "path" …)` (see
@@ -884,7 +884,7 @@ proc collectEvalDeps(depsFile: string; paths: openArray[string];
       if n.kind == TagLit:
         let tag = tagName(buf.tags, n.cursorTagId)
         if tag == "import":
-          addImportedSemOutputs(res, buf, n, paths, nifcachePath)
+          addImportedSemOutputs(res, n, paths, nifcachePath)
         elif tag == DependencyTag:
           n.loopInto:
             if n.kind == StrLit: res.add strVal(n)

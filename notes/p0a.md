@@ -89,10 +89,12 @@ Inputs that can change the result of one evaluation:
    `tests/nimony/consteval/tconstreadfile.nim`:
    `(stmts (import ".../system.nim" ".../writenif.nim" ".../syncio.nim"
    ".../strutils.nim" ".../assertions.nim"))`. That is the **direct** import
-   set only; a transitively imported module that changed is not listed, so the
-   memo additionally has to notice that *some* module in the nimcache was
-   re-semmed. The cheap conservative proxy is the newest `*.s.nif` in the
-   nimcache, computed once per nimsem process.
+   set only, which turns out to be the right cut: nifmake rewrites a module's
+   `.s.nif` whenever it re-sems it at all, and a change further down has
+   already rewritten every `.s.nif` between itself and here on its way up.
+   The `.s.nif` rather than the `.s.idx.nif`, because the sub-program LINKS
+   those modules: an edit to a non-inline body changes what it computes
+   without changing the interface checksum.
 4. Files read during the sub-compile — the `(dependency ...)` entries of
    `<sfx>.s.deps.nif` (a `slurp` or a plugin inside the sub-program).
 5. Files read **at run time by the sub-program binary**. This is the hard one
@@ -122,7 +124,7 @@ plugins (nim-lang/nimony#1378) — a plugin *reports* its extra reads through
 Decision: give the sub-program the same reporting channel. `std/syncio` grows
 an opt-in read log (off by default, one `bool` test per successful `fmRead`
 `open`), `std/writenif.setup` turns it on and `teardown` writes the recorded
-paths to `<sfx>.reads.nif` beside the result. `runEval` treats a missing
+paths to `<sfx>.out.nif.reads` beside the result. `runEval` treats a missing
 sidecar as "unknown" and re-runs, so an old nimcache costs exactly one extra
 evaluation per expression.
 
