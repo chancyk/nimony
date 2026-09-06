@@ -463,7 +463,10 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
             labels.add(nodeLabel(dag, node[]))
           of RunHandledOk:
             # An in-process node still counts as an executed command, so
-            # `--report` and `--profile` keep meaning what they meant.
+            # `--report` keeps meaning what it meant. Its duration is zero
+            # here because only the relay knows how long it took; A2b, which
+            # is the first relay to answer anything but `RunSpawn`, reports
+            # its own timings.
             inc prog.done
             prog.draw(nodeLabel(dag, node[]))
             if profile != nil: profile[].recordCmdTime(cmdName, 0.0)

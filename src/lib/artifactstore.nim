@@ -112,10 +112,12 @@
 ## Invariants
 ## ----------
 ##
-## - **Entries are replaced, never mutated.** This is PR #2396's "never
-##   truncate a file a reader has mmap'd", carried into memory: a `VfsBlob`
-##   over an entry pins that entry's payload, a write installs a *new* payload,
-##   and the old bytes stay readable until the last blob over them is closed.
+## - **An entry's bytes are replaced, never mutated.** This is PR #2396's
+##   "never truncate a file a reader has mmap'd", carried into memory: a
+##   `VfsBlob` over an entry pins that entry's payload, a write installs a
+##   *new* payload, and the old bytes stay readable until the last blob over
+##   them is closed. (A spill updates the payload's bookkeeping in place —
+##   where its disk copy is and when — which no reader can observe.)
 ## - **Generations live in the mtime space.** A memory-only entry answers
 ##   `vfsMtime` with the `vfsNow()` value stamped at write time, strictly
 ##   increasing, so `nifmake.needsRebuild` needs no change.
