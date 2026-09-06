@@ -1180,6 +1180,14 @@ proc fillObjectCache(c: var DepContext; backend, commandLineArgsLengc, passC: st
   common.add "\n"
   common.add $getLastModTime(findTool("hexer"))
   common.add "\n"
+  # Every module's Leng IR appears in its own key and in the key of everything
+  # that imports it, so digest each file once rather than re-reading it per
+  # importer.
+  var digests = initTable[string, string]()
+  for i in 0 ..< c.nodes.len:
+    let p = c.config.lengcFile(c.nodes[i].files[0], backend)
+    if not digests.hasKey(p):
+      digests[p] = computeChecksum(onRaiseQuit(readFile(p)))
   for i in 1 ..< c.nodes.len:
     let v = c.nodes[i]
     # The inputs of this module's `lengc` node: its own Leng IR plus every
@@ -1193,8 +1201,9 @@ proc fillObjectCache(c: var DepContext; backend, commandLineArgsLengc, passC: st
     for f in inputs:
       if not seen.containsOrIncl(f):
         key.add splitModulePath(f).name
+        key.add " "
+        key.add digests.getOrDefault(f, "")
         key.add "\n"
-        key.add onRaiseQuit(readFile(f))
     let base = dir / computeChecksum(key)
     c.ocache[v.files[0].modname] = base
     if vfsExists(base & ".o"):
