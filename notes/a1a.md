@@ -160,3 +160,10 @@ key's history — `writeFragment` reads its own fragment back before recording,
 which is what makes `samples` and the average survive a run. Deleting
 fragments after a merge would restart every average at one sample on the next
 build, so `consolidate` does not.
+
+## 8. Pre-existing flake seen while testing
+
+`tests/nimony/overload` reports "joined group printed unexpected output;
+re-running its 10 tests individually" and then passes all ten. It reproduces on
+an untouched `fast-devloop` checkout built into `/tmp/a1a_base`, so it is not
+A1a's; recorded here so the next phase does not chase it.
