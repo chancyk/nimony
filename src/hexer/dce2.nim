@@ -14,11 +14,12 @@ include ".." / lib / nifprelude
 include ".." / lib / compat2
 
 import ".." / lib / symparser
-import dce1
+import ".." / lib / ledger
+import dce1, hexerio
 import ".." / lengc / [leng_model]
 
 type
-  ResolveTable = Table[string, SymId]
+  ResolveTable* = Table[string, SymId]
     # `foo.1.I<type hash>` -> `foo.1.I<type hash>.module`
     # that is selected for the generic instance
 
@@ -191,22 +192,38 @@ proc tr(dest: var TokenBuf; n: var Cursor; alive: HashSet[SymId]; resolved: Reso
   else: # atoms and suffix kinds; classic: a physical ParRi cannot appear here
     dest.takeTree n
 
-proc rewriteModule(file: string; live: HashSet[SymId]; resolved: ResolveTable; outdir: string) =
-  var buf = parseFromFile(file)
-  var n = beginRead(buf)
-  var dest = createTokenBuf(buf.len)
-  tr dest, n, live, resolved
-  let outPath =
-    if outdir.len > 0:
-      outdir / splitModulePath(file).name & ".c.nif"
-    else:
-      file.changeModuleExt ".c.nif"
-  try:
-    writeFile(dest, outPath, OnlyIfChanged)
-  except:
-    quit "could not write file: " & outPath
+proc rewriteBuf*(xbuf: var TokenBuf; live: HashSet[SymId];
+                 resolved: ResolveTable): TokenBuf =
+  ## The buffer-level `.x.nif` -> `.c.nif` rewrite: drop what is dead and
+  ## point every generic instantiation at its elected owner. No file is read
+  ## and none is written, which is what lets A2b run `dceEmit` in-process.
+  var n = beginRead(xbuf)
+  result = createTokenBuf(xbuf.len)
+  tr result, n, live, resolved
 
-proc deadCodeElimination*(files: openArray[string]; outdir: string) =
+proc emitOutPath*(xnif, outdir: string): string =
+  ## Where `dceEmit` puts a module's `.c.nif`. Derived from the input's
+  ## module name, exactly as `hexer c` derives its own outputs.
+  if outdir.len > 0:
+    outdir / splitModulePath(xnif).name & ".c.nif"
+  else:
+    xnif.changeModuleExt ".c.nif"
+
+proc rewriteModule(file: string; live: HashSet[SymId]; resolved: ResolveTable;
+                   outdir: string; t: var PhaseTimer; s: var HexerStatus) =
+  ## Path-based wrapper: read -> `rewriteBuf` -> serialize -> write, with each
+  ## step charged to its own ledger bucket.
+  var buf = loadAndParse(file, t)
+  var dest = rewriteBuf(buf, live, resolved)
+  t.noteProduce()
+  let outPath = emitOutPath(file, outdir)
+  let content = serializeModule(dest, outPath)
+  t.noteSerialize()
+  writeSerialized(content, outPath, OnlyIfChanged, s)
+  t.noteWrite()
+
+proc deadCodeElimination*(files: openArray[string]; outdir: string;
+                          s: var HexerStatus) =
   ## Single-shot DCE: read all .dce.nif analyses, compute global liveness,
   ## then sequentially rewrite each module's .x.nif to .c.nif. Kept for
   ## the single-process API; the build pipeline now goes through the split
@@ -222,9 +239,11 @@ proc deadCodeElimination*(files: openArray[string]; outdir: string) =
   let resolved = resolveSymbolConflicts(graphs, "")
 
   let live = markLive(graphs, resolved)
+  var t = initPhaseTimer("", "", "")
   for file in files:
+    if s.failed: return
     let modName = splitModulePath(file).name
-    rewriteModule(file, live.getOrQuit(modName), resolved, outdir)
+    rewriteModule(file, live.getOrQuit(modName), resolved, outdir, t, s)
 
 # ---- Split DCE: liveness computation and per-module emit -----------------
 
@@ -233,6 +252,31 @@ const
   resolveTag = "resolved"  # `(resolved (kv String Symbol)*)` — generic-instance picks
   modTag     = "mod"       # `(mod String (sym …)*)` — block per module
   symTag     = "sym"
+
+type
+  LiveSet* = object
+    ## The whole result of the liveness phase, and the object A2c caches
+    ## across sub-programs: `resolved` (the elected owner of every generic
+    ## instantiation) is a pure function of the participating modules' offer
+    ## sets, so a second sub-program built from the same libraries can reuse
+    ## it instead of re-electing. `writeLiveFile`/`readLiveFile` are only the
+    ## file representation of this object.
+    resolved*: ResolveTable
+    live*: Table[string, HashSet[SymId]]
+
+  DceInputs* = object
+    ## The per-module `.dce.nif` analyses `computeLiveSet` folds, in the order
+    ## the build graph emitted them. `names[0]` is the MAIN module:
+    ## `deps.generateFinalBuildFile` emits the `dceLive` inputs in `c.nodes`
+    ## order and `c.nodes[0]` is the root module, and `prefersOffer` needs to
+    ## know which one that is.
+    names*: seq[string]
+    analyses*: seq[ModuleAnalysis]
+
+proc addAnalysis*(inp: var DceInputs; name: string; a: sink ModuleAnalysis) =
+  ## Append one module's analysis. The first one added is the main module.
+  inp.names.add name
+  inp.analyses.add a
 
 proc writeLiveFile*(outfile: string; resolved: ResolveTable;
                     live: Table[string, HashSet[SymId]]) =
@@ -258,14 +302,16 @@ proc writeLiveFile*(outfile: string; resolved: ResolveTable;
             b.addSymbol pool.syms[s], ""
   b.close()
 
-type
-  LiveSet* = object
-    resolved*: ResolveTable
-    live*: Table[string, HashSet[SymId]]
+proc writeLiveFile*(outfile: string; ls: LiveSet) {.inline.} =
+  ## Overload over the result object, so a caller that keeps a `LiveSet`
+  ## around does not have to take it apart again.
+  writeLiveFile(outfile, ls.resolved, ls.live)
 
-proc readLiveFile*(infile: string): LiveSet =
-  var buf = parseFromFile(infile)
-  var n = beginRead(buf)
+proc parseLiveSet*(n0: Cursor; ctx: string): LiveSet =
+  ## The buffer-level reader for a `.live.nif`. `ctx` only names the source in
+  ## the diagnostics.
+  var n = n0
+  let infile = ctx
   result = LiveSet(
     resolved: initTable[string, SymId](),
     live: initTable[string, HashSet[SymId]]())
@@ -315,30 +361,75 @@ proc readLiveFile*(infile: string): LiveSet =
       else:
         raiseAssert infile & ": expected (resolved|live …)"
 
-proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string) =
-  ## Read the per-module `.dce.nif` analyses, compute the global
-  ## resolve table + live sets, and write them to `liveOut`. This is the
-  ## small serial step in the split DCE pipeline.
+proc readLiveFile*(infile: string): LiveSet =
+  ## Path-based wrapper: read -> parse -> `parseLiveSet`.
+  var buf = parseFromFile(infile)
+  result = parseLiveSet(beginRead(buf), infile)
+
+proc readLiveFile*(infile: string; t: var PhaseTimer): LiveSet =
+  ## Same, with the read and the parse charged to their own ledger buckets.
+  var buf = loadAndParse(infile, t)
+  result = parseLiveSet(beginRead(buf), infile)
+
+proc computeLiveSet*(inputs: DceInputs): LiveSet =
+  ## The buffer-level liveness phase: elect an owner for every generic
+  ## instantiation and mark what each module has to keep. No file is read and
+  ## none is written.
   var graphs = initTable[string, ModuleAnalysis]()
   var mainModule = ""
-  for file in dceFiles:
-    let modName = splitModulePath(file).name
-    if mainModule.len == 0: mainModule = modName
-    graphs[modName] = readModuleAnalysis(file)
-
-  # `dceFiles[0]` is the main module: `deps.generateFinalBuildFile` emits the
-  # `dceLive` inputs in `c.nodes` order and `c.nodes[0]` is the root module.
+  for i in 0 ..< inputs.names.len:
+    if mainModule.len == 0: mainModule = inputs.names[i]
+    graphs[inputs.names[i]] = inputs.analyses[i]
   let resolved = resolveSymbolConflicts(graphs, mainModule)
-  let live = markLive(graphs, resolved)
-  writeLiveFile(liveOut, resolved, live)
+  result = LiveSet(resolved: resolved, live: markLive(graphs, resolved))
 
-proc dceEmit*(xnif, liveFile, outdir: string) =
+proc loadDceInputs*(dceFiles: openArray[string]; t: var PhaseTimer): DceInputs =
+  ## Read the per-module `.dce.nif` analyses named on the command line,
+  ## keeping the caller's order (entry 0 is the main module).
+  result = DceInputs(names: @[], analyses: @[])
+  for file in dceFiles:
+    result.addAnalysis(splitModulePath(file).name, readModuleAnalysis(file, t))
+
+proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string;
+                     t: var PhaseTimer) =
+  ## Path-based wrapper: read the `.dce.nif` analyses, compute the global
+  ## resolve table + live sets, and write them to `liveOut`. This is the
+  ## small serial step in the split DCE pipeline.
+  let inputs = loadDceInputs(dceFiles, t)
+  let ls = computeLiveSet(inputs)
+  t.noteProduce()
+  writeLiveFile(liveOut, ls)
+  t.noteWrite()
+
+proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string) =
+  ## Untimed path-based wrapper (the pre-A2a signature).
+  var t = initPhaseTimer("", "", "")
+  computeLiveSet(dceFiles, liveOut, t)
+
+proc liveOf*(ls: LiveSet; modName: string): HashSet[SymId] =
+  ## What `modName` has to keep. A module the liveness phase never saw keeps
+  ## nothing, which is what makes an unreferenced module compile to an empty
+  ## `.c.nif` rather than a crash.
+  if ls.live.hasKey(modName): ls.live.getOrQuit(modName)
+  else: initHashSet[SymId]()
+
+proc dceEmit*(xnif: string; ls: LiveSet; outdir: string;
+              t: var PhaseTimer; s: var HexerStatus) =
+  ## Per-module emit against a `LiveSet` the caller already holds. This is the
+  ## overload A2b/A2c use: the `.live.nif` is read once and N modules are
+  ## emitted from it.
+  rewriteModule(xnif, liveOf(ls, splitModulePath(xnif).name), ls.resolved,
+                outdir, t, s)
+
+proc dceEmit*(xnif, liveFile, outdir: string; t: var PhaseTimer;
+              s: var HexerStatus) =
   ## Per-module emit: read `M.x.nif` plus the shared `liveFile`, write
   ## `M.c.nif`. Multiple invocations run in parallel under the build
   ## scheduler.
-  let ls = readLiveFile(liveFile)
-  let modName = splitModulePath(xnif).name
-  let liveForMod =
-    if ls.live.hasKey(modName): ls.live.getOrQuit(modName)
-    else: initHashSet[SymId]()
-  rewriteModule(xnif, liveForMod, ls.resolved, outdir)
+  let ls = readLiveFile(liveFile, t)
+  dceEmit(xnif, ls, outdir, t, s)
+
+proc dceEmit*(xnif, liveFile, outdir: string; s: var HexerStatus) =
+  ## Untimed path-based wrapper (the pre-A2a signature plus its status).
+  var t = initPhaseTimer("", "", "")
+  dceEmit(xnif, liveFile, outdir, t, s)

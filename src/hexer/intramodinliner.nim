@@ -1285,6 +1285,14 @@ when defined(inlinerStats):
     for (t, cnt, k) in rows:
       stderr.writeLine $t & "\t" & $cnt & "\t" & k
 
+proc resetInlinerStats*() =
+  ## Called by `hexer.resetHexerGlobals` between two in-process runs. Under
+  ## `-d:inlinerStats` this module keeps the only accumulating variable in
+  ## `src/hexer`; without the define there is nothing to reset and this is a
+  ## no-op that keeps the caller free of a `when`.
+  when defined(inlinerStats):
+    inlinerStats = initTable[string, tuple[count, tokens: int]]()
+
 proc trySplice*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): int =
   ## If `n` points at a `(call f arg…)` statement we can inline, emit
   ## the splice into `dest`, advance `n` past the call, and return the

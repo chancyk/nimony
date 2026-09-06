@@ -15,6 +15,8 @@ include ".." / lib / compat2
 import ".." / lengc / [leng_model]
 
 import ".." / lib / symparser
+import ".." / lib / ledger
+import hexerio
 
 type
   ModuleAnalysis* = object
@@ -78,11 +80,21 @@ const
   offerName = "offers"
   rootName = "roots"
 
-proc prepDce(outputFilename: string; n: Cursor; dottedSuffix: string) =
+proc analyzeModule*(n: Cursor): ModuleAnalysis =
+  ## The buffer-level half of the `.dce.nif` step (JIT_IMPL.md A2a): walk a
+  ## module's Leng and answer with the roots/uses/offers graph. Nothing here
+  ## touches a file, so `expand`'s in-process caller can keep the object and
+  ## hand it straight to `computeLiveSet` instead of round-tripping it
+  ## through `.dce.nif`.
   var n = n
-  var a = ModuleAnalysis()
-  tr n, a, SymId(0)
+  result = ModuleAnalysis()
+  tr n, result, SymId(0)
 
+proc writeAnalysis*(outputFilename: string; a: var ModuleAnalysis;
+                    dottedSuffix: string) =
+  ## Serialize one `ModuleAnalysis` as `.dce.nif`. Symbols are abbreviated
+  ## against `dottedSuffix`; `readModuleAnalysis` expands them again from the
+  ## file name, so the round trip is the identity.
   var b = nifbuilder.open(outputFilename, writeMode = OnlyIfChanged)
   b.withTree "stmts":
     b.withTree rootName:
@@ -98,10 +110,13 @@ proc prepDce(outputFilename: string; n: Cursor; dottedSuffix: string) =
         b.addSymbol pool.syms[offer], dottedSuffix
   b.close()
 
-proc readModuleAnalysis*(infile: string): ModuleAnalysis =
-  var buf = parseFromFile(infile)
-  var n = beginRead(buf)
+proc parseAnalysis*(n0: Cursor; ctx: string): ModuleAnalysis =
+  ## The buffer-level reader for a `.dce.nif`. `ctx` only names the source in
+  ## the diagnostics; nothing here opens a file, so an in-process caller can
+  ## feed it a buffer it already holds.
+  var n = n0
   result = ModuleAnalysis()
+  let infile = ctx
   if n.stmtKind == StmtsS:
     let depTag = globalTags.registerTag(depName)
     let offerTag = globalTags.registerTag(offerName)
@@ -140,8 +155,18 @@ proc readModuleAnalysis*(infile: string): ModuleAnalysis =
         else:
           raiseAssert infile & ": expected (roots|uses|offers)"
 
+proc readModuleAnalysis*(infile: string): ModuleAnalysis =
+  ## Path-based wrapper: read -> parse -> analyse.
+  var buf = parseFromFile(infile)
+  result = parseAnalysis(beginRead(buf), infile)
+
+proc readModuleAnalysis*(infile: string; t: var PhaseTimer): ModuleAnalysis =
+  ## Same, with the read and the parse charged to their own ledger buckets.
+  var buf = loadAndParse(infile, t)
+  result = parseAnalysis(beginRead(buf), infile)
+
 proc writeDceOutput*(buf: var TokenBuf; outfile, dottedSuffix: string) =
   ## Direct overload that works on an already-parsed token buffer,
   ## avoiding the file read + parse step.
-  let n = beginRead(buf)
-  prepDce(outfile, n, dottedSuffix)
+  var a = analyzeModule(beginRead(buf))
+  writeAnalysis(outfile, a, dottedSuffix)
