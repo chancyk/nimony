@@ -921,6 +921,15 @@ proc generateCode*(s: var State; m: sink MainModule; flags: set[GenFlag]): Codeg
   translate(s, m, flags, t)
   result = serialize(t)
 
+proc generateCode*(s: var State; input: var TokenBuf; inp: string;
+                   flags: set[GenFlag]): CodegenResult =
+  ## The same, one step earlier: a parsed `.c.nif` buffer in, the generated C
+  ## out. `inp` is the module's logical path — it names the module and, through
+  ## `prog.scheme`, the directory foreign modules are resolved against, so a
+  ## caller working from buffers still says where the input would have lived.
+  var m = loadFromBuf(input, inp)
+  result = generateCode(s, m, flags)
+
 proc writeGenerated*(r: CodegenResult; outp: string) =
   ## The `write` half: the `.c`/`.cpp` and, if there is one, the `.h` beside it.
   ## An unchanged output keeps its mtime, which is what makes the incremental

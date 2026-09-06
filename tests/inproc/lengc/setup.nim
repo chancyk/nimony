@@ -222,10 +222,9 @@ proc fromBuffer(input: string): CodegenResult =
   ## and so must be *moved* into the backend — which Nim's move analysis only
   ## infers inside a routine.
   var raw = parseFromBuf(readFile(input), input)
-  var m = loadFromBuf(raw, input)
   var s = cliState()
   s.config.nifcacheDir = input.parentDir
-  result = generateCode(s, m, {codegen.gfMainModule})
+  result = generateCode(s, raw, input, {codegen.gfMainModule})
 
 proc fromSplitLoad(input: string): CodegenResult =
   ## `readSource` + `parseSource`, the two halves `load` is now made of.

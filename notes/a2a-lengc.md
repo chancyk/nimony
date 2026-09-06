@@ -214,3 +214,49 @@ split of section 2 the path-based wrapper gets all five:
 - `noteProduce` — `traverseCode` + `traverseTypes` + `generateTypes`.
 - `noteSerialize` — rendering the token sequences into the `.c` string.
 - `noteWrite` — the `vfsExists`/`vfsRead` compare and the `vfsWrite`.
+
+## 9. What shipped
+
+```nim
+# src/lengc/nifmodules.nim
+proc readSource*(filename: string): string
+proc parseSource*(content: sink string; filename: string): MainModule
+proc parseFromBuf*(content: sink string; filename: string): TokenBuf
+proc loadFromBuf*(raw: var TokenBuf; filename: string; fromBif = false): MainModule
+proc load*(filename: string): MainModule          # = parseSource(readSource(f), f)
+proc looksLikeBif*(content: string): bool
+proc registerForeignModule*(c: var MainModule; module: string; m: ForeignModule)
+proc foreignModuleFromBuf*(content: sink string; module: string): ForeignModule
+
+# src/lengc/codegen.nim
+type Translation* = object                        # the token streams, pre-render
+type CodegenResult* = object
+  code*, header*: string
+  hasHeader*: bool
+proc translate*(s: var State; m: sink MainModule; flags: set[GenFlag];
+                t: var Translation)
+proc serialize*(t: var Translation): CodegenResult
+proc generateCode*(s: var State; m: sink MainModule;
+                   flags: set[GenFlag]): CodegenResult
+proc generateCode*(s: var State; input: var TokenBuf; inp: string;
+                   flags: set[GenFlag]): CodegenResult
+proc writeGenerated*(r: CodegenResult; outp: string)
+proc generateCode*(s: var State, inp, outp: string; flags: set[GenFlag])
+
+# src/lengc/lengc.nim
+proc runLengc*(args: seq[string]): int
+proc resetLengcGlobals*()
+```
+
+`translate` fills its `Translation` through a `var` parameter rather than
+returning one. `MainModule` holds cursors into its own `src` buffer, so it must
+be *moved* into the `GeneratedCode` and never copied out again; `=copy` is
+unavailable for it, and Nim's move analysis does not infer the move out of a
+returned object at every call site (the test runner hit exactly that, which is
+why its buffer checks live in procs rather than at module scope).
+
+`load` reads its bytes with `vfsRead` now, where `nifreader.open` used to mmap
+them. That is one copy of the `.c.nif` per module — microseconds at these sizes
+— and it is what makes `noteLoad` mean anything; it also routes the input
+through the artifact store's read path, which is where an in-process hexer's
+output will be waiting in A2c.
