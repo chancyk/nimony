@@ -24,6 +24,12 @@
 ## table as `<nimcache>/ledger.nif`; fragments are left in place (they, not the
 ## snapshot, carry the per-key history).
 ##
+## `spawn` is the exception to that, and the only one: no tool can time its own
+## process start, so the number comes from the parent that started it. nifmake
+## collects the observations of one run in a `SpawnLog` and folds them into the
+## snapshot at the end, and `put` keeps them there across a fragment fold. See
+## the `SpawnLog` section for why they are not written per command.
+##
 ## Two directory levels are scanned because the backend phases write into
 ## `<nimcache>/<main>_c/` rather than into the nimcache itself: `lengc` is
 ## handed `--nimcache:<backendDir>` and the main module's `hexer` an
@@ -231,11 +237,22 @@ proc insertAt(l: var Ledger; pos: int; e: LedgerEntry) =
   l.entries[pos] = e
 
 proc put*(l: var Ledger; e: LedgerEntry) =
-  ## Insert or replace `e` wholesale. Used by the fragment fold, where the
-  ## fragment already carries the accumulated history for its key.
+  ## Insert or replace `e`. Used by the fragment fold, where the fragment
+  ## already carries the accumulated history for its key.
+  ##
+  ## One field survives the replacement: `spawn`, when the incoming entry has
+  ## none. No tool measures its own process, so a tool's fragment always reports
+  ## `spawn = 0` -- that is "nothing to say", not "zero" -- while the snapshot
+  ## `<nimcache>/ledger.nif` is where nifmake, the only process that *can*
+  ## measure a spawn, keeps what it saw. Letting the fold clobber it would throw
+  ## the spawn history away on every build. A rebuilt tool is the exception: a
+  ## changed `toolhash` restarts that average too, exactly as `record` does.
   var pos = 0
   if find(l, e.key, pos):
-    l.entries[pos] = e
+    var merged = e
+    if merged.ewma.spawnNs == 0 and merged.toolhash == l.entries[pos].toolhash:
+      merged.ewma.spawnNs = l.entries[pos].ewma.spawnNs
+    l.entries[pos] = merged
   else:
     insertAt(l, pos, e)
   l.dirty = true
@@ -488,49 +505,6 @@ proc recordSpawn*(dir: string; key: LedgerKey; spawnNs: int64;
   if not existed: ensureDir(fragmentDir(dir))
   writeLedgerFile(l, p)
 
-proc recordSpawnWall*(dir: string; phase, module: string; wallNs: int64;
-                      observer: string) =
-  ## What a *command* cost, as seen from outside it: `spawn` is the wall time
-  ## the process took minus the `produce` the tool inside it reported.
-  ##
-  ## This is nifmake's half of JIT.md 5.2. It runs once per executed command, so
-  ## it is one `vfsExists` plus one `vfsRead` plus one atomic write -- the same
-  ## budget `writeFragment` costs the tool itself.
-  ##
-  ## Two keys are probed before anything is created. A whole-program node keys
-  ## its own fragment with an empty module (`dceLive` does), while an observer
-  ## outside the tool can only derive a module suffix from the node's output
-  ## file. Probing `(phase, module)` and then `(phase, "")` lands the spawn on
-  ## the sample the tool actually took instead of opening a second entry beside
-  ## it; the extra probe is one `vfsExists` and only on the nodes that need it.
-  ##
-  ## The `produce` subtracted is the fragment's running average, not this run's
-  ## raw measurement: a separate process cannot see the latter, and the tool has
-  ## just folded the latter into the former. The difference is damped again by
-  ## the EWMA the spawn itself goes through. When no fragment exists at all --
-  ## `cc`, `link`, and anything else that is not one of our instrumented tools
-  ## -- the whole wall time is the spawn cost, which is the honest answer for a
-  ## node that can never run in-process.
-  var key = LedgerKey(phase: phase, module: module)
-  var p = fragmentPath(dir, key)
-  var l = Ledger(path: p, entries: @[], current: observer, dirty: false)
-  var existed = readLedgerFile(l, p)
-  if not existed and module.len > 0:
-    let whole = LedgerKey(phase: phase, module: "")
-    let wp = fragmentPath(dir, whole)
-    if readLedgerFile(l, wp):
-      key = whole
-      p = wp
-      existed = true
-  var produceNs = 0'i64
-  var pos = 0
-  if find(l, key, pos): produceNs = l.entries[pos].ewma.produceNs
-  var spawnNs = wallNs - produceNs
-  if spawnNs < 0: spawnNs = 0
-  foldSpawn(l, key, spawnNs, observer)
-  if not existed: ensureDir(fragmentDir(dir))
-  writeLedgerFile(l, p)
-
 proc foldFragments(l: var Ledger; dir: string) =
   var files: seq[string] = @[]
   addNifFiles(fragmentDir(dir), files)
@@ -565,9 +539,83 @@ proc saveLedger*(l: var Ledger) =
 proc consolidate*(nimcache: string) =
   ## Fold every fragment under `nimcache` into `<nimcache>/ledger.nif`. The
   ## fragments are left alone: they, not the snapshot, carry each key's history,
-  ## and deleting them would restart every average at one sample. For phase A1d,
-  ## where nifmake calls this at the end of a run.
+  ## and deleting them would restart every average at one sample.
   var l = openLedger(nimcache / "ledger.nif")
+  if l.entries.len > 0:
+    saveLedger l
+
+# --- spawn observations ----------------------------------------------------
+#
+# A spawn is the one measurement no tool can take about itself: it is the wall
+# time of the process minus the work the process reported doing, and only the
+# parent that started it knows the first half. nifmake is that parent.
+#
+# The observations are collected in memory and folded in one pass at the end of
+# a run rather than written per command, and the reason is measured. A
+# fragment write is ~124 us (read, fold, atomic replace) and it happens in
+# nifmake's own single-threaded process, between two spawns -- unlike a tool's
+# own fragment, which is written inside the tool and so overlaps with the rest
+# of the DAG depth. At 47 commands for a forced hello world that is 5.8 ms of
+# serial work against a 420 ms build: 1.4 %, and the phase's budget is 1 %.
+# Folding at the end costs one `openLedger` plus one `saveLedger` -- 1.2 ms per
+# nifmake run, whatever the command count -- and the numbers come out the same.
+#
+# The consequence is that `spawn` lives in the snapshot rather than in the
+# fragments, which is what `put`'s merge rule above is for. Two prices, both
+# small and both deliberate: deleting `<nimcache>/ledger.nif` restarts the
+# spawn averages (but not `produce`, which is the fragments'), and two nifmake
+# processes consolidating the same nimcache at once -- a CTFE sub-compile
+# running beside its parent's build -- can lose one run's observations to the
+# other's write. `saveLedger` is atomic, so that is a lost update of an
+# average, never a corrupt file.
+
+type
+  SpawnObservation = object
+    key: LedgerKey
+    wallNs: int64
+
+  SpawnLog* = object
+    ## What one `runDag` saw. Append-only and in memory; `consolidate` turns it
+    ## into ledger entries.
+    obs: seq[SpawnObservation]
+
+proc noteSpawn*(log: var SpawnLog; phase, module: string; wallNs: int64) =
+  ## Remember that one command took `wallNs` of wall clock. This is what runs
+  ## between two process spawns, so it is a `seq` append and nothing else.
+  log.obs.add SpawnObservation(
+    key: LedgerKey(phase: phase, module: module), wallNs: wallNs)
+
+proc len*(log: SpawnLog): int = log.obs.len
+
+proc consolidate*(nimcache: string; log: SpawnLog) =
+  ## `consolidate`, plus the spawn costs `log` collected.
+  ##
+  ## `spawn` is `wall - produce`, with `produce` read from the table the fold
+  ## has just built, i.e. the tool's own running average. A separate process
+  ## cannot see this run's raw `produce`, and the tool has just folded it into
+  ## that average; the residue is damped again by the EWMA the spawn goes
+  ## through.
+  ##
+  ## Two keys are probed. A whole-program node keys its own sample with an empty
+  ## module (`dceLive` does), while an observer outside the tool can only derive
+  ## a module suffix from the node's output file, so `(phase, module)` is tried
+  ## first and `(phase, "")` second. Both missing means nothing measured this
+  ## phase at all -- `cc`, `link`, anything that is not one of our instrumented
+  ## tools -- and then the whole wall time is the spawn cost, which is the
+  ## honest answer for a node that can never run in-process.
+  var l = openLedger(nimcache / "ledger.nif")
+  let observer = toolhash()
+  for i in 0 ..< log.obs.len:
+    var key = log.obs[i].key
+    var pos = 0
+    if not find(l, key, pos) and key.module.len > 0:
+      let whole = LedgerKey(phase: key.phase, module: "")
+      if find(l, whole, pos): key = whole
+    var produceNs = 0'i64
+    if find(l, key, pos): produceNs = l.entries[pos].ewma.produceNs
+    var spawnNs = log.obs[i].wallNs - produceNs
+    if spawnNs < 0: spawnNs = 0
+    foldSpawn(l, key, spawnNs, observer)
   if l.entries.len > 0:
     saveLedger l
 

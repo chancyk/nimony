@@ -182,73 +182,111 @@ block fragmentFold:
   expect l.entries.len == 4, "a fragment below a subdirectory is folded, got " & $l.entries.len
 
 # --- 5b. spawn: what nifmake sees from outside the process (A1d) -----------
+#
+# `spawn` is the one measurement a tool cannot take about itself. nifmake
+# collects it in a `SpawnLog` during a run and folds it into the snapshot at
+# the end, so the cases here drive that pair rather than a per-command write.
+
+proc spawnOf(l: Ledger; phase, module: string): int64 =
+  result = -1
+  for i in 0 ..< l.entries.len:
+    if l.entries[i].key == key(phase, module): result = l.entries[i].ewma.spawnNs
 
 block spawnRecording:
-  let dir = scratch / "spawn"
-  createDir dir
+  let nc = scratch / "spawn"
+  createDir nc
   # The tool measured 6 ms of work; the process it ran in took 10 ms wall. The
   # difference is what the process itself cost.
-  writeFragment(dir, key("hexer", "m1"), sample(6_000_000, 100), HashA)
-  recordSpawnWall(dir, "hexer", "m1", 10_000_000, HashB)
-  var f = openFragment(dir, key("hexer", "m1"))
-  expect f.entries.len == 1, "the observation stays in the tool's fragment"
-  if f.entries.len == 1:
-    expect f.entries[0].ewma.spawnNs == 4_000_000,
-      "spawn is wall minus produce, got " & $f.entries[0].ewma.spawnNs
-    expect f.entries[0].ewma.produceNs == 6_000_000,
+  writeFragment(nc, key("hexer", "m1"), sample(6_000_000, 100), HashA)
+  var log = default(SpawnLog)
+  log.noteSpawn("hexer", "m1", 10_000_000)
+  consolidate(nc, log)
+
+  var l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "hexer", "m1") == 4_000_000,
+    "spawn is wall minus produce, got " & $spawnOf(l, "hexer", "m1")
+  var pos = -1
+  for i in 0 ..< l.entries.len:
+    if l.entries[i].key == key("hexer", "m1"): pos = i
+  if pos >= 0:
+    expect l.entries[pos].ewma.produceNs == 6_000_000,
       "and the tool's produce is untouched"
-    expect f.entries[0].samples == 1,
+    expect l.entries[pos].samples == 1,
       "an observation about a sample is not a second sample"
     # The observer is a different binary than the tool -- nifmake's `toolhash`
-    # can never equal hexer's -- so an entry that gets restamped here would
-    # have its average restarted by the watcher on every single build.
-    expect f.entries[0].toolhash == HashA,
+    # can never equal hexer's -- so an entry that got restamped here would have
+    # its average restarted by the watcher on every single build.
+    expect l.entries[pos].toolhash == HashA,
       "the entry keeps the stamp of whoever measured it, got " &
-        f.entries[0].toolhash
+        l.entries[pos].toolhash
 
-  # A second observation blends: (7*4ms + 3*14ms) / 10 = 7 ms.
-  recordSpawnWall(dir, "hexer", "m1", 20_000_000, HashB)
-  f = openFragment(dir, key("hexer", "m1"))
-  if f.entries.len == 1:
-    expect f.entries[0].ewma.spawnNs == 7_000_000,
-      "a second observation blends, got " & $f.entries[0].ewma.spawnNs
+  # The next build rewrites the fragment (which still reports no spawn of its
+  # own) and observes again. The spawn must survive the fold and then blend:
+  # (7*4ms + 3*14ms) / 10 = 7 ms.
+  writeFragment(nc, key("hexer", "m1"), sample(6_000_000, 100), HashA)
+  var log2 = default(SpawnLog)
+  log2.noteSpawn("hexer", "m1", 20_000_000)
+  consolidate(nc, log2)
+  l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "hexer", "m1") == 7_000_000,
+    "a fragment fold must not clobber the spawn, and the second observation " &
+      "blends: got " & $spawnOf(l, "hexer", "m1")
 
   # A tool that reports nothing -- `cc`, `link` -- gives the whole wall time.
-  recordSpawnWall(dir, "cc", "m1", 54_000_000, HashB)
-  f = openFragment(dir, key("cc", "m1"))
-  expect f.entries.len == 1, "an unreported phase gets an entry of its own"
-  if f.entries.len == 1:
-    expect f.entries[0].ewma.spawnNs == 54_000_000,
-      "with the whole command as its spawn cost, got " &
-        $f.entries[0].ewma.spawnNs
-    expect f.entries[0].toolhash == HashB,
-      "stamped by the observer, because nobody else measured it"
+  var log3 = default(SpawnLog)
+  log3.noteSpawn("cc", "m1", 54_000_000)
+  consolidate(nc, log3)
+  l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "cc", "m1") == 54_000_000,
+    "an unreported phase contributes its whole command, got " &
+      $spawnOf(l, "cc", "m1")
 
-  # A whole-program node keys its own fragment with an empty module (hexer's
-  # `dl` does), while nifmake can only derive a module from the output file.
-  # The observation has to find the tool's sample rather than open a second one.
-  writeFragment(dir, key("dceLive", ""), sample(8_000_000, 10), HashA)
-  recordSpawnWall(dir, "dceLive", "mainmod", 9_000_000, HashB)
-  expect not fileExists(fragmentPath(dir, key("dceLive", "mainmod"))),
-    "no second fragment is opened beside the tool's"
-  f = openFragment(dir, key("dceLive", ""))
-  if f.entries.len == 1:
-    expect f.entries[0].ewma.spawnNs == 1_000_000,
-      "the spawn landed on the whole-program key, got " &
-        $f.entries[0].ewma.spawnNs
-    expect f.entries[0].ewma.produceNs == 8_000_000,
-      "and left its produce alone"
+  # A whole-program node keys its own sample with an empty module (hexer's `dl`
+  # does), while nifmake can only derive a module from the output file. The
+  # observation has to find the tool's sample rather than open a second one.
+  writeFragment(nc, key("dceLive", ""), sample(8_000_000, 10), HashA)
+  var log4 = default(SpawnLog)
+  log4.noteSpawn("dceLive", "mainmod", 9_000_000)
+  consolidate(nc, log4)
+  l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "dceLive", "mainmod") == -1,
+    "no second entry is opened beside the tool's"
+  expect spawnOf(l, "dceLive", "") == 1_000_000,
+    "the spawn landed on the whole-program key, got " &
+      $spawnOf(l, "dceLive", "")
 
-  # A wall time below the reported produce (a clock that disagrees with itself,
-  # a produce average that has not caught up) is a zero spawn, never negative.
-  recordSpawnWall(dir, "nimsem", "m1", 1_000_000, HashB)
-  writeFragment(dir, key("nimsem", "m2"), sample(50_000_000), HashA)
-  recordSpawnWall(dir, "nimsem", "m2", 10_000_000, HashB)
-  f = openFragment(dir, key("nimsem", "m2"))
+  # A wall time below the reported produce (a produce average that has not
+  # caught up, a clock that disagrees with itself) is a zero spawn, never
+  # negative.
+  writeFragment(nc, key("nimsem", "m2"), sample(50_000_000), HashA)
+  var log5 = default(SpawnLog)
+  log5.noteSpawn("nimsem", "m2", 10_000_000)
+  consolidate(nc, log5)
+  l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "nimsem", "m2") == 0,
+    "a wall time below produce clamps to zero, got " &
+      $spawnOf(l, "nimsem", "m2")
+
+  # A rebuilt tool restarts its spawn average with the rest of its numbers.
+  writeFragment(nc, key("hexer", "m1"), sample(6_000_000, 100), HashB)
+  l = openLedger(nc / "ledger.nif")
+  expect spawnOf(l, "hexer", "m1") == 0,
+    "a changed toolhash drops the spawn the old binary earned, got " &
+      $spawnOf(l, "hexer", "m1")
+
+  # `recordSpawn` is the per-key form, for a caller that has one observation
+  # and a fragment to put it in rather than a whole run's worth.
+  let one = scratch / "spawn1"
+  createDir one
+  writeFragment(one, key("lengc", "m1"), sample(5_000_000, 10), HashA)
+  recordSpawn(one, key("lengc", "m1"), 2_000_000, HashB)
+  let f = openFragment(one, key("lengc", "m1"))
   if f.entries.len == 1:
-    expect f.entries[0].ewma.spawnNs == 0,
-      "a wall time below produce clamps to zero, got " &
+    expect f.entries[0].ewma.spawnNs == 2_000_000,
+      "the first observation seeds the average, got " &
         $f.entries[0].ewma.spawnNs
+    expect f.entries[0].toolhash == HashA,
+      "and does not restamp the entry"
 
 # --- 5c. consolidate: the snapshot nifmake publishes ------------------------
 
