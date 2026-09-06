@@ -48,6 +48,32 @@ proc mainHexedPerBackend(cache: string): seq[(string, string)] =
       result.add (dir.lastPathPart, readFile(f))
   sort result
 
+
+proc ctfeStamps(cache: string; buildOnly: bool): seq[(string, string)] =
+  ## `(name, mtime)` for the artifacts of every compile-time evaluation in
+  ## `cache`. Each evaluation owns `<sfx>.out.nif` (rewritten when the
+  ## sub-program RAN again) and a `<sfx>/` directory of `.c`/`.o`/exe
+  ## (rewritten when its BUILD nodes ran again). `buildOnly` keeps just the
+  ## second group, which is what `-f` on the outer compile must leave alone.
+  ##
+  ## The mtime is formatted rather than compared as a `Time` so a phase can
+  ## diff two snapshots as plain values, and it keeps nanoseconds: a
+  ## sub-program is fast enough to be rebuilt twice within one second.
+  result = @[]
+  const outSuffix = ".out.nif"
+  for f in walkFiles(cache / "*" & outSuffix):
+    let base = f.lastPathPart
+    let sfx = base[0 ..< base.len - outSuffix.len]
+    if not buildOnly:
+      let t = getLastModificationTime(f)
+      result.add (base, $t.toUnix & "." & $t.nanosecond)
+    let dir = cache / sfx
+    if dirExists(dir):
+      for g in walkFiles(dir / "*"):
+        let t = getLastModificationTime(g)
+        result.add (sfx / g.lastPathPart, $t.toUnix & "." & $t.nanosecond)
+  sort result
+
 proc incrementalTests*() =
   ## Drive `bin/nimony c --report` through a fixed sequence of scenarios on
   ## `tests/incremental/sample.nim` and assert the per-nifmake-invocation
@@ -283,6 +309,110 @@ proc incrementalTests*() =
                " commands; a missing dependency must force ONE rebuild, not a loop"
     writeFile(pluginData, originalPluginData)
     writeFile(slurpData, originalSlurpData)
+
+  # Phases 12-16: compile-time evaluation. A `const` that `expreval` cannot
+  # fold makes `exprexec` compile and run a whole program (`semos.runEval`),
+  # and the result is memoized in `<sfx>.out.nif`. These phases pin the two
+  # halves of that memo: it must be reused when nothing the evaluation
+  # depends on moved, and it must give way when something did — including a
+  # file the sub-program read at RUN time, which no compiler phase can see.
+  # Its own fixture again, so the extra sub-compiles do not perturb the
+  # counts asserted above.
+  let ctfeSrc = "tests/incremental/ctfedep.nim"
+  let ctfeData = "tests/incremental/ctfedata.txt"
+  let ctfeCache = "nimcache" / "incremental-ctfe"
+  if fileExists(ctfeSrc) and fileExists(ctfeData):
+    phases += 5
+    let originalCtfeData = readFile(ctfeData)
+    removeDir ctfeCache
+    let ctfeCmd = nimony.quoteShell & " c -r --silentMake --report --nimcache:" &
+                  ctfeCache.quoteShell & " " & ctfeSrc.quoteShell
+
+    var ctfeOutput = ""
+    proc runCtfe(label: string; extraFlags = ""): seq[seq[ReportEntry]] =
+      let (output, ec) = execCmdEx(ctfeCmd & extraFlags)
+      ctfeOutput = output
+      if ec != 0:
+        stdout.write output
+        writeFile(ctfeData, originalCtfeData)
+        restoreSources()
+        quit "incremental: '" & label & "' compile failed"
+      parseNifmakeReports(output)
+
+    # Phase 12: cold. Both consts are evaluated for real and the one that
+    # reads a file must see it.
+    block:
+      let r = runCtfe("ctfe-cold")
+      if r.len == 2:
+        expect reportField(r[0], "total") > 0, "ctfe-cold: frontend ran 0 commands"
+      expect ctfeOutput.contains("ctfe label: ctfe-one"),
+             "ctfe-cold: the const did not read its data file"
+      expect ctfeStamps(ctfeCache, buildOnly = false).len > 0,
+             "ctfe-cold: no evaluation artifacts under " & ctfeCache
+
+    # Phase 13: nothing changed. The `.reads` sidecars and the `(dependency …)`
+    # entries they produce are extra inputs of the module's nimsem node, and
+    # extra inputs are exactly how a node becomes perpetually stale.
+    block:
+      let r = runCtfe("ctfe-noop")
+      if r.len == 2:
+        expect reportField(r[0], "total") == 0,
+               "ctfe-noop: frontend re-ran " & $reportField(r[0], "total") & " commands"
+        expect reportField(r[1], "total") == 0,
+               "ctfe-noop: backend re-ran " & $reportField(r[1], "total") & " commands"
+
+    # Phase 14: touch without changing the bytes. nifler reruns and finds the
+    # `.p.nif` unchanged, so nimsem never reaches the consts at all and no
+    # sub-program may move.
+    block:
+      let before = ctfeStamps(ctfeCache, buildOnly = false)
+      setLastModificationTime(ctfeSrc, getTime())
+      let r = runCtfe("ctfe-touch")
+      if r.len == 2:
+        expect reportField(r[0], "nifler") >= 1, "ctfe-touch: nifler did not re-run"
+        expect reportField(r[0], "nimsem") == 0,
+               "ctfe-touch: nimsem ran " & $reportField(r[0], "nimsem") & " times (expected 0)"
+      expect ctfeStamps(ctfeCache, buildOnly = false) == before,
+             "ctfe-touch: a sub-program was rebuilt or rerun for a content-preserving touch"
+
+    # Phase 15: edit the file the sub-program reads WHILE IT RUNS. Nothing in
+    # the module's own inputs changed and no compiler phase saw the read —
+    # `readFile` is a plain call, not `slurp` — so two things have to work:
+    # `runEval` reported the path through `recordFileDep`, which makes the
+    # module stale at all, and the memo noticed the same path is newer than
+    # its `.out.nif`.
+    block:
+      let before = ctfeStamps(ctfeCache, buildOnly = false)
+      writeFile(ctfeData, "ctfe-two\nthe rest is ignored\n")
+      let r = runCtfe("ctfe-data-edit")
+      if r.len == 2:
+        expect reportField(r[0], "nimsem") >= 1,
+               "ctfe-data-edit: nimsem did not re-run; the file the const read " &
+               "is not an input of its module"
+      expect ctfeOutput.contains("ctfe label: ctfe-two"),
+             "ctfe-data-edit: served a stale evaluation; expected 'ctfe-two'"
+      expect ctfeStamps(ctfeCache, buildOnly = false) != before,
+             "ctfe-data-edit: no evaluation artifact moved"
+      discard runCtfe("ctfe-data-settle")
+
+    # Phase 16: `-f`. It is an instruction about the graph the user named, and
+    # a sub-program is content-addressed, so forcing must not reach it.
+    # Before the fix `-f` was forwarded to the inner `nimony s`, which deleted
+    # and rebuilt all ~30 of its nodes per const. The evaluations themselves
+    # may re-run here (a forced build re-sems every module, which rewrites the
+    # `.s.nif` files the sub-programs link), but their BUILD must not.
+    block:
+      let before = ctfeStamps(ctfeCache, buildOnly = true)
+      let r = runCtfe("ctfe-force", " -f")
+      if r.len == 2:
+        expect reportField(r[0], "total") > 0,
+               "ctfe-force: -f did not rebuild the outer graph, so this phase proves nothing"
+      expect ctfeStamps(ctfeCache, buildOnly = true) == before,
+             "ctfe-force: -f leaked into a CTFE sub-compile and rebuilt its objects"
+      expect ctfeOutput.contains("ctfe label: ctfe-two"),
+             "ctfe-force: wrong value after a forced build"
+
+    writeFile(ctfeData, originalCtfeData)
 
   let dt = epochTime() - t0
   if failures.len > 0:
