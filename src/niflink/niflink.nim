@@ -33,7 +33,7 @@
 ## overrides the manifest's `(output …)`).
 
 import std / [os, syncio, strutils]
-import ".." / "lib" / [nifcore, nifcoreparse, argsfinder]
+import ".." / "lib" / [nifcore, nifcoreparse, argsfinder, vfs]
 
 type
   LinkFile = object
@@ -211,5 +211,17 @@ proc main =
     args.add "-o"
     args.add output
     quit runTool(cc, args, output)
+
+when defined(vfsProfile):
+  # Every exit from `main` is a `quit`, so the dump has to be an exit proc
+  # rather than a statement after the call. niflink reaches the VFS only
+  # through `nifcoreparse` reading the manifest; a near-zero line here is
+  # the answer, not a missing one.
+  import std / exitprocs
+
+  proc dumpNiflinkProfile() =
+    dumpVfsProfile("niflink")
+
+  addExitProc dumpNiflinkProfile
 
 main()

@@ -30,6 +30,12 @@ when defined(nimony):
 
 import std / [memfiles, syncio, times]
 
+when defined(vfsProfile):
+  # `inNanoseconds` comes from `std/times` above; the clock itself does not.
+  # Without this the whole profiling build fails on `getMonoTime`, which is
+  # why the mode had bit-rotted.
+  import std / monotimes
+
 # --- profiling --------------------------------------------------------
 #
 # Compile with `-d:vfsProfile` to record per-op counts and elapsed time.

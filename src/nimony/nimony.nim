@@ -17,7 +17,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
 import std / [parseopt, sets, strutils, os, assertions, syncio, dirs, paths]
-import ".." / lib / [tooldirs, argsfinder, nimversion]
+import ".." / lib / [tooldirs, argsfinder, nimversion, vfs]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
@@ -440,3 +440,6 @@ when isMainModule:
 
   handleCmdLine(c, @[], FromCmdLine)
   compileProgram(c)
+  # The driver is the parent of every other tool process, so its own VFS time
+  # is the one line the per-tool dumps cannot account for.
+  dumpVfsProfile("nimony")
