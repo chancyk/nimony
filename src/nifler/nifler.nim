@@ -34,9 +34,9 @@ Options:
   --help                show this help
 """
 
-proc fail(msg: string; code = 1): int =
-  ## What `quit msg` wrote and returned, as a value: same bytes on stderr, same
-  ## exit code, but the process survives so it can parse a second file
+proc exitWith(msg: string; code = 1): int =
+  ## `quit(msg, code)` as a value: the same bytes on stderr and the same exit
+  ## code, but the process survives so it can parse a second file
   ## (`JIT.md` 6.1).
   stderr.writeLine msg
   result = code
@@ -88,29 +88,29 @@ proc runNifler*(argv: seq[string]): int =
     of cmdLongOption, cmdShortOption:
       case normalize(key)
       # `quit(x, QuitSuccess)`, minus the quit.
-      of "help", "h": return fail(Usage, QuitSuccess)
-      of "version", "v": return fail(Version & "\n", QuitSuccess)
+      of "help", "h": return exitWith(Usage, QuitSuccess)
+      of "version", "v": return exitWith(Version & "\n", QuitSuccess)
       of "force", "f": forceRebuild = true
       of "portablepaths": portablePaths = true
       of "deps": deps = true
       of "docs": preserveDocs = true
       of "vfs":
         if not requestStorePolicy(val):
-          return fail("invalid value for --vfs; expected disk, memory, memory+spill or verify")
+          return exitWith("invalid value for --vfs; expected disk, memory, memory+spill or verify")
       of "vfs-budget", "vfsbudget":
         let mb = parseBudgetMB(val)
-        if mb <= 0: return fail("invalid value for --vfs-budget; expected a size in megabytes")
+        if mb <= 0: return exitWith("invalid value for --vfs-budget; expected a size in megabytes")
         requestStoreBudgetMB mb
-      else: return fail(Usage)
+      else: return exitWith(Usage)
     of cmdEnd: assert false, "cannot happen"
   applyRequestedStore()
 
   case action
   of "":
-    result = fail(Usage, QuitSuccess)
+    result = exitWith(Usage, QuitSuccess)
   of "p", "parse", "deps":
     if args.len == 0:
-      result = fail("'parse' command takes a filename")
+      result = exitWith("'parse' command takes a filename")
     else:
       let inp = args[0]
       let outp = if args.len >= 2: args[1].addFileExt".nif" else: changeFileExt(inp, ".nif")
@@ -129,14 +129,14 @@ proc runNifler*(argv: seq[string]): int =
         let m = parseToBuf(inp, portablePaths, deps, depsOnly, preserveDocs)
         timer.noteProduce()
         if not m.ok:
-          return if m.msg.len > 0: fail(m.msg) else: 1
+          return if m.msg.len > 0: exitWith(m.msg) else: 1
         writeParsed(m, outp, deps, depsOnly)
         timer.noteWrite()
         timer.noteOutput(outp)
         timer.finish()
   of "config":
     if args.len == 0:
-      result = fail("'config' command takes a filename")
+      result = exitWith("'config' command takes a filename")
     else:
       let inp = args[0]
       let outp = if args.len >= 2: args[1].addFileExt".nif" else: changeFileExt(inp, ".cfg.nif")
@@ -145,7 +145,7 @@ proc runNifler*(argv: seq[string]): int =
       else:
         produceConfig inp, outp
   else:
-    result = fail("Invalid action: " & action)
+    result = exitWith("Invalid action: " & action)
 
 when isMainModule:
   let exitCode = runNifler(commandLineParams())

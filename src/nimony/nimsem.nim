@@ -55,10 +55,10 @@ type
   Command = enum
     None, SingleModule, GenerateIdx, Execute, Idetools, BuildPlugin
 
-proc fail(msg: string): int =
-  ## What `quit msg` wrote and returned, as a value: same bytes on stderr, same
-  ## exit code, but the process survives so a second module can be checked in
-  ## it (`JIT.md` 6.1).
+proc exitWith(msg: string): int =
+  ## `quit msg` as a value: the same bytes on stderr and the same exit code,
+  ## but the process survives so a second module can be checked in it
+  ## (`JIT.md` 6.1).
   stderr.writeLine msg
   result = 1
 
@@ -66,7 +66,7 @@ proc processModules(infiles: seq[string]; config: sink NifConfig;
                     moduleFlags: set[ModuleFlag]; commandLineArgs: string): int =
   for infile in infiles:
     if not semos.fileExists(infile):
-      return fail("cannot find " & infile)
+      return exitWith("cannot find " & infile)
   var outfiles: seq[string] = @[]
   for infile in infiles:
     # Mirror the doc-mode prefix: `.pc.nif` → `.sc.nif`, plain `.p.nif` → `.s.nif`.
@@ -143,7 +143,7 @@ proc runNimsem*(argv: seq[string]): int =
         of "plugin":
           cmd = BuildPlugin
         else:
-          return fail("command expected")
+          return exitWith("command expected")
       else:
         args.add key
 
@@ -182,40 +182,40 @@ proc runNimsem*(argv: seq[string]): int =
 
   case cmd
   of None:
-    result = fail("command missing")
+    result = exitWith("command missing")
   of SingleModule:
     if args.len < 1:
-      result = fail("want at least 1 command line argument")
+      result = exitWith("want at least 1 command line argument")
     else:
       result = processModules(args, ensureMove config, moduleFlags, commandLineArgs)
   of GenerateIdx:
     if args.len != 1:
-      result = fail("want exactly 1 command line argument")
+      result = exitWith("want exactly 1 command line argument")
     else:
       indexFromNif(args[0])
       result = 0
   of Execute:
     if args.len == 0:
-      result = fail("want more than 0 command line argument")
+      result = exitWith("want more than 0 command line argument")
     else:
       executeNif args, ensureMove config
       result = 0
   of BuildPlugin:
     if args.len != 2:
-      result = fail("want exactly 2 command line arguments: <plugin.nim> <executable>")
+      result = exitWith("want exactly 2 command line arguments: <plugin.nim> <executable>")
     else:
       buildPlugin(config, args[0], args[1])
       result = 0
   of Idetools:
     if args.len == 0:
-      result = fail("want more than 0 command line argument")
+      result = exitWith("want more than 0 command line argument")
     else:
       case config.toTrack.mode
       of TrackUsages, TrackDef:
         usages(args, config)
         result = 0
       of TrackNone:
-        result = fail("no --track information provided")
+        result = exitWith("no --track information provided")
 
 when isMainModule:
   let exitCode = runNimsem(commandLineParams())
