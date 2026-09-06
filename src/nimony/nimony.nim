@@ -21,6 +21,7 @@ import ".." / lib / [tooldirs, argsfinder, nimversion, vfs, artifactstore]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
+import phases
 
 include ".." / lib / compat2
 
@@ -230,6 +231,15 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
         var forwardArgLengc = false
         # Handle special cases first, then try common parser
         let keyNorm = normalize(key)
+        if keyNorm == "vfs" and normalize(val) == "disk":
+          # JIT.md 6.2: "`--vfs:disk` forces today's behaviour entirely". It is
+          # the EXPLICIT flag that implies it, not the resolved policy: A1b
+          # left the default policy at `disk` until A2c flips it, so reading
+          # the resolved value here would leave the whole in-process path dead
+          # at its own default. `--spawn:` given later still wins, which is
+          # what makes `--vfs:disk --spawn:auto` mean "old store, new
+          # scheduler" for a bisect.
+          putEnv("NIMONY_SPAWN", "always")
         if keyNorm == "help":
           echo Usage
           quit(QuitSuccess)
@@ -284,6 +294,41 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
             else: quit "invalid value for --boundchecks"
           of "silentmake":
             c.buildFlags.incl SilentMake
+            forwardArg = false
+          of "spawn":
+            # `always` is the escape hatch of JIT.md 6.2: every DAG node gets a
+            # process, and so does `nifmake` itself, so the process tree is
+            # literally the one the release before A2b produced. It isolates a
+            # scheduler bug from a store bug because the store stays installed.
+            #
+            # In the environment rather than in `c.commandLineArgs` for the
+            # reason A1b gives for `--vfs`: a forwarded flag is spliced into
+            # the `.build.nif`, and the two modes would then emit different
+            # build files -- exactly what this phase's gate forbids the tests
+            # from tolerating. The environment reaches every child, the nested
+            # `nimony s` of a compile-time evaluation included.
+            case normalize(val)
+            of "always": putEnv("NIMONY_SPAWN", "always")
+            of "auto", "": putEnv("NIMONY_SPAWN", "auto")
+            else: quit "invalid value for --spawn; expected always or auto"
+            forwardArg = false
+          of "jobs":
+            var n = 0
+            try:
+              n = parseInt(val)
+            except ValueError:
+              quit "invalid value for --jobs; expected a process count"
+            if n < 1: quit "--jobs value must be >= 1"
+            putEnv("NIMONY_JOBS", $n)
+            forwardArg = false
+          of "inproc-k", "inprock":
+            var n = 0
+            try:
+              n = parseInt(val)
+            except ValueError:
+              quit "invalid value for --inproc-k; expected a number"
+            if n < 1: quit "--inproc-k value must be >= 1"
+            putEnv("NIMONY_INPROC_K", $n)
             forwardArg = false
           of "profile":
             c.buildFlags.incl Profile
@@ -471,6 +516,14 @@ when isMainModule:
   # from a command line rather than from a path it was handed.
   requestLedgerDir(c.config.nifcachePath)
   applyRequestedStore()
+  # The in-process scheduler (JIT.md 6.1-6.2). Installed here, after the
+  # command line and after the store, because it reads the cost ledger out of
+  # the nimcache and the nimcache is a command-line answer. `--spawn:always`
+  # installs nothing, which is what makes the escape hatch exact rather than
+  # approximate: no relay, so `deps.runMake` spawns `nifmake` and `nifmake`
+  # spawns every node, the way it always did.
+  installPhaseRelay(spawnModeFromEnv(smAuto), c.config.nifcachePath,
+                    inprocKFromEnv(DefaultInprocK))
   compileProgram(c)
   storeFlush()
   # The driver is the parent of every other tool process, so its own VFS time
