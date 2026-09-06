@@ -20,6 +20,7 @@
 import std / [os, assertions, strutils, syncio, sets]
 import ".." / ".." / "lib" / nifcoreparse   # parse/serialize; re-exports nifcore
 import ".." / ".." / "lib" / nifcdecl        # createLengTagPool, stmtKind, takeProcDecl
+import ".." / ".." / "lib" / vfs           # .c.nif in, .oc.nif out
 import induction_variables                     # runInductionVariables (live pass)
 import cse                                     # runCSE + collectFunctionSummaries
 import scalarizer                              # runScalarize (object → field scalars / SROA)
@@ -235,7 +236,7 @@ proc processFile*(input, output: string; verify = false;
   var imiChanged = false
   let imiNif =
     if passOn("imi"): runImi(input, suffix, splitFile(input).dir, imiChanged)
-    else: readFile(input)
+    else: vfsRead(input)
   if imiChanged: inc st.intermodChanged
   # 2. Load the module as a typenav context (for type-precise aliasing), and
   #    reparse the (post-inlining) body into nifcore SHARING that context's pool
@@ -248,7 +249,7 @@ proc processFile*(input, output: string; verify = false;
   var eng = newEngine(ArithRules, typeCtx.pool, typeCtx.tags)
   var optimized = optimizeModule(src, suffix, st, addr typeCtx, eng, vecMode)
   checkWellFormed(optimized)
-  writeFile(output, toModuleString(optimized, "." & extractModuleSuffix(output)))
+  vfsWrite(output, toModuleString(optimized, "." & extractModuleSuffix(output)))
   if verify:
     var back = parseFromFile(output, 4000, sharedTags = createLengTagPool())
     checkWellFormed(back)

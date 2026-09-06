@@ -8,6 +8,7 @@
 
 import std/[os, strutils, parseopt, strtabs, times]
 from std/sequtils import addUnique
+import ".." / lib / vfs
 
 import compiler / [commands, options, msgs, idents, lineinfos, cmdlinehelper, pathutils, modulegraphs, condsyms]
 
@@ -216,7 +217,7 @@ proc produceConfig*(infile, outfile: string) =
 
 proc sourcesChangedImpl(configFile: string; c: Cursor): bool =
   var c = c
-  let modtime = getLastModificationTime(configFile)
+  let modtime = vfsMtime(configFile)
   result = false
   while c.hasMore:
     if c.isTagLit and globalTags.tags[c.cursorTagId] == "sources":
@@ -224,9 +225,9 @@ proc sourcesChangedImpl(configFile: string; c: Cursor): bool =
       while dep.hasMore:
         if dep.isStringLit:
           let path = pool.strings[dep.strId]
-          if not fileExists(path):
+          if not vfsExists(path):
             return true
-          if getLastModificationTime(path) >= modtime:
+          if vfsMtime(path) >= modtime:
             return true
         skip dep
       skip c

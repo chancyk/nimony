@@ -8,7 +8,7 @@
 
 import std / [strutils, sets, syncio, os]
 import nifconfig, langmodes
-import ".." / lib / argsfinder
+import ".." / lib / [argsfinder, artifactstore]
 
 proc parseTrack(s: string; mode: TrackMode): TrackPosition =
   ## Parse file,line,col format for --usages and --def options
@@ -167,6 +167,22 @@ proc parseCommonOption*(key, val: string; config: var NifConfig;
     of "", "on": config.inlineFrames = true
     of "off": config.inlineFrames = false
     else: quit "invalid value for --inlineframes; expected on or off"
+  of "vfs":
+    # The artifact store's policy (`src/lib/artifactstore.nim`). Consumed
+    # here, never forwarded: the resolved policy travels to every child
+    # process in the environment instead, so two modes still emit
+    # byte-identical `*.build.nif` files.
+    if not requestStorePolicy(val):
+      quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
+    forwardArg = false
+  of "vfs-budget", "vfsbudget":
+    var mb = 0
+    try: mb = parseInt(val)
+    except ValueError: mb = -1
+    if mb <= 0:
+      quit "invalid value for --vfs-budget; expected a size in megabytes"
+    requestStoreBudgetMB mb
+    forwardArg = false
   of "novalidate":
     config.noValidate = true
   of "verbose":

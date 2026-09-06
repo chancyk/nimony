@@ -10,7 +10,7 @@
 
 import std/[syncio, os, osproc, tables, hashes, assertions]
 
-import ".." / lib / [nifpools, bitabs, nifindexes, symparser]
+import ".." / lib / [nifpools, bitabs, nifindexes, symparser, vfs]
 import ".." / lib / nifreader
 from ".." / lib / nifcoreparse import parse
 import ".." / models / [tags]
@@ -299,7 +299,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   deps.addParLe StmtsS, info
   deps.addParRi()
   try:
-    writeFile(depsFile, toString(deps, true))
+    vfsWrite(depsFile, toString(deps, true))
   except:
     echo "Macro plugin: failed to write ", depsFile
     return ""
@@ -351,7 +351,7 @@ proc runMacroPlugin*(nifcachePath: string; dest: var TokenBuf;
   let inputPath = nifcachePath / "macro_in_" & $macroSym.int & ".nif"
   let outputPath = nifcachePath / "macro_out_" & $macroSym.int & ".nif"
   try:
-    writeFile(inputPath, toString(args))
+    vfsWrite(inputPath, toString(args))
   except:
     echo "Macro plugin: failed to write ", inputPath
     return false

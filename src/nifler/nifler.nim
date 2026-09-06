@@ -9,7 +9,7 @@
 
 import std / [parseopt, strutils, os, assertions, times]
 import bridge, configcmd
-import ".." / lib / [vfs, nimversion]
+import ".." / lib / [vfs, artifactstore, nimversion]
 
 include ".." / lib / compat2
 
@@ -59,8 +59,18 @@ proc handleCmdLine() =
       of "portablepaths": portablePaths = true
       of "deps": deps = true
       of "docs": preserveDocs = true
+      of "vfs":
+        if not requestStorePolicy(val):
+          quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
+      of "vfs-budget", "vfsbudget":
+        var mb = 0
+        try: mb = parseInt(val)
+        except ValueError: mb = -1
+        if mb <= 0: quit "invalid value for --vfs-budget; expected a size in megabytes"
+        requestStoreBudgetMB mb
       else: quit(Usage)
     of cmdEnd: assert false, "cannot happen"
+  applyRequestedStore()
 
   case action
   of "":
@@ -72,9 +82,9 @@ proc handleCmdLine() =
       let inp = args[0]
       let outp = if args.len >= 2: args[1].addFileExt".nif" else: changeFileExt(inp, ".nif")
       let depsNif = outp.changeFileExt(".deps.nif")
-      if not forceRebuild and fileExists(outp) and fileExists(inp) and
-          getLastModificationTime(outp) > getLastModificationTime(inp) and
-          (not deps or (fileExists(depsNif) and getLastModificationTime(depsNif) > getLastModificationTime(inp))):
+      if not forceRebuild and vfsExists(outp) and vfsExists(inp) and
+          vfsMtime(outp) > vfsMtime(inp) and
+          (not deps or (vfsExists(depsNif) and vfsMtime(depsNif) > vfsMtime(inp))):
         discard "nothing to do"
       else:
         parseFile inp, outp, portablePaths, deps, action == "deps", preserveDocs
@@ -84,7 +94,7 @@ proc handleCmdLine() =
     else:
       let inp = args[0]
       let outp = if args.len >= 2: args[1].addFileExt".nif" else: changeFileExt(inp, ".cfg.nif")
-      if not forceRebuild and fileExists(outp) and not sourcesChanged(outp):
+      if not forceRebuild and vfsExists(outp) and not sourcesChanged(outp):
         discard "nothing to do"
       else:
         produceConfig inp, outp
@@ -93,4 +103,5 @@ proc handleCmdLine() =
 
 when isMainModule:
   handleCmdLine()
+  storeFlush()
   dumpVfsProfile("nifler")

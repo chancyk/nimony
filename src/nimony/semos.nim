@@ -313,12 +313,11 @@ proc lastModTimeOrStale(path: string): int64 =
   ## `getLastModificationTime` raises on transient I/O errors. The result is
   ## only used for staleness comparisons, so any failure must fall through to
   ## "regenerate": -1 makes that automatic, since `-1 > anything` is false.
-  ## Mirrors `deps.getLastModTime`.
+  ## Mirrors `deps.getLastModTime`. Through `vfsMtime`, so an artifact the
+  ## store holds answers with its generation rather than with a stat of a copy
+  ## that may not be on disk at all.
   try:
-    when defined(nimony):
-      result = getLastModificationTime(path)
-    else:
-      result = times.toUnix(getLastModificationTime(path))
+    result = vfsMtime(path)
   except:
     result = -1'i64
 
@@ -336,8 +335,8 @@ proc parseFile*(nimFile: string; paths: openArray[string], nifcachePath: string)
   # overhead. Reuse the artifact under the same freshness rule `execNifler`
   # uses, so the two agree on when a re-parse is actually needed.
   let srcTime = lastModTimeOrStale(nimFile)
-  if fileExists(src) and fileExists(nimFile) and lastModTimeOrStale(src) > srcTime and
-      fileExists(depsFile) and lastModTimeOrStale(depsFile) > srcTime:
+  if vfsExists(src) and fileExists(nimFile) and lastModTimeOrStale(src) > srcTime and
+      vfsExists(depsFile) and lastModTimeOrStale(depsFile) > srcTime:
     discard "already parsed by the dep scan"
   else:
     exec quoteShell(nifler) & " --portablePaths --deps parse " & quoteShell(nimFile) & " " &
@@ -491,11 +490,11 @@ proc ensurePlugin(config: NifConfig; nf, exefile: string) =
   vfsRemoveTree scratch & "_v"
 
 proc writeFileIfChanged(file, content: string) {.canRaise.} =
-  if os.fileExists(file) and readFile(file) == content:
+  if vfsExists(file) and vfsRead(file) == content:
     # do not touch the timestamp
     discard "nothing to do here"
   else:
-    writeFile file, content
+    vfsWrite file, content
 
 const pluginTempBase = "tmp"
 
@@ -727,7 +726,7 @@ const
 proc prepareEval*(c: var SemContext): string =
   if not c.checkedForWriteNifModule:
     c.checkedForWriteNifModule = true
-    if not os.fileExists(c.g.config.nifcachePath / writeNifModuleSuffix & ".s.nif"):
+    if not vfsExists(c.g.config.nifcachePath / writeNifModuleSuffix & ".s.nif"):
       # precompile the module.
       # Forward the outer compile's CLI args (notably `--cc`) so the
       # inner nimony emits a build file whose `nimsem` cmd-line MATCHES

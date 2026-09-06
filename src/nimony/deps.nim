@@ -691,11 +691,10 @@ proc getLastModTime(path: string): int64 =
   ## to "rebuild needed" — returning -1 makes that automatic: `-1 > anything`
   ## is false (so we don't skip rebuilds), and `-1 == -1` (when both paths
   ## fail) is also not `>`, so we still rebuild.
+  ## Through `vfsMtime`, so an artifact the store holds answers with its
+  ## generation instead of with a stat of a disk copy that may not exist.
   try:
-    when defined(nimony):
-      result = getLastModificationTime(path)
-    else:
-      result = times.toUnix(getLastModificationTime(path))
+    result = vfsMtime(path)
   except:
     result = -1'i64
 
@@ -707,9 +706,9 @@ proc execNifler(c: var DepContext; f: FilePair) =
   let output = c.config.parsedFile(f, preserveDocs)
   let depsFile = c.config.depsFile(f, preserveDocs)
   let srcTime = getLastModTime(f.nimFile)
-  if not c.forceRebuild and semos.fileExists(output) and
+  if not c.forceRebuild and vfsExists(output) and
       semos.fileExists(f.nimFile) and getLastModTime(output) > srcTime and
-      semos.fileExists(depsFile) and getLastModTime(depsFile) > srcTime:
+      vfsExists(depsFile) and getLastModTime(depsFile) > srcTime:
     discard "nothing to do"
   else:
     let docsFlag = if preserveDocs: " --docs" else: ""
@@ -743,7 +742,7 @@ proc processFileDeps(c: var DepContext; p: FilePair; current: Node) =
   ## is exact. Nothing else in that file is looked at: its imports are last
   ## build's, and the caller has just read the current ones from nifler.
   let depsFile = c.config.deps2File(p)
-  if semos.fileExists(depsFile):
+  if vfsExists(depsFile):
     var buf = loadDepsFile(depsFile)
     var n = beginRead(buf)
     if n.isTagLit and globalTags.tags[n.cursorTagId] == "stmts":
@@ -1191,7 +1190,7 @@ proc fillObjectCache(c: var DepContext; backend, commandLineArgsLengc, passC: st
   for i in 0 ..< c.nodes.len:
     let p = c.config.lengcFile(c.nodes[i].files[0], backend)
     if not digests.hasKey(p):
-      digests[p] = computeChecksum(onRaiseQuit(readFile(p)))
+      digests[p] = computeChecksum(vfsRead(p))
   for i in 1 ..< c.nodes.len:
     let v = c.nodes[i]
     # The inputs of this module's `lengc` node: its own Leng IR plus every
@@ -2043,12 +2042,12 @@ proc generateCachedConfigFile(c: DepContext; passC, passL: string): bool =
   let configStr = c.config.getOptionsAsOneString() &
                   " --passC:" & passC & " --passL:" & passL
 
-  let needUpdate = if semos.fileExists(path) and not c.forceRebuild:
-                     configStr != onRaiseQuit(readFile(path))
+  let needUpdate = if vfsExists(path) and not c.forceRebuild:
+                     configStr != vfsRead(path)
                    else:
                      true
   if needUpdate:
-    onRaiseQuit writeFile(path, configStr)
+    vfsWrite(path, configStr)
   result = needUpdate
 
 proc initDepContext(config: sink NifConfig; project, nifler: string; isFinal, forceRebuild: bool; moduleFlags: set[ModuleFlag]; cmd: Command): DepContext =

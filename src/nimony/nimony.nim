@@ -17,7 +17,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
 import std / [parseopt, sets, strutils, os, assertions, syncio, dirs, paths]
-import ".." / lib / [tooldirs, argsfinder, nimversion, vfs]
+import ".." / lib / [tooldirs, argsfinder, nimversion, vfs, artifactstore]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
@@ -439,7 +439,12 @@ when isMainModule:
       handleCmdLine(c, args, FromArgsFile)
 
   handleCmdLine(c, @[], FromCmdLine)
+  # The store, if any, has to exist before the first artifact is touched and
+  # after `--vfs` has been seen. Every child process inherits the mode through
+  # the environment (`artifactstore.applyRequestedStore`).
+  applyRequestedStore()
   compileProgram(c)
+  storeFlush()
   # The driver is the parent of every other tool process, so its own VFS time
   # is the one line the per-tool dumps cannot account for.
   dumpVfsProfile("nimony")
