@@ -6,7 +6,7 @@
 
 ## Path handling and `exec` like features as `sem.nim` needs it.
 
-from std / strutils import multiReplace, startsWith
+from std / strutils import multiReplace, startsWith, split
 import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths, times]
 from std / osproc import execCmdEx
 
@@ -749,32 +749,216 @@ proc prepareEval*(c: var SemContext): string =
         return "failed to run: " & cmd
   return ""
 
+# ── The compile-time evaluation memo ────────────────────────────────────────
+#
+# `runEval` compiles and runs a whole program to fold one `const`: 32 processes
+# and about half a second for a first evaluation. The result lands in
+# `<sfx>.out.nif`, and `<sfx>` is a checksum of the triggering expression, so
+# the same expression always names the same file. That is a cache key, not a
+# proof: the generated program also inlines the BODIES of same-module symbols
+# the expression reaches, and it imports the caller's modules. What makes the
+# memo sound is the same mtime comparison `runPlugin` does for plugin outputs,
+# over a dependency set assembled from four places.
+#
+#  1. `<sfx>.p.nif` and `<sfx>.p.deps.nif` — the program and its import list.
+#     Both are written only when their bytes change (`writeEvalProgram`,
+#     `writeEvalImports`), so an evaluation that is genuinely unchanged leaves
+#     their mtimes alone.
+#  2. The nimsem binary. A rebuilt toolchain can change what the sub-program
+#     computes, and nothing else in the dependency set would notice; this is
+#     `needsRecompile`'s check for a plugin, spelled out for a whole pipeline.
+#  3. The `(import …)` and `(dependency …)` sections of `<sfx>.s.deps.nif`,
+#     which the INNER nimsem wrote while semchecking the sub-program. See
+#     `collectEvalDeps` for why the direct imports are the right cut.
+#  4. `<sfx>.out.nif.reads` — the files the compiled binary opened while it
+#     ran. No compiler phase can see those: `readFile` in a `const` is an
+#     ordinary call, not a magic like `slurp`, and the read happens in a
+#     separate process after the sub-compile finished (see
+#     tests/nimony/consteval/tconstreadfile.nim). `std/writenif` records them
+#     and writes the sidecar, the same channel `plugins.dependsOn` gives a
+#     plugin.
+#
+# Every unknown answers "not fresh", so the worst case of the memo is exactly
+# the behaviour that preceded it: run the program again.
+
+const evalReadsExt = ".reads"
+  ## Must match `std/writenif.ReadsExt`.
+
+type
+  EvalMemo = object
+    ## The paths one evaluation is memoized under. `outFile` is the memo,
+    ## everything else is an input whose mtime decides whether it still holds.
+    outFile: string      ## `<sfx>.out.nif`, the serialized result
+    progFile: string     ## `<sfx>.p.nif`, the generated program
+    progDepsFile: string ## `<sfx>.p.deps.nif`, its import list
+    semDepsFile: string  ## `<sfx>.s.deps.nif`, written by the inner nimsem
+    readsFile: string    ## the sidecar `std/writenif.teardown` writes
+    sourceDir: string    ## the working directory the program ran in
+
+proc initEvalMemo(nifcachePath, srcName, sourceDir: string): EvalMemo =
+  let base = nifcachePath / srcName
+  result = EvalMemo(outFile: base & ".out.nif",
+                    progFile: base & ".p.nif",
+                    progDepsFile: base & ".p.deps.nif",
+                    semDepsFile: base & ".s.deps.nif",
+                    readsFile: base & ".out.nif" & evalReadsExt,
+                    sourceDir: sourceDir)
+
+proc writeEvalProgram(progFile: string; src: TokenBuf) {.canRaise.} =
+  ## `writeFileAndIndex` with `writeFileIfChanged` semantics. The mtime of
+  ## `.p.nif` is the memo's first input, and `createIndex` derives
+  ## `<sfx>.s.idx.nif` from it — the very file the inner `nimony s` later
+  ## writes from real semchecking, so rewriting it on every call also kept the
+  ## sub-compile's own nimsem node permanently stale.
+  let content = toString(src, true)
+  let indexFile = changeModuleExt(progFile, ".s.idx.nif")
+  if vfsExists(progFile) and vfsExists(indexFile) and vfsRead(progFile) == content:
+    return
+  writeFileAndIndex(progFile, src)
+
+proc writeEvalImports(c: var SemContext; depsFile: string) {.canRaise.} =
+  ## The sub-program's import list. `nimony s` opens this unconditionally, so
+  ## an empty `(stmts)` still has to be written when the caller has no
+  ## imports. Only when it changes, for the same reason as the program itself.
+  var deps = createTokenBuf(c.importSnippets.len + 4)
+  deps.addParLe StmtsS, NoLineInfo
+  if c.importSnippets.len > 0:
+    deps.add c.importSnippets
+  deps.addParRi()
+  writeFileIfChanged(depsFile, toString(deps, true))
+
+proc addImportedSemOutputs(res: var seq[string]; n: var Cursor;
+                           paths: openArray[string]; nifcachePath: string) =
+  ## One `(import …)` section: a flat list of module source paths, except that
+  ## a module reached through a plugin is wrapped as `(pragmax "path" …)` (see
+  ## `semmain.writeNewDepsFile`). Only the leading path of such a wrapper is a
+  ## file; the pragma values are not, and watching them would keep the memo
+  ## permanently stale.
+  n.loopInto:
+    if n.kind == StrLit:
+      res.add nifcachePath / moduleSuffix(strVal(n), paths) & ".s.nif"
+      skip n
+    elif n.kind == TagLit:
+      var wrapped = n
+      skip n
+      wrapped.loopInto:
+        if wrapped.kind == StrLit:
+          res.add nifcachePath / moduleSuffix(strVal(wrapped), paths) & ".s.nif"
+          # the rest of a `(pragmax …)` is pragma payload, not paths
+          while wrapped.hasMore: skip wrapped
+        else:
+          skip wrapped
+    else:
+      skip n
+
+proc collectEvalDeps(depsFile: string; paths: openArray[string];
+                     nifcachePath: string; res: var seq[string]) =
+  ## Turns the inner nimsem's `<sfx>.s.deps.nif` into files the memo must
+  ## outlive:
+  ##
+  ## * `(import …)` becomes each module's `.s.nif` in the nimcache — the file
+  ##   the sub-program's own build graph consumes for hexer, lengc and the C
+  ##   compiler, and the one nimsem rewrites whenever that module was
+  ##   re-semmed at all (unlike `.s.idx.nif`, which is written only when the
+  ##   interface or an inline body actually changed). Watching the always-
+  ##   written one is the conservative choice and is what makes an edit to a
+  ##   NON-inline body in an imported module invalidate the memo: the
+  ##   sub-program links that body, so its result can differ even though the
+  ##   importer's own inputs did not change. The price is that `-f`, which
+  ##   re-sems everything, also re-runs every evaluation — the sub-program's
+  ##   build nodes still do nothing, only its binary runs again.
+  ##   DIRECT imports are the right cut: a deeper module that changed has
+  ##   already had its `.s.nif` consumed by, and rewritten, everything between
+  ##   it and here.
+  ## * `(dependency …)` is what a `slurp` or a plugin read while the
+  ##   sub-program itself was semchecked.
+  if not vfsExists(depsFile): return
+  var buf = createTokenBuf(60)
+  var r = rd.open(depsFile)
+  parse(r, buf)
+  rd.close(r)
+  if buf.len == 0: return
+  var n = beginRead(buf)
+  if n.kind == TagLit:
+    n.loopInto:                      # descend into `(stmts …)`
+      if n.kind == TagLit:
+        let tag = tagName(buf.tags, n.cursorTagId)
+        if tag == "import":
+          addImportedSemOutputs(res, n, paths, nifcachePath)
+        elif tag == DependencyTag:
+          n.loopInto:
+            if n.kind == StrLit: res.add strVal(n)
+            skip n
+        else:
+          skip n
+      else:
+        skip n
+  endRead(n)
+
+proc addRuntimeReads(m: EvalMemo; res: var seq[string]) =
+  ## The files the compiled sub-program opened for reading last time.
+  ## Relative paths resolve against the directory it ran in, which is the
+  ## calling module's directory (`runProgram`'s `workingDir`).
+  var raw = ""
+  try:
+    raw = vfsRead(m.readsFile)
+  except:
+    return
+  for line in raw.split('\n'):
+    if line.len == 0: continue
+    if os.isAbsolute(line) or m.sourceDir.len == 0: res.add line
+    else: res.add m.sourceDir / line
+
+proc evalMemoIsFresh(c: var SemContext; m: EvalMemo): bool =
+  ## True when `<sfx>.out.nif` can be parsed instead of rebuilding and
+  ## rerunning the sub-program.
+  if not vfsExists(m.outFile): return false
+  if not vfsExists(m.readsFile):
+    # `teardown` writes the sidecar LAST, so its absence means either an older
+    # nimcache or a run that did not finish. Neither is evidence of anything.
+    return false
+  let written = vfsMtime(m.outFile)
+  if written <= 0: return false
+  if vfsMtime(m.progFile) > written: return false
+  if vfsMtime(m.progDepsFile) > written: return false
+  var toolchain = ""
+  try:
+    toolchain = getAppFilename()
+  except:
+    return false
+  # nimsem stands in for the whole pipeline: hastur rebuilds the tools
+  # together, so any of them being newer than this nimsem is not a state the
+  # build produces.
+  if vfsMtime(toolchain) > written: return false
+  var deps: seq[string] = @[]
+  collectEvalDeps(m.semDepsFile, c.g.config.paths, c.g.config.nifcachePath, deps)
+  addRuntimeReads(m, deps)
+  result = not memoIsStale(m.outFile, deps)
+
 proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: TokenBuf;
                usedModules: HashSet[string]; sourceDir = ""): string =
   ## Returns an error message if the evaluation failed, "" on success.
-  let progfile = c.g.config.nifcachePath / srcName.addFileExt(".p.nif")
+  let m = initEvalMemo(c.g.config.nifcachePath, srcName, sourceDir)
   try:
-    writeFileAndIndex(progfile, src)
-
-    # Write the .p.deps.nif file so that `nimony s` can find the imports.
-    # Always write — `nimony s` opens this unconditionally, so an empty
-    # `(stmts)` is needed when the original module has no imports.
-    var deps = createTokenBuf(c.importSnippets.len + 4)
-    deps.addParLe StmtsS, NoLineInfo
-    if c.importSnippets.len > 0:
-      deps.add c.importSnippets
-    deps.addParRi()
-    let depsFile = c.g.config.nifcachePath / srcName & ".p.deps.nif"
-    writeFile(depsFile, toString(deps, true))
-    let (output, exitCode) = runProgram(progfile, c.g.config.nifcachePath, usedModules,
-                                        c.commandLineArgs, sourceDir)
-    if exitCode != 0:
-      result = ensureMove(output)
-    else:
-      let outfile = c.g.config.nifcachePath / srcName.addFileExt(".out.nif")
-      var r = rd.open(outfile)
-      parse(r, dest)
-      rd.close(r)
-      result = ""  # success: caller interprets "" as no error
+    writeEvalProgram(m.progFile, src)
+    writeEvalImports(c, m.progDepsFile)
+    if not evalMemoIsFresh(c, m):
+      let (output, exitCode) = runProgram(m.progFile, c.g.config.nifcachePath, usedModules,
+                                          c.commandLineArgs, sourceDir)
+      if exitCode != 0:
+        return ensureMove(output)
+    # The files the sub-program read are dependencies of the CALLING module,
+    # exactly as a plugin's reported reads are (`runPlugin`). Without this the
+    # module's nimsem node has no edge to them at all: editing the data file
+    # behind `const x = readFile("…")` would not even re-sem the module, so
+    # the memo would never be consulted and the old value would stand.
+    var reads: seq[string] = @[]
+    addRuntimeReads(m, reads)
+    for f in reads:
+      recordFileDep c, f
+    var r = rd.open(m.outFile)
+    parse(r, dest)
+    rd.close(r)
+    result = ""  # success: caller interprets "" as no error
   except:
     result = "I/O error while evaluating " & srcName

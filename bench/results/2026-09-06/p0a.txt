@@ -1,0 +1,106 @@
+commit:   77077345 (jit/p0a, "perf(sem): memoize compile-time evaluation results")
+baseline: f69b8afc (fast-devloop fork point, built in the sibling checkout
+          /Users/chanc/Projects/nimony with its own bin/ and lib/)
+branch:   jit/p0a
+os:       macOS 26.6.2  arm64
+cpu:      Apple M5
+nim:      Nim Compiler Version 2.2.10 [MacOSX: arm64]
+cc:       Apple clang version 21.0.0 (clang-2100.1.1.101)
+mode:     C backend, default flags
+runs:     3 alternating runs per scenario (baseline, p0a, baseline, …) so a
+          load spike hits both; median reported, raw runs below
+caveat:   the machine was NOT quiet — a second agent was building the
+          toolchain in a parallel worktree throughout. Absolute wall times
+          drift by a factor of two between rounds; the ratios below were
+          stable across rounds and are what the conclusions rest on. The
+          first round of every scenario was discarded (macOS charges
+          0.12-0.23 s for the first launch of a freshly linked Mach-O, which
+          would otherwise be attributed to whichever binary was newer).
+
+Phase P0a changes measured here:
+  1. `-f`/`--forcebuild`/`--ff` no longer forwarded into CTFE sub-compiles
+  2. `runEval` memoizes `<sfx>.out.nif`; `.p.nif`/`.p.deps.nif` written only
+     when their bytes change
+
+================================================================================
+A. tests/nimony/consteval/tmyops.nim — 5 consts needing a sub-compile
+================================================================================
+
+  scenario                          baseline      p0a      ratio
+  ---------------------------------------------------------------
+  cold (fresh nimcache)               3.83 s     3.63 s     1.06x
+  warm (nothing changed)              0.02 s     0.02 s      1.0x
+  edit one line, rebuild              0.194 s    0.092 s     2.1x
+  forced (-f)                         3.63 s     0.91 s      4.0x
+
+raw, `nimony c --nimcache:<fresh> tmyops.nim`:
+  baseline cold   2.65  3.83  4.84
+  p0a      cold   2.98  5.49  3.63
+
+raw, `nimony c -f --nimcache:<warm> tmyops.nim`:
+  baseline -f     3.86  3.63  3.63
+  p0a      -f     0.82  0.91  0.91
+
+raw, append one line to the module then rebuild (nimsem re-runs and reaches
+all five consts; none of them changed):
+  baseline edit   0.197  0.194  0.199
+  p0a      edit   0.090  0.092  0.093
+
+  The edit scenario is the dev loop, and it is the one the memo is for. p0a
+  spawns zero `nimony s` processes there; baseline spawns five and reruns five
+  binaries. ~21 ms saved per const.
+
+  Cold is unchanged, as expected: nothing is memoized yet and the time is the
+  stdlib. (An earlier measurement of 7.95 s -> 3.11 s was wrong: both figures
+  were first-launch taxes on binaries that had just been linked.)
+
+================================================================================
+B. bench/ctfe_bench.nim — 14 sub-programs, via bench/ctfe_latency.sh
+================================================================================
+
+  scenario                          baseline      p0a      ratio
+  ---------------------------------------------------------------
+  cold                                6.97 s     6.99 s      1.0x
+  warm                                0.017 s    0.017 s     1.0x
+  edit (append a statement)           0.48 s     0.14 s      3.4x
+  forced (-f)                        10.06 s     1.54 s      6.5x
+
+raw (rounds 2 and 3; round 1 discarded, see caveat):
+  baseline  cold 6.641 6.972 | warm 0.021 0.017 | edit 0.514 0.443 | -f 10.327 9.789
+  p0a       cold 6.950 6.989 | warm 0.017 0.017 | edit 0.141 0.137 | -f  1.535 1.537
+
+  Per evaluation, from the edit scenario: baseline (0.48 - 0.05 backend) / 14
+  = 31 ms; p0a (0.14 - 0.05) / 14 = 6 ms, and the 6 ms is nifler + nimsem +
+  the backend of the one edited module, not the evaluations — the memo serves
+  all fourteen with no process at all.
+
+  `--report` under `-f`, p0a:
+    nifmake-report nifler=32 nimsem=6 total=38
+    nifmake-report cc=6 dceEmit=6 dceLive=1 hexer=6 lengc=6 link=1 total=26
+  i.e. the outer graph is rebuilt (that is what `-f` asks for) and no
+  sub-program's build nodes run. Baseline ran the same outer graph and
+  additionally deleted and rebuilt ~30 nodes per const inside 14 `nimony s`
+  children, which is the 10 s.
+
+================================================================================
+C. Gate check against JIT_IMPL.md Phase P0a
+================================================================================
+
+  "repeat evaluation <= 2 ms per const"
+      MET for the case the memo covers. Warm (`nimony c` on an unchanged
+      file) is 17 ms for the whole compile, nifmake-dominated, with two
+      `total=0` reports and no evaluation at all. In the edit case, where all
+      14 evaluations ARE reached, they cost no process and no measurable time;
+      the 90 ms floor is the module's own nifler/nimsem/backend.
+
+  "new evaluation <= 0.36 s per const (was 0.45-0.49 s)"
+      NOT MEASURED SEPARATELY, and not moved by this phase. A cold nimcache
+      builds the stdlib in the same processes, so the per-const figure cannot
+      be isolated from a wall time here; that is what phase P0b's object cache
+      is aimed at.
+
+  "-f no longer doubles CTFE cost"
+      MET. 4.0x on tmyops, 6.5x on ctfe_bench.
+
+  Test suites green at this commit: tests/incremental (10/10 phases),
+  tests/nifcache, tests/nimony/consteval (5/5), bench (5/5).
