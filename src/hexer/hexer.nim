@@ -47,8 +47,8 @@ import ".." / nimony / [langmodes, nifconfig]
 import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
 import hexerio
 import ".." / lib / [vfs, artifactstore, nimversion, ledger]
-from ".." / nimony / programs import prog, Program
-from ".." / lib / nifpools import pool, newPool, fallbackPool
+from ".." / nimony / programs import resetProgram
+from ".." / lib / nifpools import resetPools
 from intramodinliner import resetInlinerStats
 
 include ".." / lib / compat2
@@ -161,9 +161,8 @@ proc resetHexerGlobals*() =
   ##   module and not resettable from here. A second `runHexer` that passes no
   ##   `--vfs` therefore inherits the first one's policy; the wanted shared
   ##   change is in `notes/a2a-hexer.md`.
-  prog = default(Program)
-  pool = newPool()
-  fallbackPool = pool
+  resetProgram()
+  resetPools()
   resetInlinerStats()
 
 proc runHexer*(args: seq[string]): int =
