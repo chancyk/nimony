@@ -355,7 +355,7 @@ proc parseLedgerText(l: var Ledger; content: string) =
     else:
       discard "the `ns` unit marker and anything a later version adds"
 
-proc readLedgerFile(l: var Ledger; path: string): bool {.discardable.} =
+proc readLedgerFile(l: var Ledger; path: string): bool =
   ## True when the file was there. One open instead of a stat plus an open:
   ## this runs once in every tool process of every build.
   result = vfsExists(path)
@@ -387,7 +387,7 @@ proc openFragment*(dir: string; key: LedgerKey): Ledger =
   ## The accumulated history for one key, as a one-entry ledger.
   let p = fragmentPath(dir, key)
   result = Ledger(path: p, entries: @[], current: toolhash(), dirty: false)
-  readLedgerFile(result, p)
+  discard readLedgerFile(result, p)
 
 proc writeFragment*(dir: string; key: LedgerKey; s: LedgerSample;
                     toolhash: string) =
@@ -437,7 +437,7 @@ proc openLedger*(path: string): Ledger =
   ## The fragments below the nimcache -- its own `.ledger/` and one directory
   ## level down, where the backend phases write -- are folded in on top.
   result = Ledger(path: path, entries: @[], current: toolhash(), dirty: false)
-  readLedgerFile(result, path)
+  discard readLedgerFile(result, path)
   let root = path.parentDir
   foldFragments(result, root)
   var subdirs: seq[string] = @[]
