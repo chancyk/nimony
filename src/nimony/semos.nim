@@ -6,7 +6,7 @@
 
 ## Path handling and `exec` like features as `sem.nim` needs it.
 
-from std / strutils import multiReplace, startsWith, split
+from std / strutils import multiReplace, startsWith, split, normalize
 import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths]
 from std / osproc import execCmdEx
 
@@ -25,6 +25,13 @@ import nimony_model, symtabs, builtintypes, decls, asthelpers,
   semdata
 
 import ".." / gear2 / modnames
+
+when defined(nimonyEngine):
+  # `-d:nimonyEngine` is set by `hastur build nimsem` when the sibling
+  # `../nativenif` checkout is there. Without it nimsem builds and behaves
+  # exactly as it did before this phase, and `--ctfe:engine` says so instead of
+  # pretending.
+  import engine
 
 proc nimonyDir(): string =
   ## The project root for stdlib resolution. `bin*` (not just `bin`) is
@@ -690,13 +697,14 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   var noAdditional = nifcore.createTokenBuf(1)
   runPlugin(c, dest, info, pluginName, input, noAdditional)
 
-proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string];
-                commandLineArgs: string;
-                sourceDir = ""): tuple[output: string, exitCode: int] =
-  # Compile the .p.nif through the full pipeline, then run the resulting
-  # binary. Compilation must keep the outer cwd (nimcache paths are relative
-  # to the invoking compile). Only the execution step uses `workingDir` so
-  # relative paths like `doc/version.md` resolve next to the caller module.
+proc buildEvalProgram(file, nimcachePath, commandLineArgs: string):
+    tuple[output: string, exitCode: int] =
+  ## `nimony <forwarded args> --nimcache:<dir> s <sfx>.p.nif`. What that
+  ## produces depends on the forwarded `--ctfe`: under `subprocess` the whole
+  ## graph down to the linked binary, under `engine` only the frontend and the
+  ## analysis graph, so the `.c.nif` files exist and nothing below them ran
+  ## (`deps.buildGraph`). Compilation keeps the outer cwd -- nimcache paths are
+  ## relative to the invoking compile.
   let nimonyExe = findTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
     " --nimcache:" & quoteShell(nimcachePath) &
@@ -705,6 +713,31 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
     result = execCmdEx(compileCmd)
   except:
     result = (output: "failed to run: " & compileCmd, exitCode: -1)
+
+proc subprocessCtfeArgs(commandLineArgs: string): string =
+  ## The same forwarded arguments with `--ctfe:` forced back to `subprocess`.
+  ## The fallback has to REBUILD the sub-program: the run that fell back
+  ## stopped after the analysis graph, so there is no binary to run yet.
+  result = ""
+  var sawCtfe = false
+  for tok in commandLineArgs.split(' '):
+    if tok.len == 0: continue
+    if normalize(tok).startsWith("--ctfe:"):
+      sawCtfe = true
+      result.add " --ctfe:subprocess"
+    else:
+      result.add " "
+      result.add tok
+  if not sawCtfe:
+    result.add " --ctfe:subprocess"
+
+proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string];
+                commandLineArgs: string;
+                sourceDir = ""): tuple[output: string, exitCode: int] =
+  # Compile the .p.nif through the full pipeline, then run the resulting
+  # binary. Only the execution step uses `workingDir` so relative paths like
+  # `doc/version.md` resolve next to the caller module.
+  result = buildEvalProgram(file, nimcachePath, commandLineArgs)
   if result.exitCode != 0: return
 
   let modname = extractModuleSuffix(file)
@@ -937,6 +970,48 @@ proc evalMemoIsFresh(c: var SemContext; m: EvalMemo): bool =
   addRuntimeReads(m, deps)
   result = not memoIsStale(m.outFile, deps)
 
+when defined(nimonyEngine):
+  var theEngine = initEngine()
+    ## One engine per nimsem process, and it has to be process-wide rather than
+    ## per-`SemContext`: a guest that ran past its budget is STILL RUNNING on a
+    ## thread nothing can stop, which disqualifies the whole process from
+    ## running another one. arkham's Leng tag pool wants the same lifetime.
+    ## `engine.nim` explains why its two intercept globals are unavoidable; this
+    ## is the state that decides whether they may be used at all.
+
+  proc evalThroughEngine(c: var SemContext; m: EvalMemo):
+      tuple[output: string, exitCode: int, fellBack: bool] =
+    ## Build only what the engine consumes, then run it. `--ctfe:engine` is
+    ## already on `c.commandLineArgs` (it forwards like `--cc`), so the inner
+    ## `nimony s` stops after the analysis graph without being told twice.
+    result = (output: "", exitCode: 0, fellBack: false)
+    let (buildOut, buildCode) = buildEvalProgram(m.progFile,
+                                                 c.g.config.nifcachePath,
+                                                 c.commandLineArgs)
+    if buildCode != 0:
+      # A sub-program that does not COMPILE fails the same way in both modes;
+      # falling back would only compile it again to watch it fail again.
+      return (ensureMove(buildOut), buildCode, false)
+
+    let sfx = extractModuleSuffix(m.progFile)
+    var budget = c.g.config.ctfeBudgetMs
+    if budget <= 0: budget = DefaultBudgetMs
+    let r = evaluate(theEngine, toAbsolutePath(c.g.config.nifcachePath / sfx),
+                     sfx, m.sourceDir, budget)
+    case r.outcome
+    of eoRan:
+      if c.g.config.verbose:
+        echo timingLine(r, sfx)
+      result = (r.output, r.status, false)
+    of eoBudget:
+      # NOT a fallback: re-running an expression that loops forever is the same
+      # hang, one process further out.
+      result = (r.reason, 1, false)
+    of eoFallback:
+      if c.g.config.verbose:
+        echo "[ctfe-engine] ", sfx, ": falling back to the subprocess -- ", r.reason
+      result = ("", 0, true)
+
 proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: TokenBuf;
                usedModules: HashSet[string]; sourceDir = ""): string =
   ## Returns an error message if the evaluation failed, "" on success.
@@ -945,10 +1020,25 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
     writeEvalProgram(m.progFile, src)
     writeEvalImports(c, m.progDepsFile)
     if not evalMemoIsFresh(c, m):
-      let (output, exitCode) = runProgram(m.progFile, c.g.config.nifcachePath, usedModules,
-                                          c.commandLineArgs, sourceDir)
-      if exitCode != 0:
-        return ensureMove(output)
+      var done = false
+      when defined(nimonyEngine):
+        if c.g.config.ctfeMode == ctfeEngine:
+          let (engineOut, engineCode, fellBack) = evalThroughEngine(c, m)
+          if not fellBack:
+            done = true
+            if engineCode != 0:
+              return ensureMove(engineOut)
+      if not done:
+        # The subprocess path, which is also every fallback: the sub-program is
+        # rebuilt with `--ctfe:subprocess` because the run that fell back left
+        # it stopped after the analysis graph, with no binary to run.
+        let args =
+          if c.g.config.ctfeMode == ctfeEngine: subprocessCtfeArgs(c.commandLineArgs)
+          else: c.commandLineArgs
+        let (output, exitCode) = runProgram(m.progFile, c.g.config.nifcachePath, usedModules,
+                                            args, sourceDir)
+        if exitCode != 0:
+          return ensureMove(output)
     # The files the sub-program read are dependencies of the CALLING module,
     # exactly as a plugin's reported reads are (`runPlugin`). Without this the
     # module's nimsem node has no edge to them at all: editing the data file

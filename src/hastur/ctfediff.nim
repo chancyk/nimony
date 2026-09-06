@@ -241,6 +241,36 @@ proc initMode(flags, cache: string): ModeRun =
   result = ModeRun(flags: flags, cache: cache, seen: initHashSet[string](),
                    fresh: @[])
 
+proc engineIsCompiledIn*(probe = "tests/nimony/consteval/tconstarray.nim"): bool =
+  ## Whether the `bin/nimsem` in use actually HAS the compile-time-evaluation
+  ## engine (`--ctfe:engine`, `src/nimony/engine.nim`). It is compiled in only
+  ## where the sibling `../nativenif` checkout exists at build time, and a
+  ## nimsem without it accepts `--ctfe:engine` and quietly evaluates every
+  ## `const` through the subprocess — which is right (the flag is a preference,
+  ## not a demand), and would make a differential run against it vacuous.
+  ##
+  ## Asked by EVIDENCE rather than by a version string or a `dirExists`: compile
+  ## one `const` under `--ctfe:engine` and look at what the nimcache holds
+  ## afterwards. The engine leaves the sub-program's modules as `.asm.nif` and
+  ## no `.o` at all, because its build stops after the analysis graph; the
+  ## subprocess path leaves an object per module. That is the difference the
+  ## flag is supposed to make, so it is the right thing to test for.
+  let cache = getTempDir() / "ctfe_engine_probe" / $getCurrentProcessId()
+  removeDir cache
+  createDir cache
+  var cmd = quoteShell(toolExe("nimony")) & " c --isMain --ctfe:engine" &
+            " --nimcache:" & quoteShell(cache) &
+            " --out:" & quoteShell(cache / "probe".addFileExt(ExeExt)) &
+            " " & quoteShell(probe)
+  let (_, code) = execCmdEx(cmd)
+  result = false
+  if code == 0:
+    for path in walkDirRec(cache):
+      if path.endsWith(".asm.nif"):
+        result = true
+        break
+  removeDir cache
+
 proc ctfeDiff*(dirs: seq[string]; modeA, modeB: string): int =
   ## Compile every `.nim` directly under each of `dirs` twice — once with
   ## `modeA`'s flags, once with `modeB`'s — and compare what compile-time

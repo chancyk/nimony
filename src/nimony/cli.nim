@@ -181,6 +181,25 @@ proc parseCommonOption*(key, val: string; config: var NifConfig;
       quit "invalid value for --vfs-budget; expected a size in megabytes"
     requestStoreBudgetMB mb
     forwardArg = false
+  of "ctfe":
+    # Forwarded, unlike `--vfs`: the sub-compile of a `const` is itself a
+    # `nimony s` invocation, and it has to know that its caller means to run
+    # its `.c.nif` files rather than link them -- that is what makes it stop
+    # after the analysis graph (`deps.buildGraph`). Riding `commandLineArgs`
+    # also means a nested evaluation inherits the mode with no extra plumbing.
+    case normalize(val)
+    of "subprocess": config.ctfeMode = ctfeSubprocess
+    of "engine": config.ctfeMode = ctfeEngine
+    else: quit "invalid value for --ctfe; expected subprocess or engine"
+  of "ctfe-budget", "ctfebudget":
+    var ms = 0
+    try:
+      ms = parseInt(val)
+    except ValueError:
+      ms = -1
+    if ms <= 0:
+      quit "invalid value for --ctfe-budget; expected a positive number of milliseconds"
+    config.ctfeBudgetMs = ms
   of "novalidate":
     config.noValidate = true
   of "verbose":

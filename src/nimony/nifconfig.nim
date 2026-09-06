@@ -89,6 +89,16 @@ type
     backendNative = "native"  # C-free: Leng -> arkham -> nifasm (static, libc-free)
     backendWasm = "wasm"      # C-free: Leng -> ithaqua (whole-program .wasm, no linker)
 
+  CtfeMode* = enum
+    ## `--ctfe:` — how a `const` too complex for `expreval` is evaluated.
+    ctfeSubprocess = "subprocess"
+      ## Compile the synthesized sub-program to an executable and run it.
+      ## Correct everywhere, and the fallback whenever the engine refuses.
+    ctfeEngine = "engine"
+      ## Stop the sub-program's build after the analysis graph and run its
+      ## `.c.nif` modules from nimsem's own memory (arkham + nifasm + an
+      ## arena). No C compiler, no linker, no process. `src/nimony/engine.nim`.
+
   OptLevel* = enum
     optDebug   # default: -O1 (debug-friendly but avoids dumb codegen)
     optNone    # --opt:none: -O0
@@ -126,6 +136,14 @@ type
     optLevel*: OptLevel
     noValidate*: bool # skip running the validator on plugin sources
     verbose*: bool    # --verbose: dump Final IR on contract/init failures
+    ctfeMode*: CtfeMode  ## `--ctfe:subprocess|engine`. Read by `semos.runEval`
+                         ## (which engine to evaluate a `const` with) and by
+                         ## `deps.buildGraph` (whether a `.p.nif` sub-program's
+                         ## build stops after the analysis graph).
+    ctfeBudgetMs*: int   ## `--ctfe-budget:<ms>`, 0 = the default. How long one
+                         ## compile-time evaluation may run before it is a
+                         ## diagnostic instead of a hang. Engine mode only: a
+                         ## subprocess is the OS's problem, not nimsem's.
     outFile*: string  # filename portion set by `--out:PATH` / `-o:PATH`
                       # (empty = derive from module basename).
     outDir*: string   # directory portion set by `--out:DIR/NAME` (its
