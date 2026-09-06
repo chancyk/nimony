@@ -2357,6 +2357,17 @@ proc buildGraph*(config: sink NifConfig; project: string;
       exec nifmakeCommand & progArg(flags, 50, 60) & quoteShell(analysisFile)
       fillObjectCache(c, c.config.backendDirName(c.rootNode.files[0]),
                       commandLineArgsLengc, passC)
+      if c.config.ctfeAnalysisOnly:
+        # `--ctfe-analysis-only`: the compiler that spawned this one runs these
+        # `.c.nif` files itself (`semos.runEval` -> `engine.nim`), so the
+        # codegen graph below -- lengc, the C compiler, the linker -- has
+        # nothing to produce that anyone will read. Stopping here IS the
+        # phase's win; everything above this line ran exactly as it does for a
+        # subprocess evaluation, which is what keeps the two modes comparable.
+        # The `Stats` block and the `DoRun` exec below are skipped with it:
+        # nothing was built to report on, and a `.p.nif` sub-compile is never
+        # `DoRun`.
+        return
     var thisPhase = fpWhole
     if useObjectCache: thisPhase = fpCodegen
     let buildFinalFilename = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,

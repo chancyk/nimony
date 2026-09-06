@@ -35,6 +35,18 @@ if failures > 0:
 # the corpus.
 if "--self-test" notin commandLineParams():
   failures += ctfeDiff(@["tests/nimony/consteval"], "--vfs:disk", "--vfs:memory+spill")
+  # B2: the same corpus with the sub-program COMPILED AND LINKED against the
+  # same sub-program RUN FROM NIMSEM'S OWN MEMORY. Two entirely different ways
+  # of producing a `.out.nif`, so this is the strongest statement the harness
+  # can make about the engine. Only when nimsem has one: without the sibling
+  # `../nativenif` checkout there is no engine to compare against, `--ctfe:engine`
+  # falls back to the subprocess for every evaluation, and the run would pass
+  # while proving nothing -- so say so instead.
+  if engineIsCompiledIn():
+    failures += ctfeDiff(@["tests/nimony/consteval"], "--ctfe:subprocess", "--ctfe:engine")
+  else:
+    echo "ctfe_diff: nimsem has no compile-time-evaluation engine " &
+         "(no ../nativenif at build time); skipping the --ctfe comparison"
 
 if failures > 0:
   echo "ctfe_diff: ", failures, " failure(s)"

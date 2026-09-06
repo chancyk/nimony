@@ -71,8 +71,40 @@ proc buildNifler*(showProgress = false) =
   syncNimParser()
   buildTool("nifler", "src/nifler/nifler.nim", showProgress)
 
+proc engineFlags*(): string =
+  ## The compile-time-evaluation ENGINE (`--ctfe:engine`, `src/nimony/engine.nim`)
+  ## links arkham and nifasm out of the sibling `../nativenif` checkout, so it
+  ## can only be built where that checkout is — the same assume-nothing
+  ## arrangement `buildArkham` has, and the same `dirExists` guard, so a plain
+  ## clone of this repo still builds a nimsem and simply has no engine in it.
+  ##
+  ## Three flags, and each is load-bearing:
+  ##
+  ## * `--path:<nativenif>/src` and `/src/common` put arkham's and nifasm's
+  ##   modules on the search list. Their own `nim.cfg`s are NOT read here: Nim
+  ##   reads a config for the PROJECT's directory chain, and the project is
+  ##   `src/nimony/nimsem.nim`.
+  ## * `--path:src` is what makes nativenif's `import lib / nifreader` resolve
+  ##   to THIS checkout's `src/lib` — the same files nimsem's own
+  ##   `import ".." / lib / …` reaches. Without it a linked checkout gets two
+  ##   copies of every NIF module and nothing type-checks across the seam.
+  ## * `--undef:nimPreviewSlimSystem` because `src/config.nims` defines it for
+  ##   everything under `src/` and nativenif does not: 27 of its modules use
+  ##   `assert` without importing `std/assertions`. Undefining it only widens
+  ##   what `system` exports, and `hastur boot` is what proves nimsem still
+  ##   does the same thing.
+  result = ""
+  when defined(cpu64):
+    if dirExists(NativenifDir):
+      syncNativenif()
+      result = "-d:nimonyEngine --undef:nimPreviewSlimSystem " &
+        "--path:" & "src".quoteShell & " " &
+        "--path:" & (NativenifDir / "src").quoteShell & " " &
+        "--path:" & (NativenifDir / "src" / "common").quoteShell & " "
+
 proc buildNimsem*(showProgress = false) =
-  buildTool("nimsem", "src/nimony/nimsem.nim", showProgress, validatePassesFlag())
+  buildTool("nimsem", "src/nimony/nimsem.nim", showProgress,
+            validatePassesFlag() & engineFlags())
 
 proc buildNimony*(showProgress = false) =
   buildTool("nimony", "src/nimony/nimony.nim", showProgress, validatePassesFlag())
