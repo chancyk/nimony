@@ -15,7 +15,8 @@ Conventions used in this document:
 - **Tests**: what must be added or extended. Every phase adds tests; a phase
   without a red-to-green test is not done.
 - **Gate**: the measurement or invariant that must hold before the phase is
-  merged. `hastur test tests/nimony`, `hastur test tests/incremental` and
+  merged. `hastur tests/nimony` (the tree walk; `hastur test <dir>` runs only that
+  directory's own files), `hastur test tests/incremental` and
   `hastur test tests/nifcache` must stay green in every phase; `hastur boot`
   stages must stay byte-identical whenever a phase touches a tool that boots.
 - **Verification commands** are given per phase; results are recorded in
@@ -655,7 +656,7 @@ Gate: B3's numbers on each platform.
 | B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | planned | |
 | A1b | planned | |
-| A1c | planned | |
+| A1c | merged (13 new consteval tests, `tests/ctfe_diff` harness; 4 CTFE bugs documented in `tests/nimony/consteval/todo/README.md`: enum/set results crash the serializer, distinct loses its conversion, `seq[UserObject]` unresolved, failed evaluations have no diagnostic) | merged from jit/a1c |
 | A1d | planned | |
 | A2a | planned | |
 | A2b | planned | |
