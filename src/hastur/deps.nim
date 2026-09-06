@@ -13,11 +13,21 @@ import context
 # local branch someone was mid-way through. `src/nativenif.commit` makes it one
 # answer, recorded in this repo and moved deliberately by `hastur update deps`.
 
+let NativenifDir* = block:
+  ## Sibling checkout arkham + nifasm live in. Their committed `nim.cfg`s
+  ## reach back here through `../../../nimony/src/lib`, so the layout — and
+  ## this repo's directory name — is already load-bearing.
+  ##
+  ## `NIMONY_NATIVENIF` overrides it. A linked checkout made by `git
+  ## worktree add` is NOT beside the sibling — it lives under
+  ## `.claude/worktrees/` or wherever it was put — so `../nativenif` names
+  ## nothing there and every native build silently skips arkham and nifasm.
+  ## One environment variable is the whole fix; an absolute path in it means
+  ## the same directory from wherever a hastur command runs.
+  let fromEnv = getEnv("NIMONY_NATIVENIF")
+  if fromEnv.len > 0: fromEnv else: "../nativenif"
+
 const
-  NativenifDir* = "../nativenif"
-    ## Sibling checkout arkham + nifasm live in. Their committed `nim.cfg`s
-    ## reach back here through `../../../nimony/src/lib`, so the layout — and
-    ## this repo's directory name — is already load-bearing.
   NativenifUrl* = "https://github.com/nim-lang/nativenif"
     ## Cloned from over HTTPS rather than SSH: the auto-clone below has to work
     ## on a machine that has never pushed to this repo — CI, or someone who
