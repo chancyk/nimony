@@ -148,8 +148,8 @@ Nimony always runs nifmake with `-j`, so the parallel path is the one that
 matters; `--profile` is off in an ordinary build, so `startTimes` is not even
 allocated. A1d makes the two clock reads unconditional (two `getMonoTime()`
 calls per command against a process spawn — three orders of magnitude apart)
-and threads a per-command `outDir`/`module` alongside `cmdNames` so the
-`afterRunEvent` callback can name the fragment.
+and threads a per-command `module` alongside `cmdNames` so the `afterRunEvent`
+callback can name the key.
 
 `ProfileData` and `recordCmdTime` (line 351) stay exactly as they are: the
 ledger is a second consumer of the same measurement, not a change to
@@ -349,9 +349,43 @@ fragment the tool inside it just wrote.
 - A command that *failed* is still recorded. It cost a process, and what that
   cost is exactly what the next run's scheduler wants to know.
 
-`ledger.recordSpawnWall(dir, phase, module, wall, observer)` is the new entry
-point. One `vfsExists` + one `vfsRead` + one atomic ~350-byte write, the same
-budget the tool inside already pays for its own fragment.
+`ledger.SpawnLog` is the new entry point: `noteSpawn(phase, module, wall)` per
+command, `consolidate(nimcache, log)` once at the end.
+
+### Why the fold is per run and not per command
+
+The first implementation wrote a fragment per command (`recordSpawnWall`), which
+is what the phase brief budgets for. It measured over the gate. The
+microbenchmark in `bench/results/2026-09-06/a1d.txt`:
+
+```
+ledger.recordSpawn / recordSpawnWall (per command)   124 us
+ledger.consolidate (75 fragments, per run)          1187 us
+```
+
+A tool's own fragment write costs the same 124 us but is paid *inside the tool*,
+so it overlaps with the rest of the DAG depth — that is why A1a measured +0.78 %
+for 47 of them. nifmake's is paid in nifmake's single-threaded process, between
+two spawns, and does not overlap with anything: 47 x 124 us = 5.8 ms of pure
+serial time on a 420 ms build, i.e. 1.4 % before `consolidate` is counted at
+all.
+
+Collecting in memory and folding once costs `openLedger` + `saveLedger`, which
+is 1.2 ms per nifmake run and does not grow with the command count. The numbers
+are identical: `spawn = wall - produce` still reads `produce` from the tool's
+running average, and the `(phase, module)` then `(phase, "")` probe is a lookup
+in the table the fold just built instead of a second `stat`.
+
+The cost is that `spawn` now lives in `<nimcache>/ledger.nif` and not in the
+fragments, so `put` gained one merge rule: a fold must not clobber a spawn with
+the zero a tool reports, because no tool measures its own process and zero there
+means "nothing to say". A changed `toolhash` still restarts that average with
+the rest of the entry's numbers. Two prices, both written down at the type:
+deleting the snapshot restarts the spawn averages (not `produce`, which is the
+fragments'), and two nifmake processes consolidating one nimcache at once — a
+CTFE sub-compile beside its parent's build — can lose one run's observations to
+the other's write. `saveLedger` is atomic, so that is a lost update of an
+average and never a corrupt file.
 
 ### The consolidation rule
 
@@ -367,10 +401,10 @@ search root and `expandCommand` is its only reader.
 
 `openLedger` folds `<nimcache>/.ledger/` and `<nimcache>/*/.ledger/`, which is
 the two levels the pipeline writes into, so one `consolidate` there sees the
-whole build. `ledgerTargetOf` keeps that true from the other side: a node whose
-first output is neither in the nimcache nor one level below it -- `link` under
-`--out:`, pointed at the user's own source directory -- has its sample written
-at the nimcache root instead of creating a `.ledger/` where it does not belong.
+whole build, and everything nifmake itself writes goes to the snapshot at that
+one path, so no node's output directory can pull a `.ledger/` into a place it
+does not belong (a `link` under `--out:` naming the user's own source
+directory, say).
 
 `executed > 0` gates the consolidation. An up-to-date rebuild is 11 ms today
 (JIT_IMPL.md 0) and has nothing new to fold; making it pay for a directory walk
@@ -382,10 +416,11 @@ would be a bigger regression than the phase is a win.
 of the eight node kinds agree with the key the tool wrote (table in §2.3
 above). `dceLive` does not: `hexer.nim:164` keys it with an empty module
 because it is a whole-program node, while an observer outside the process can
-only read a module suffix off `<main>.live.nif`. `recordSpawnWall` therefore
-probes `(phase, module)` and then `(phase, "")` before it creates anything, so
-the spawn lands on the sample the tool took. Verified on a real build: the
-fragment directory holds `dceLive_.nif` and no `dceLive_<main>.nif`.
+only read a module suffix off `<main>.live.nif`. `consolidate` therefore probes
+`(phase, module)` and then `(phase, "")` before it creates anything, so the
+spawn lands on the sample the tool took. Verified on a real build: the ledger
+holds one `dceLive` entry with an empty module and none named after the main
+module.
 
 `cc` and `link` have no fragment at all, so their whole wall time is the spawn
 cost. Measured on `tests/ledger/hello.nim`: `cc` 48.7 ms, `link` 31.4 ms,
@@ -494,8 +529,7 @@ forced whole-stdlib rebuild.
   suffix to phase to `produce` to decision -- is still tested end to end
   through a real `ledger.nif`. A2b and A2c populate `addEphemeralSuffix`, and
   that is when the rank starts firing.
-- **A per-run `produce` channel.** `recordSpawnWall` subtracts the fragment's
-  running average, because a separate process cannot see this run's raw
-  measurement. The residual is damped again by the EWMA the spawn itself goes
+- **A per-run `produce` channel.** `consolidate` subtracts the entry's running
+  average, because a separate process cannot see this run's raw measurement. The residual is damped again by the EWMA the spawn itself goes
   through. A tool that wanted to hand its exact `produce` to its parent would
   need a channel that does not exist, and the number does not justify one.
