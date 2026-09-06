@@ -11,7 +11,7 @@ import std / [syncio, os, hashes, tables, sets]
 when not defined(nimony):
   import std / [times, sequtils]
 include ".." / lib / nifprelude
-import ".." / lib / [nifindexes, symparser]
+import ".." / lib / [nifindexes, symparser, vfs]
 import ".." / gear2 / modnames
 import reporters, builtintypes, decls, nimony_model, symtabs, identstyle
 import ".." / models / [nifindex_tags]
@@ -226,12 +226,12 @@ proc semIndexExt(): string {.inline.} =
   else: ".s.idx.nif"
 
 proc needsRecompile*(dep, output: string): bool =
-  if not fileExists(output):
+  if not vfsExists(output):
     return true
   # If either file's mtime cannot be read, treat as needing recompile rather
   # than propagating a raise into every caller.
   try:
-    result = getLastModificationTime(output) < getLastModificationTime(dep)
+    result = vfsMtime(output) < vfsMtime(dep)
   except:
     result = true
 

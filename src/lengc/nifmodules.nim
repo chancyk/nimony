@@ -27,6 +27,7 @@ import ".." / "lib" / nifreader as rd       # Reader, jumpTo, indexStartsAt
 import ".." / "lib" / symparser             # splitSymName, splitModulePath, basename
 import ".." / "lib" / foreignmodules         # shared lazy loader (ForeignModule)
 import ".." / "lib" / bif                    # binary NIF: isBifFile probe + load
+import ".." / "lib" / vfs                     # relayed existence check
 import noptions                              # ConfigRef
 
 type
@@ -160,7 +161,7 @@ proc canLoadForeign*(c: var MainModule; s: SymId): bool =
     m = getOrQuit(c.prog.mods, splitted.module)
   else:
     c.prog.scheme.name = splitted.module
-    if not fileExists($c.prog.scheme): return false
+    if not vfsExists($c.prog.scheme): return false
     m = openForeignModule($c.prog.scheme)
     c.prog.mods[splitted.module] = m
   result = hasDecl(m, $splitted)

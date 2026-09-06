@@ -74,15 +74,34 @@ proc ctfeStamps(cache: string; buildOnly: bool): seq[(string, string)] =
         result.add (sfx / g.lastPathPart, $t.toUnix & "." & $t.nanosecond)
   sort result
 
-proc incrementalTests*() =
+proc modeTag(mode: string): string =
+  ## A directory-safe stem for a mode string, so two modes can be run in the
+  ## same tree without sharing a nimcache. `--vfs:memory+spill` -> `vfsmemoryspill`.
+  result = ""
+  for c in mode:
+    if c in {'a'..'z', 'A'..'Z', '0'..'9'}: result.add c
+
+proc modeLabel(mode: string): string =
+  if mode.len > 0: " (" & mode & ")" else: ""
+
+proc incrementalTests*(mode = "") =
   ## Drive `bin/nimony c --report` through a fixed sequence of scenarios on
   ## `tests/incremental/sample.nim` and assert the per-nifmake-invocation
   ## command counts. Fails the run on the first divergence; restores the
   ## sample file regardless of outcome.
+  ##
+  ## `mode` is extra flags handed to every `nimony` invocation, and it also
+  ## names this run's nimcache: the suite runs the whole sequence once per VFS
+  ## mode (`tests/incremental/setup.nim`), and the counts asserted below must
+  ## come out the same under each — a store that changed what nifmake
+  ## considers stale would show up here as a rebuild count, which is the
+  ## cheapest possible detector for it.
   let t0 = epochTime()
   let src = "tests/incremental/sample.nim"
   let dep = "tests/incremental/inlinedep.nim"
-  let cache = "nimcache" / "incremental"
+  let modeFlag = if mode.len > 0: " " & mode else: ""
+  let suffix = if mode.len > 0: "-" & modeTag(mode) else: ""
+  let cache = "nimcache" / ("incremental" & suffix)
   let nimony = "bin" / "nimony".addFileExt(ExeExt)
   for f in [src, dep]:
     if not fileExists(f):
@@ -94,8 +113,8 @@ proc incrementalTests*() =
   # `-r` so every phase also RUNS the result: a rebuild that nifmake skipped
   # when it should not have leaves a stale binary behind, and a report count
   # alone would not notice (see the `inline-dep` phase).
-  let baseCmd = nimony.quoteShell & " c -r --silentMake --report --nimcache:" &
-                cache.quoteShell & " " & src.quoteShell
+  let baseCmd = nimony.quoteShell & " c -r --silentMake --report" & modeFlag &
+                " --nimcache:" & cache.quoteShell & " " & src.quoteShell
   let originalSrc = readFile(src)
   let originalDep = readFile(dep)
 
@@ -203,8 +222,8 @@ proc incrementalTests*() =
       let before = mainHexedPerBackend(cache)
       expect before.len == 1,
              "backend-switch: expected 1 backend directory before, got " & $before.len
-      let nativeCmd = nimony.quoteShell & " n -r --silentMake --report --nimcache:" &
-                      cache.quoteShell & " " & src.quoteShell
+      let nativeCmd = nimony.quoteShell & " n -r --silentMake --report" & modeFlag &
+                      " --nimcache:" & cache.quoteShell & " " & src.quoteShell
       let (nativeOut, nativeEc) = execCmdEx(nativeCmd)
       if nativeEc != 0:
         stdout.write nativeOut
@@ -231,14 +250,14 @@ proc incrementalTests*() =
   let depSrc = "tests/incremental/plugindep.nim"
   let pluginData = "tests/incremental/plugindata.txt"
   let slurpData = "tests/incremental/slurpdata.txt"
-  let depCache = "nimcache" / "incremental-deps"
+  let depCache = "nimcache" / ("incremental-deps" & suffix)
   if fileExists(depSrc) and fileExists(pluginData) and fileExists(slurpData):
     phases += 5
     let originalPluginData = readFile(pluginData)
     let originalSlurpData = readFile(slurpData)
     removeDir depCache
-    let depCmd = nimony.quoteShell & " c -r --silentMake --report --nimcache:" &
-                 depCache.quoteShell & " " & depSrc.quoteShell
+    let depCmd = nimony.quoteShell & " c -r --silentMake --report" & modeFlag &
+                 " --nimcache:" & depCache.quoteShell & " " & depSrc.quoteShell
 
     var depOutput = ""
     proc runDep(label: string): seq[seq[ReportEntry]] =
@@ -320,13 +339,13 @@ proc incrementalTests*() =
   # counts asserted above.
   let ctfeSrc = "tests/incremental/ctfedep.nim"
   let ctfeData = "tests/incremental/ctfedata.txt"
-  let ctfeCache = "nimcache" / "incremental-ctfe"
+  let ctfeCache = "nimcache" / ("incremental-ctfe" & suffix)
   if fileExists(ctfeSrc) and fileExists(ctfeData):
     phases += 5
     let originalCtfeData = readFile(ctfeData)
     removeDir ctfeCache
-    let ctfeCmd = nimony.quoteShell & " c -r --silentMake --report --nimcache:" &
-                  ctfeCache.quoteShell & " " & ctfeSrc.quoteShell
+    let ctfeCmd = nimony.quoteShell & " c -r --silentMake --report" & modeFlag &
+                  " --nimcache:" & ctfeCache.quoteShell & " " & ctfeSrc.quoteShell
 
     var ctfeOutput = ""
     proc runCtfe(label: string; extraFlags = ""): seq[seq[ReportEntry]] =
@@ -416,11 +435,10 @@ proc incrementalTests*() =
 
   let dt = epochTime() - t0
   if failures.len > 0:
-    for f in failures: stderr.writeLine "incremental: " & f
+    for f in failures: stderr.writeLine "incremental" & modeLabel(mode) & ": " & f
     quit "FAILURE: " & $failures.len & " incremental phase(s) failed."
-  echo "incremental: ", phases, " / ", phases, " phases successful in ",
-       formatFloat(dt, ffDecimal, precision=2), "s."
-  echo "SUCCESS."
+  echo "incremental", modeLabel(mode), ": ", phases, " / ", phases,
+       " phases successful in ", formatFloat(dt, ffDecimal, precision=2), "s."
 
 # ---- Compile-time-eval object cache ---------------------------------------
 # Every `const` that `expreval` cannot fold costs a whole sub-program, and
@@ -457,7 +475,7 @@ proc countObjects(dir: string): int =
   result = 0
   for f in walkFiles(dir / "*.o"): inc result
 
-proc incrementalOCacheTests*() =
+proc incrementalOCacheTests*(mode = "") =
   ## Compile two modules that each need a compile-time-eval sub-program into
   ## one nimcache and assert the second one's sub-compile reused the first's
   ## objects. The inner `nimony s` runs under `execCmdEx` and never sees
@@ -465,7 +483,8 @@ proc incrementalOCacheTests*() =
   let t0 = epochTime()
   let srcA = "tests/incremental/ctfe_ocache_a.nim"
   let srcB = "tests/incremental/ctfe_ocache_b.nim"
-  let cache = "nimcache" / "ctfe_ocache"
+  let modeFlag = if mode.len > 0: " " & mode else: ""
+  let cache = "nimcache" / ("ctfe_ocache" & (if mode.len > 0: "-" & modeTag(mode) else: ""))
   let nimony = "bin" / "nimony".addFileExt(ExeExt)
   for f in [srcA, srcB]:
     if not fileExists(f):
@@ -481,7 +500,7 @@ proc incrementalOCacheTests*() =
   proc run(src, label: string): string =
     # `-r` so the program also runs: a wrongly reused object would either fail
     # to link or produce the wrong number.
-    let cmd = nimony.quoteShell & " c -r --silentMake --nimcache:" &
+    let cmd = nimony.quoteShell & " c -r --silentMake" & modeFlag & " --nimcache:" &
               cache.quoteShell & " " & src.quoteShell
     let (output, ec) = execCmdEx(cmd)
     if ec != 0:
@@ -523,7 +542,7 @@ proc incrementalOCacheTests*() =
 
   let dt = epochTime() - t0
   if failures.len > 0:
-    for f in failures: stderr.writeLine "ctfe-ocache: " & f
+    for f in failures: stderr.writeLine "ctfe-ocache" & modeLabel(mode) & ": " & f
     quit "FAILURE: " & $failures.len & " ctfe-ocache phase(s) failed."
-  echo "ctfe-ocache: 2 / 2 phases successful in ",
+  echo "ctfe-ocache", modeLabel(mode), ": 2 / 2 phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."

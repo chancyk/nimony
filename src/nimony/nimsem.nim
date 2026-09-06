@@ -10,7 +10,7 @@ import std / [parseopt, sets, strutils, os, assertions, syncio]
 
 import ".." / gear2 / modnames
 import ".." / lib / [argsfinder, symparser, nifpools, nifreader,
-                     nifbuilder, nifindexes, tooldirs, vfs, nimversion, ledger]
+                     nifbuilder, nifindexes, tooldirs, vfs, artifactstore, nimversion, ledger]
 import semmain, sem, nifconfig, semos, semdata, indexgen, programs,
        derefs, deps, idetools, cli, langmodes
 
@@ -162,6 +162,7 @@ proc handleCmdLine() =
   semos.setupPaths(config)
   if config.linker.len == 0 and config.cc.len > 0:
     config.linker = config.cc
+  applyRequestedStore()
 
   case cmd
   of None:
@@ -193,6 +194,7 @@ proc handleCmdLine() =
 
 when isMainModule:
   handleCmdLine()
+  storeFlush()
   when defined(prepMutStats):
     stderr.writeLine "[prepMutStats] fast=", cowFastCount,
       " slow=", cowSlowCount,

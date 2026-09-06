@@ -4,12 +4,13 @@
 ## both times. Needs a built `bin/nimony` (the tree walk's `tests/setup.hastur`
 ## provides it).
 ##
-## The two modes are empty strings today because the flags they will name do
-## not exist yet: A1b adds `--vfs:disk` / `--vfs:memory+spill`, B2 adds
-## `--ctfe:subprocess` / `--ctfe:engine`. Disk against disk is not a vacuous
-## run — it is the harness's own baseline, and it catches nondeterminism in the
-## sub-compile (a hash-order-dependent Table layout, a leaked absolute path, a
-## timestamp) that would otherwise be blamed on whichever mode lands next.
+## The two modes are `--vfs:disk` and `--vfs:memory+spill` since A1b: the
+## first is the escape hatch that installs no artifact store at all, the second
+## keeps every artifact resident in the process that produced it. B2 will add
+## `--ctfe:subprocess` / `--ctfe:engine` the same way. The comparison also
+## still catches nondeterminism in the sub-compile itself (a hash-order-
+## dependent Table layout, a leaked absolute path, a timestamp), which is what
+## made a disk-against-disk run worth having before these flags existed.
 ## `ctfeDiffSelfTest` is what proves the comparison has teeth: it must report a
 ## planted difference and must not report an identical pair.
 
@@ -33,7 +34,7 @@ if failures > 0:
 # the way to iterate on `ctfediff.nim` without paying for two full compiles of
 # the corpus.
 if "--self-test" notin commandLineParams():
-  failures += ctfeDiff(@["tests/nimony/consteval"], "", "")
+  failures += ctfeDiff(@["tests/nimony/consteval"], "--vfs:disk", "--vfs:memory+spill")
 
 if failures > 0:
   echo "ctfe_diff: ", failures, " failure(s)"

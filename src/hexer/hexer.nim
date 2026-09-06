@@ -45,7 +45,7 @@ Hexer accepts Nimony's grammar.
 import std / [parseopt, strutils, os, osproc, tables, assertions, syncio]
 import ".." / nimony / [langmodes, nifconfig]
 import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
-import ".." / lib / [vfs, nimversion, ledger]
+import ".." / lib / [vfs, artifactstore, nimversion, ledger]
 
 include ".." / lib / compat2
 
@@ -124,10 +124,18 @@ proc handleCmdLine*() =
         else: quit "invalid value for --app; expected console, gui, lib, or staticlib"
       of "flags":
         flags = parseFlags(val)
+      of "vfs":
+        if not requestStorePolicy(val):
+          quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
+      of "vfs-budget", "vfsbudget":
+        let mb = parseBudgetMB(val)
+        if mb <= 0: quit "invalid value for --vfs-budget; expected a size in megabytes"
+        requestStoreBudgetMB mb
       of "help", "h": writeHelp()
       of "version", "v": writeVersion()
       else: writeHelp()
     of cmdEnd: assert false, "cannot happen"
+  applyRequestedStore()
   if action == "c" and files.len > 1:
     quit "too many arguments given, seek --help"
   elif action.len == 0 or files.len == 0:
@@ -174,4 +182,5 @@ proc handleCmdLine*() =
 
 when isMainModule:
   handleCmdLine()
+  storeFlush()
   dumpVfsProfile("hexer")

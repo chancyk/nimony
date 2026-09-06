@@ -14,5 +14,12 @@ proc arg(name: string): string =
 if arg("bindir").len > 0: toolchainDir = arg("bindir")
 if arg("cachedir").len > 0: nimcacheDir = arg("cachedir")
 
+# Once per VFS mode. `--vfs:disk` is the default and is what every other run
+# of the suite exercises, so the second pass is the interesting one: the store
+# must not change which nodes nifmake considers stale, and the phase counts
+# below are the assertion that it does not.
 incrementalOCacheTests()
 incrementalTests()
+incrementalOCacheTests("--vfs:memory+spill")
+incrementalTests("--vfs:memory+spill")
+echo "SUCCESS."

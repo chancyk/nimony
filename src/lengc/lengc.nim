@@ -14,7 +14,7 @@ import std / [parseopt, strutils, os, osproc, tables, assertions, syncio,
 import codegen, llvmcodegen          # nifcore backends (local to shoggoth/)
 import noptions
 import ".." / lib / symparser
-import ".." / lib / vfs
+import ".." / lib / [vfs, artifactstore]
 import ".." / lib / ledger
 import ".." / lib / nimversion
 
@@ -190,9 +190,17 @@ proc handleCmdLine() =
           s.config.appType = appStaticLib
         else:
           quit "invalid value for --app; expected console, gui, lib, or staticlib"
+      of "vfs":
+        if not requestStorePolicy(val):
+          quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
+      of "vfs-budget", "vfsbudget":
+        let mb = parseBudgetMB(val)
+        if mb <= 0: quit "invalid value for --vfs-budget; expected a size in megabytes"
+        requestStoreBudgetMB mb
       else: writeHelp()
     of cmdEnd: assert false, "cannot happen"
 
+  applyRequestedStore()
   makeDir(s.config.nifcacheDir)
   if actionTable.len != 0:
     for action in actionTable.keys:
@@ -228,4 +236,5 @@ proc handleCmdLine() =
 
 when isMainModule:
   handleCmdLine()
+  storeFlush()
   dumpVfsProfile("lengc")

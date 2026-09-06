@@ -15,11 +15,34 @@
 ## Two surfaces, because there are two writers: `bif.store` (binary `.bif`) and
 ## `vfs.vfsWrite` (the relay behind every `.nif` / `.idx.nif` write — nifpools,
 ## nifindexes, nifbuilder, nifmake).
+##
+## A third case drives the whole toolchain instead of the library: the same
+## sources are compiled under `--vfs:disk` and under `--vfs:verify` into the
+## same nimcache path, and every `.nif` the build leaves behind must come out
+## byte for byte the same. `--vfs:verify` is the mode that makes a store that
+## disagrees with the disk a fatal diagnostic rather than a stale build, so a
+## clean run of it plus identical bytes is the phase's gate (JIT_IMPL.md A1b).
+##
+## The nimcache PATH is shared between the two runs on purpose: several
+## artifacts legitimately embed the absolute cache directory (the CTFE
+## sub-program bakes in the `<sfx>.out.nif` it writes at run time), so two
+## caches in two directories differ for a reason that has nothing to do with
+## the VFS mode. Wiping one directory between the runs compares the modes and
+## nothing else.
 
-import std / [os, strutils]
+import std / [os, strutils, osproc, algorithm, tables]
 import "../../src/lib/vfs"
 import "../../src/lib/bif"
 import "../../src/lib/nifcore"
+
+proc arg(name: string): string =
+  let prefix = "--" & name & ":"
+  for p in commandLineParams():
+    if p.startsWith(prefix): return p[prefix.len .. ^1]
+  result = ""
+
+let toolchainDir = if arg("bindir").len > 0: arg("bindir") else: "bin"
+let cacheRoot = if arg("cachedir").len > 0: arg("cachedir") else: "nimcache"
 
 var failures = 0
 
@@ -121,8 +144,103 @@ proc vfsCase() =
   else: ok "no .tmp.* residue"
   removeFile path
 
+# ── surface 3: the toolchain, once per --vfs mode ────────────────────────────
+
+proc artifactSnapshot(cache: string): Table[string, string] =
+  ## Every `.nif` under `cache`, keyed by its path relative to `cache`. The
+  ## bytes rather than a digest: a difference has to be reportable, and these
+  ## caches are a few hundred small files.
+  result = initTable[string, string]()
+  for path in walkDirRec(cache):
+    if path.endsWith(".nif"):
+      result[path.relativePath(cache)] = readFile(path)
+
+proc compileUnder(mode, cache, src: string; output: var string): bool =
+  ## One `nimony c` into a freshly wiped `cache`. `NIMONY_VFS_STATS` makes
+  ## every process of the build print its own store line, which is how the
+  ## caller can tell an engaged store from a mode that was silently ignored.
+  removeDir cache
+  let nimony = toolchainDir / "nimony".addFileExt(ExeExt)
+  let cmd = nimony.quoteShell & " c --silentMake --vfs:" & mode &
+            " --nimcache:" & cache.quoteShell & " " & src.quoteShell
+  putEnv("NIMONY_VFS_STATS", "1")
+  let (outp, ec) = execCmdEx(cmd)
+  delEnv("NIMONY_VFS_STATS")
+  output = outp
+  result = ec == 0
+  if not result:
+    echo outp
+
+proc storeLineTotals(output: string; field: string): int =
+  ## Sum one `[store] … <field>=<n>` counter across every process of a build.
+  result = 0
+  for line in output.splitLines:
+    if not line.startsWith("[store]"): continue
+    for part in line.split(' '):
+      let eq = part.find('=')
+      if eq > 0 and part[0 ..< eq] == field:
+        try: result += parseInt(part[eq+1 .. ^1])
+        except ValueError: discard
+
+proc modeCase(src: string) =
+  echo "--vfs:disk and --vfs:verify agree on ", src
+  let nimony = toolchainDir / "nimony".addFileExt(ExeExt)
+  if not fileExists(nimony):
+    fail "no " & nimony & "; run `hastur build nimony` first"
+    return
+  if not fileExists(src):
+    fail "missing fixture " & src
+    return
+  let cache = cacheRoot / "vfsmodes"
+
+  var diskOut = ""
+  if not compileUnder("disk", cache, src, diskOut):
+    fail "the --vfs:disk build failed"
+    return
+  let disk = artifactSnapshot(cache)
+  if disk.len == 0:
+    fail "the --vfs:disk build produced no .nif artifacts"
+    return
+
+  var verifyOut = ""
+  if not compileUnder("verify", cache, src, verifyOut):
+    fail "the --vfs:verify build failed"
+    return
+  let verify = artifactSnapshot(cache)
+
+  ok "--vfs:verify completed with no mismatch"
+  let checks = storeLineTotals(verifyOut, "verify")
+  let mismatches = storeLineTotals(verifyOut, "mismatches")
+  if checks == 0:
+    fail "the store answered no read from memory; --vfs:verify proved nothing"
+  else:
+    ok "the store was engaged (" & $checks & " reads compared against the disk)"
+  if mismatches != 0:
+    fail $mismatches & " verify mismatch(es) reported"
+
+  var missing: seq[string] = @[]
+  var extra: seq[string] = @[]
+  var differing: seq[string] = @[]
+  for name, bytes in disk:
+    if name notin verify: missing.add name
+    elif verify[name] != bytes: differing.add name
+  for name in verify.keys:
+    if name notin disk: extra.add name
+  sort missing
+  sort extra
+  sort differing
+  if missing.len > 0: fail "only in the disk build: " & missing[0 ..< min(3, missing.len)].join(", ")
+  if extra.len > 0: fail "only in the verify build: " & extra[0 ..< min(3, extra.len)].join(", ")
+  if differing.len > 0:
+    fail $differing.len & " artifact(s) differ, first: " & differing[0 ..< min(3, differing.len)].join(", ")
+  if missing.len == 0 and extra.len == 0 and differing.len == 0:
+    ok "both modes left the same " & $disk.len & " .nif artifacts, byte for byte"
+  removeDir cache
+
 bifCase()
 vfsCase()
+modeCase("tests/nimony/consteval/tmyops.nim")
+modeCase("tests/incremental/sample.nim")
 
 if failures > 0:
   echo "nifcache: ", failures, " failure(s)"

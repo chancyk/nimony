@@ -17,7 +17,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
 import std / [parseopt, sets, strutils, os, assertions, syncio, dirs, paths]
-import ".." / lib / [tooldirs, argsfinder, nimversion, vfs]
+import ".." / lib / [tooldirs, argsfinder, nimversion, vfs, artifactstore]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
@@ -98,6 +98,13 @@ Options:
   --inlineframes:on|off     record which template an expansion came from, so a
                             debug build shows template calls as inlined frames
                             (default: off)
+  --vfs:MODE                where build artifacts live: disk (the default; no
+                            artifact store at all), memory, memory+spill, or
+                            verify (memory, written through, every read
+                            compared against the disk copy). The mode reaches
+                            every tool of the build through the environment.
+  --vfs-budget:MB           how much the artifact store may hold resident
+                            before it sheds entries (default: 512)
   --novalidate              skip running the plugin validator on plugin sources
   --verbose                 dump Final IR (and other diagnostics) on contract
                             analysis failures
@@ -439,7 +446,12 @@ when isMainModule:
       handleCmdLine(c, args, FromArgsFile)
 
   handleCmdLine(c, @[], FromCmdLine)
+  # The store, if any, has to exist before the first artifact is touched and
+  # after `--vfs` has been seen. Every child process inherits the mode through
+  # the environment (`artifactstore.applyRequestedStore`).
+  applyRequestedStore()
   compileProgram(c)
+  storeFlush()
   # The driver is the parent of every other tool process, so its own VFS time
   # is the one line the per-tool dumps cannot account for.
   dumpVfsProfile("nimony")

@@ -49,7 +49,7 @@
 import std / [tables, assertions, os, sets, hashes]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / symparser
+import ".." / lib / [symparser, vfs]
 import ".." / lengc / [leng_model]
 
 type
@@ -349,9 +349,9 @@ proc findForeignFile(c: InlinerCtx; modul, ext: string): string =
   ## the search and look up by name.)
   if c.xnifDir.len == 0: return ""
   let direct = c.xnifDir / modul & ext
-  if fileExists(direct): return direct
+  if vfsExists(direct): return direct
   let parent = c.xnifDir / ".." / modul & ext
-  if fileExists(parent): return parent
+  if vfsExists(parent): return parent
   return ""
 
 proc loadForeign(c: var InlinerCtx; modul: string): bool =

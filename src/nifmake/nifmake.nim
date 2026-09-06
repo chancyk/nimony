@@ -9,7 +9,8 @@
 ## by a .nif file or it can translate this file to a Makefile.
 
 import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes, sets, parseopt, syncio, osproc, algorithm, terminal]
-import ".." / lib / [bitabs, lineinfos, nifreader, tooldirs, argsfinder, vfs, nifpools, nimversion]
+import ".." / lib / [bitabs, lineinfos, nifreader, tooldirs, argsfinder, vfs, artifactstore,
+                     nifpools, nimversion]
 
 # Inspired by https://gittup.org/tup/build_system_rules_and_algorithms.pdf
 #[
@@ -296,6 +297,50 @@ proc executeCommand(command: string): bool =
   except:
     result = false
 
+# --- the run-node relay ---------------------------------------------------
+#
+# The seam Phase A2b fills: a relay that gets first refusal on every node the
+# DAG decides to run. Today's default declines everything, so both paths below
+# behave exactly as they did — the sequential one shells out, the parallel one
+# batches the depth into `execProcesses`.
+#
+# The answer is a tri-state rather than a bool because A2b routes SOME
+# commands in-process (the phases it has registered) while the rest of the
+# same DAG depth still has to fan out: `RunSpawn` sends the node to the batch,
+# the two `Handled` answers keep it out of it and report the outcome.
+
+type
+  RunNodeStatus* = enum
+    RunSpawn,          ## the relay declines; nifmake runs the command itself
+    RunHandledOk,      ## the relay ran it in-process, successfully
+    RunHandledFailed   ## the relay ran it in-process, and it failed
+
+  RunNodeRequest* = object
+    ## Everything a relay needs to decide whether it can run this node itself.
+    ## `command` is the fully expanded shell line the default path would run,
+    ## so a relay that declines costs nothing extra and one that accepts still
+    ## has the exact argv to report or fall back to.
+    name*: string        ## the `cmd` name from the DAG: `nifler`, `cc`, …
+    command*: string
+    inputs*: seq[string]
+    outputs*: seq[string]
+    args*: seq[string]
+    baseDir*: string
+
+proc spawnEverything(req: RunNodeRequest): RunNodeStatus {.nimcall.} = RunSpawn
+
+var runNodeRelay*: proc (req: RunNodeRequest): RunNodeStatus {.nimcall.} = spawnEverything
+
+proc offerNode(name, command: string; node: Node; baseDir: string): RunNodeStatus =
+  ## Ask the relay. Named so the two paths in `runDag` agree, and guarded so
+  ## the default relay costs nothing: assembling the request copies three
+  ## `seq[string]`s per node, and the make loop runs it for every node of
+  ## every depth.
+  if runNodeRelay == spawnEverything: return RunSpawn
+  runNodeRelay(RunNodeRequest(
+    name: name, command: command, inputs: node.inputs,
+    outputs: node.outputs, args: node.args, baseDir: baseDir))
+
 proc failed(arg: string) =
   stdout.write "nifmake: "
   stdout.writeLine arg
@@ -409,10 +454,29 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           let expandedCmd = expandCommand(dag.commands[node.cmdIdx], node.inputs, node.outputs, node.args, dag.baseDir)
           if Verbose in opt:
             echo "Command: ", expandedCmd
-          commands.add(expandedCmd)
-          nodeIds.add(sortedNodes[i])
-          cmdNames.add(dag.commands[node.cmdIdx].name)
-          labels.add(nodeLabel(dag, node[]))
+          let cmdName = dag.commands[node.cmdIdx].name
+          case offerNode(cmdName, expandedCmd, node[], dag.baseDir)
+          of RunSpawn:
+            commands.add(expandedCmd)
+            nodeIds.add(sortedNodes[i])
+            cmdNames.add(cmdName)
+            labels.add(nodeLabel(dag, node[]))
+          of RunHandledOk:
+            # An in-process node still counts as an executed command, so
+            # `--report` keeps meaning what it meant. Its duration is zero
+            # here because only the relay knows how long it took; A2b, which
+            # is the first relay to answer anything but `RunSpawn`, reports
+            # its own timings.
+            inc prog.done
+            prog.draw(nodeLabel(dag, node[]))
+            if profile != nil: profile[].recordCmdTime(cmdName, 0.0)
+          of RunHandledFailed:
+            if prog.active:
+              stdout.write "\n"
+              stdout.flushFile()
+            if profile != nil: profile[].recordCmdTime(cmdName, 0.0)
+            failed expandedCmd
+            return false
         inc i
 
       # Execute all commands at this depth in parallel
@@ -465,7 +529,12 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           echo "Command: ", expandedCmd
         let cmdName = dag.commands[node.cmdIdx].name
         let start = if profile != nil: getMonoTime() else: MonoTime()
-        if not executeCommand(expandedCmd):
+        let ok =
+          case offerNode(cmdName, expandedCmd, node[], dag.baseDir)
+          of RunSpawn: executeCommand(expandedCmd)
+          of RunHandledOk: true
+          of RunHandledFailed: false
+        if not ok:
           if profile != nil:
             profile[].recordCmdTime(cmdName, toSeconds(getMonoTime() - start))
           if prog.active:
@@ -674,6 +743,10 @@ Options:
                         --report). The optional LO:HI range remaps the bar so a
                         caller running several builds can show one continuous
                         0..100% bar across them.
+  --vfs:MODE            Artifact store policy: disk (default), memory,
+                        memory+spill or verify. Normally inherited from the
+                        environment, which is how nimony hands it down.
+  --vfs-budget:MB       Resident budget for the artifact store (default 512).
   --profile             Print timing profile of executed commands to stderr.
   --report              Print machine-readable per-command invocation
                         counts to stdout, e.g.
@@ -781,6 +854,13 @@ proc main() =
       of "base": baseDir = val
       of "profile": opt.incl Profile
       of "report": opt.incl Report
+      of "vfs":
+        if not requestStorePolicy(val):
+          quit "invalid value for --vfs; expected disk, memory, memory+spill or verify"
+      of "vfs-budget", "vfsbudget":
+        let mb = parseBudgetMB(val)
+        if mb <= 0: quit "invalid value for --vfs-budget; expected a size in megabytes"
+        requestStoreBudgetMB mb
       of "progress":
         opt.incl Progress
         # Optional `--progress:LO:HI` remaps the bar into a sub-range so a
@@ -800,6 +880,8 @@ proc main() =
         quit(1)
 
     of cmdEnd: discard
+
+  applyRequestedStore()
 
   case cmd
   of cmdHelp: writeHelp()
@@ -832,4 +914,5 @@ proc main() =
 
 when isMainModule:
   main()
+  storeFlush()
   dumpVfsProfile("nifmake")
