@@ -427,14 +427,19 @@ proc evaluate*(e: var Engine; backendDir, mainSuffix, sourceDir: string;
   #     `openFileSession`, which is the path nifasm's whole corpus and B1's
   #     `nifrun` exercise.
   #
-  # They should be the same program and are not always: one evaluation in
-  # `tests/nimony/consteval` (`tconstfloat`'s first, and only when its nimcache
-  # already holds other tests' artifacts) makes the buffer handoff assert inside
-  # nifasm's `bitabs` while the file path assembles it and runs it correctly.
-  # Retrying through the tested path costs a few milliseconds on an evaluation
-  # that would otherwise have fallen back to the C backend and cost half a
-  # second, and it keeps the difference visible instead of hiding it: the
-  # `--verbose` line says `viaFile`. See notes/b2.md for what is known about it.
+  # They are the same program, and one evaluation in `tests/nimony/consteval`
+  # used to disagree: the buffer handoff asserted inside nifasm's `bitabs` while
+  # the file path assembled and ran it. That was nifasm reading an optional
+  # operand that was not there — `Cursor.kind` past the end of a bounded scope,
+  # in a buffer holding ONE foreign declaration, so the token it decoded as a
+  # string was uninitialized heap. Fixed in nativenif `736b491`, which is what
+  # this checkout pins; the file path only ever "worked" because its differently
+  # recycled bytes did not spell a `StrLit`.
+  #
+  # The retry stays as the safety net it was written to be — a refusal on the
+  # path with no corpus behind it should cost a few milliseconds rather than the
+  # half second of a fallback to the C backend — and `viaFile` on the
+  # `--verbose` line is what says it was needed. It should now never appear.
   #
   # Either way the OTHER modules are read back from their `.asm.nif` by nifasm's
   # own lazy loader, which reads only the symbols the program actually reaches.
