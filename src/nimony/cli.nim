@@ -191,13 +191,26 @@ proc parseCommonOption*(key, val: string; config: var NifConfig;
     of "subprocess": config.ctfeMode = ctfeSubprocess
     of "engine": config.ctfeMode = ctfeEngine
     else: quit "invalid value for --ctfe; expected subprocess or engine"
+  of "ctfe-analysis-only", "ctfeanalysisonly":
+    # Undocumented by design: not a user's choice but one compiler telling the
+    # child it spawned that it will run the result itself. NOT forwarded — the
+    # child's own sub-compiles (a macro plugin, a nested `const`) each decide
+    # for themselves, and a plugin that stopped before its linker would simply
+    # not exist.
+    config.ctfeAnalysisOnly = true
+    forwardArg = false
   of "ctfe-budget", "ctfebudget":
+    # Digits by hand, like `parseTrack` above: this file is compiled by nimony
+    # itself during `hastur boot`, where `parseInt`'s `ValueError` is not a
+    # type that exists.
     var ms = 0
-    try:
-      ms = parseInt(val)
-    except ValueError:
-      ms = -1
-    if ms <= 0:
+    var valid = val.len > 0
+    for ch in val:
+      if ch in {'0'..'9'}:
+        ms = ms * 10 + (ord(ch) - ord('0'))
+      else:
+        valid = false
+    if not valid or ms <= 0:
       quit "invalid value for --ctfe-budget; expected a positive number of milliseconds"
     config.ctfeBudgetMs = ms
   of "novalidate":

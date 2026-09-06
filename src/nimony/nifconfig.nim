@@ -140,6 +140,14 @@ type
                          ## (which engine to evaluate a `const` with) and by
                          ## `deps.buildGraph` (whether a `.p.nif` sub-program's
                          ## build stops after the analysis graph).
+    ctfeAnalysisOnly*: bool
+      ## `--ctfe-analysis-only`: stop this build after the analysis graph, with
+      ## the `.c.nif` files written and no lengc, no C compiler and no linker.
+      ## Passed to ONE `nimony s <sfx>.p.nif` by `semos.buildEvalProgram` when
+      ## the engine is about to run that sub-program itself, and never
+      ## forwarded any further — a macro plugin is built through the same
+      ## `nimony s <name>.p.nif` spelling and genuinely needs its executable,
+      ## so inferring this from `--ctfe:engine` would break every macro.
     ctfeBudgetMs*: int   ## `--ctfe-budget:<ms>`, 0 = the default. How long one
                          ## compile-time evaluation may run before it is a
                          ## diagnostic instead of a hang. Engine mode only: a

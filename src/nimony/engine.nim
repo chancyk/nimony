@@ -69,6 +69,8 @@ type
     ## Where one evaluation's milliseconds went. Printed under `--verbose`.
     arkhamMs*, assembleMs*, layMs*, bindMs*, runMs*, totalMs*: float
     modules*, arkhamRuns*, cacheHits*: int
+    viaFile*: bool   ## the main module went through `.asm.nif` after the
+                     ## in-memory handoff was refused
     codeLen*, dataLen*, externals*: int
 
   EngineResult* = object
@@ -416,52 +418,92 @@ proc evaluate*(e: var Engine; backendDir, mainSuffix, sourceDir: string;
 
   # ── nifasm: one session over the whole module set ─────────────────────────
   #
-  # The MAIN module goes in as arkham's buffer, so its literal pool becomes the
-  # session's pool -- which is what `openFileSession` does with the buffer it
-  # parses, and what every foreign symbol is interned against. The others are
-  # read back from their `.asm.nif` by nifasm's own lazy loader, which reads
-  # only the symbols the program actually reaches.
+  # Two ways in, tried in this order:
+  #
+  #  0. the MAIN module as arkham's own `TokenBuf`, its literal pool becoming
+  #     the session's -- no serialization at all, and the reason `generateAsmBuf`
+  #     exists.
+  #  1. the same module written out as `.asm.nif` and re-read by
+  #     `openFileSession`, which is the path nifasm's whole corpus and B1's
+  #     `nifrun` exercise.
+  #
+  # They should be the same program and are not always: one evaluation in
+  # `tests/nimony/consteval` (`tconstfloat`'s first, and only when its nimcache
+  # already holds other tests' artifacts) makes the buffer handoff assert inside
+  # nifasm's `bitabs` while the file path assembles it and runs it correctly.
+  # Retrying through the tested path costs a few milliseconds on an evaluation
+  # that would otherwise have fallen back to the C backend and cost half a
+  # second, and it keeps the difference visible instead of hiding it: the
+  # `--verbose` line says `viaFile`. See notes/b2.md for what is known about it.
+  #
+  # Either way the OTHER modules are read back from their `.asm.nif` by nifasm's
+  # own lazy loader, which reads only the symbols the program actually reaches.
   var sess = default(AsmSession)
   var arena = default(Arena)
   var img = default(MemImage)
   var haveArena = false
   var haveSession = false
-  try:
-    let tAsm = getMonoTime()
-    # `singleThread`: the guest's `localErr`, current-exception and allocator
-    # region are all `{.threadvar.}`, and `layInMemory` REFUSES an image that
-    # still has thread-locals. Evaluations are serialized, so a thread-local is
-    # exactly a global here.
-    sess = openSession(mainAsm.code.pool, backendDir, mainSuffix,
-                       debugInfo = false, singleThread = true)
-    haveSession = true
-    sess.addMainModule(move mainAsm.code)
-    sess.declare()
-    sess.beginEmit()
-    sess.emitTopLevel()
-    sess.emitRoots()
-    sess.finishCode()
-    result.timings.assembleMs = (getMonoTime() - tAsm).inNanoseconds.float / 1e6
+  var laid = false
+  var lastReason = ""
+  let mainPool = mainAsm.code.pool
+  for attempt in 0 .. 1:
+    if laid: break
+    if attempt == 1:
+      # Nothing of the first attempt may survive into the second.
+      if haveArena: releaseArena arena
+      if haveSession: sess.closeSession()
+      haveArena = false
+      haveSession = false
+      sess = default(AsmSession)
+      arena = default(Arena)
+      result.timings.viaFile = true
+    try:
+      let tAsm = getMonoTime()
+      # `singleThread`: the guest's `localErr`, current-exception and allocator
+      # region are all `{.threadvar.}`, and `layInMemory` REFUSES an image that
+      # still has thread-locals. Evaluations are serialized, so a thread-local
+      # is exactly a global here.
+      if attempt == 0:
+        # The pool is read BEFORE the move, exactly as `openFileSession` reads
+        # it off the buffer it parsed: it is the one pool every foreign decl is
+        # interned into, and it has to outlive the buffer it came from.
+        sess = openSession(mainPool, backendDir, mainSuffix,
+                           debugInfo = false, singleThread = true)
+        haveSession = true
+        sess.addMainModule(move mainAsm.code)
+      else:
+        # arkham again rather than a copy of the buffer above: a `TokenBuf` is
+        # not copyable, the first attempt consumed it, and a second lowering of
+        # one module costs a few milliseconds on a path taken once in the whole
+        # corpus.
+        let mainAsmFile = backendDir / mainSuffix & AsmExt
+        emitAsmFor(e, mainCNif, mainAsmFile, result.timings.arkhamRuns)
+        sess = openFileSession(mainAsmFile, debugInfo = false,
+                               singleThread = true)
+        haveSession = true
+      sess.declare()
+      sess.beginEmit()
+      sess.emitTopLevel()
+      sess.emitRoots()
+      sess.finishCode()
+      result.timings.assembleMs = (getMonoTime() - tAsm).inNanoseconds.float / 1e6
 
-    # No `synthesizeProcessEntry`: that stub turns a kernel's process start into
-    # a C call, and there is already a process here.
-    let tLay = getMonoTime()
-    arena = reserveArena()
-    haveArena = true
-    img = loadImage(sess.ctx, arena)
-    result.timings.layMs = (getMonoTime() - tLay).inNanoseconds.float / 1e6
-  except AsmError as ex:
-    result.reason = "nifasm: " & ex.msg
-    if haveArena: releaseArena arena
-    if haveSession: sess.closeSession()
-    return
-  except CatchableError as ex:
-    result.reason = "nifasm: " & ex.msg
-    if haveArena: releaseArena arena
-    if haveSession: sess.closeSession()
-    return
-  except Defect as ex:
-    result.reason = "nifasm: " & ex.msg
+      # No `synthesizeProcessEntry`: that stub turns a kernel's process start
+      # into a C call, and there is already a process here.
+      let tLay = getMonoTime()
+      arena = reserveArena()
+      haveArena = true
+      img = loadImage(sess.ctx, arena)
+      result.timings.layMs = (getMonoTime() - tLay).inNanoseconds.float / 1e6
+      laid = true
+    except AsmError as ex:
+      lastReason = "nifasm: " & ex.msg
+    except CatchableError as ex:
+      lastReason = "nifasm: " & ex.msg
+    except Defect as ex:
+      lastReason = "nifasm: " & ex.msg
+  if not laid:
+    result.reason = lastReason
     if haveArena: releaseArena arena
     if haveSession: sess.closeSession()
     return
@@ -539,4 +581,5 @@ proc timingLine*(r: EngineResult; label: string): string =
     "ms total=" & formatFloat(r.timings.totalMs, ffDecimal, 2) &
     "ms code=" & $r.timings.codeLen &
     "B data=" & $r.timings.dataLen &
-    "B ext=" & $r.timings.externals
+    "B ext=" & $r.timings.externals &
+    (if r.timings.viaFile: " viaFile" else: "")

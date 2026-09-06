@@ -1,0 +1,162 @@
+B2 — the Leng engine behind `executeExpr`
+=========================================
+
+Branch `jit/b2` (nimony) over `fast-devloop` at 9744087a; `../nativenif` on
+`jit/b1` + two commits (015dcbb, 3d20d5c), pinned in `src/nativenif.commit`.
+
+Machine: macOS 26.6.2, Apple M5, arm64. Nim 2.2.10, Apple clang 21.0.0.
+
+  CAVEAT ON EVERY WALL-CLOCK NUMBER BELOW: this machine was running four other
+  compiler agents throughout. Load average moved between 14 and 26 while these
+  were taken, against the idle machine P0a's 0.91 s forced-tmyops figure was
+  measured on. The two modes were always measured back to back under the same
+  load, so the RATIOS are sound and the absolute numbers are pessimistic.
+
+
+1. Per-evaluation engine time (the gate: <= 30 ms)
+-------------------------------------------------
+
+`bin/nimony c --verbose --ctfe:engine`, one line per evaluation. "arkham" is
+Leng -> asm-NIF for every module that was not already cached; "assemble" is
+nifasm's declare/emit/finishCode over the whole module set; "lay" is
+`layInMemory`; "bind" is `bindExternals` + `mprotect` + icache; "run" is the
+guest.
+
+  tests/nimony/consteval/tmyops.nim, COLD nimcache (5 evaluations)
+
+    arkham  assemble  lay   bind  run   TOTAL   modules run/cached
+    19.05     7.52   0.08   0.03  0.14  26.93   8 / 0
+     4.72     7.20   0.09   0.03  0.14  12.26   2 / 6
+    18.62     7.16   0.08   0.03  0.18  26.14   8 / 0
+     6.83     6.91   0.09   0.03  0.14  14.08   4 / 4
+     3.51     6.62   0.08   0.03  0.13  10.45   1 / 7
+
+  tests/nimony/consteval/tconstseq.nim into the SAME nimcache (5 evaluations)
+
+    21.36     7.67   0.08   0.02  0.15  29.41   8 / 0
+     3.89     7.58   0.09   0.02  0.14  11.81   1 / 7
+     4.03     7.83   0.08   0.02  0.16  12.24   1 / 7
+     0.87     7.26   0.08   0.02  0.14   8.47   1 / 0
+     4.17     7.54   0.09   0.03  0.17  12.08   1 / 7
+
+  Ten new evaluations: min 8.47 ms, median 12.25 ms, max 29.41 ms.
+  GATE MET — every evaluation is under 30 ms, including the ones that had to
+  lower the whole eight-module stdlib closure themselves.
+
+  Image: ~25-28 KB of code, ~13 KB of data, 8 external symbols, every time.
+
+  Where the time is: arkham. `assemble` is a flat ~7.5 ms and everything after
+  it is noise (lay 0.08, bind 0.03, run 0.15). The spread in the totals is
+  entirely the arkham column, which is why `<nimcache>/asmcache/` matters:
+  1 module lowered instead of 8 turns a 27 ms evaluation into a 12 ms one.
+
+  For comparison, B1's file-path measurement of the same work (bench/results/
+  2026-09-06/b1_nativenif.md): arkham 30.70 ms as 8 processes (12.1 ms of that
+  the spawn floor alone), assemble+load+run 7.8 ms, `nifasm -o:prog` 18.85 ms,
+  and the C-backend sub-compile 450-490 ms.
+
+
+2. tests/nimony/consteval/tmyops.nim (5 evaluations)
+---------------------------------------------------
+
+Same nimcache, in this order; `bench/ctfe_latency.sh`'s scenarios by hand.
+
+    scenario   --ctfe:subprocess   --ctfe:engine   ratio
+    cold             3.319 s           1.262 s     2.6x
+    warm             0.015 s           0.018 s     --      (memo, no work)
+    edit             0.095 s           0.114 s     --      (memo, no work)
+    forced (-f)      1.857 s           1.026 s     1.8x
+
+  A second sample of `forced` alone, taken while the load average was 14-16:
+  subprocess 2.104 / 5.489 / 2.939 s, engine 1.159 / 0.933 / 1.393 s.
+
+  So the engine's forced tmyops is ~1.0-1.2 s against a same-machine
+  subprocess baseline of ~1.9-2.9 s. P0a recorded 0.91 s for this scenario on
+  an idle machine; the engine is in that neighbourhood under four times the
+  load, and the subprocess path is not.
+
+  `warm` and `edit` are unchanged BY DESIGN: P0a's memo answers both without
+  running anything, and the engine never gets asked.
+
+
+3. bench/ctfe_bench.nim via bench/ctfe_latency.sh (14 evaluations)
+-----------------------------------------------------------------
+
+    scenario   --ctfe:subprocess   --ctfe:engine   ratio
+    cold             7.287 s           1.928 s     3.8x
+    warm             0.025 s           0.019 s     --
+    edit             0.203 s           0.163 s     --
+    forced (-f)      3.330 s           2.229 s     1.5x
+
+  An earlier sample under heavier load: cold 9.977 s -> 3.110 s (3.2x),
+  edit 0.359 s -> 0.226 s, forced 6.472 s -> 4.219 s.
+
+  The `nifmake-report` lines are identical between the two modes for the OUTER
+  build (cold: `nifler=32 nimsem=6`, then `cc=6 dceEmit=6 dceLive=1 hexer=1
+  lengc=6 link=1`) — the engine changes what the sub-programs cost, not what
+  the program itself costs.
+
+
+4. What the engine does to a sub-program's artifacts
+---------------------------------------------------
+
+One `const` (tests/ctfe_engine/cases/tsimpleconst.nim), counted inside the
+sub-program directories only:
+
+    --ctfe:subprocess   8 object files,  0 .asm.nif
+    --ctfe:engine       0 object files,  7 .asm.nif
+
+  No C compiler and no linker run for an evaluation the engine takes. This is
+  asserted by `tests/ctfe_engine`.
+
+
+5. The corpus: what went through the engine
+-------------------------------------------
+
+Every `.nim` in tests/nimony/consteval compiled with `--ctfe:engine --verbose`
+into one shared nimcache:
+
+    47 evaluations, 47 through the engine, 0 fallbacks to the subprocess.
+
+  One of them (`tconstfloat`'s first, and only when the nimcache already holds
+  the earlier tests' artifacts) is refused by nifasm when arkham's `TokenBuf`
+  is handed to `addMainModule` directly:
+
+    nifasm: bitabs.nim(169, 5) `idx < t.vals.len`
+
+  The same `.c.nif` files assemble and run correctly through `bin/arkham` +
+  `bin/nifrun`, so this is the in-memory handoff and not a program nifasm
+  cannot assemble. The engine therefore retries once through `.asm.nif` +
+  `openFileSession` — the path nifasm's whole corpus exercises — before giving
+  up, and the `--verbose` line says `viaFile` when it did:
+
+    [ctfe-engine] tco351B39... arkham=34.68ms (9 run, 0 cached, 8 modules)
+      assemble=13.42ms lay=0.13ms bind=0.03ms run=0.19ms total=52.87ms
+      code=46800B data=13264B ext=8 viaFile
+
+  Cost of the retry: one extra arkham run on one evaluation in the corpus.
+  This is the only known in-memory-vs-file divergence and it is unexplained;
+  see notes/b2.md.
+
+
+6. Tests
+--------
+
+    tests/ctfe_diff   18 file(s), 46 artifact(s), 0 difference(s)
+                      for BOTH pairs: --vfs:disk vs --vfs:memory+spill, and
+                      --ctfe:subprocess vs --ctfe:engine
+    tests/ctfe_engine all checks passed (no backend ran; forced fallback still
+                      correct; runaway const is a budget diagnostic in ~2.3 s)
+    hastur tests/nimony               793 / 793 (default, --ctfe:subprocess)
+    hastur --forward:--ctfe:engine tests/nimony
+                                      793 / 793
+    hastur test tests/incremental     16/16 + 2/2, and again under
+                                      --vfs:memory+spill
+    hastur boot                       stages 2 and 3 byte-identical
+    hastur tiers native               0 / 27 bootstrap regressions in 104.44s
+
+  `hastur boot` reports `stage size diff: nimsem (5726232 vs 3020472)` between
+  stage 0 and stage 1. That is not drift: stage 0 is the host-Nim nimsem WITH
+  the engine linked in, stage 1 onward are nimony-compiled and carry
+  `-d:nimonyEngine` nowhere. The self-hosted compiler has no engine, which is
+  the conservative answer for this phase.

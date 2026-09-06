@@ -697,16 +697,21 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   var noAdditional = nifcore.createTokenBuf(1)
   runPlugin(c, dest, info, pluginName, input, noAdditional)
 
-proc buildEvalProgram(file, nimcachePath, commandLineArgs: string):
-    tuple[output: string, exitCode: int] =
-  ## `nimony <forwarded args> --nimcache:<dir> s <sfx>.p.nif`. What that
-  ## produces depends on the forwarded `--ctfe`: under `subprocess` the whole
-  ## graph down to the linked binary, under `engine` only the frontend and the
-  ## analysis graph, so the `.c.nif` files exist and nothing below them ran
-  ## (`deps.buildGraph`). Compilation keeps the outer cwd -- nimcache paths are
-  ## relative to the invoking compile.
+proc buildEvalProgram(file, nimcachePath, commandLineArgs: string;
+                      analysisOnly = false): tuple[output: string, exitCode: int] =
+  ## `nimony <forwarded args> --nimcache:<dir> s <sfx>.p.nif`, the whole graph
+  ## down to the linked binary — unless `analysisOnly`, which adds
+  ## `--ctfe-analysis-only` and stops it once every `.c.nif` exists, because the
+  ## engine in THIS process is about to run those instead (`deps.buildGraph`).
+  ##
+  ## The flag is passed here rather than inferred from `--ctfe:engine` inside
+  ## the child: a macro plugin is built through the very same
+  ## `nimony s <name>.p.nif` spelling and genuinely needs its executable.
+  ## Compilation keeps the outer cwd — nimcache paths are relative to the
+  ## invoking compile.
   let nimonyExe = findTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
+    (if analysisOnly: " --ctfe-analysis-only" else: "") &
     " --nimcache:" & quoteShell(nimcachePath) &
     " s " & quoteShell(file)
   try:
@@ -981,13 +986,12 @@ when defined(nimonyEngine):
 
   proc evalThroughEngine(c: var SemContext; m: EvalMemo):
       tuple[output: string, exitCode: int, fellBack: bool] =
-    ## Build only what the engine consumes, then run it. `--ctfe:engine` is
-    ## already on `c.commandLineArgs` (it forwards like `--cc`), so the inner
-    ## `nimony s` stops after the analysis graph without being told twice.
+    ## Build only what the engine consumes, then run it.
     result = (output: "", exitCode: 0, fellBack: false)
     let (buildOut, buildCode) = buildEvalProgram(m.progFile,
                                                  c.g.config.nifcachePath,
-                                                 c.commandLineArgs)
+                                                 c.commandLineArgs,
+                                                 analysisOnly = true)
     if buildCode != 0:
       # A sub-program that does not COMPILE fails the same way in both modes;
       # falling back would only compile it again to watch it fail again.
