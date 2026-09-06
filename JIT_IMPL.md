@@ -689,4 +689,5 @@ machine, with one script. The rule, from 2026-09-06 on:
 | A2b | planned | |
 | A2c | planned | |
 | B1 (nativenif half) | done on `../nativenif` branch `jit/b1` (10 commits from pin d0781a48): `generateAsmBuf`, `AsmSession`/`emitRoots`, `AsmError`, `image/memory.nim` + `hostfixup.nim`, `core/hostsyms.nim`, `hostrun.nim` + `tools/nifrun`, `--dev-single-thread`; refactor gate byte-identical; 234/234 memory-vs-file code hash checks; CTFE sub-program runs from memory in ~8 ms with byte-identical `.out.nif` (reproduced by the integrator). Not yet: x64 `&threadvar` lowering (arkham side), Windows `runImage`, the nimony-side `nimony r`, re-pin of `src/nativenif.commit` | nativenif e368478 |
-| B2–B5 | planned | |
+| B2 | merged (`src/nimony/engine.nim` behind `-d:nimonyEngine`, `--ctfe:subprocess\|engine` (default subprocess), `--ctfe-budget`, `NIMONY_CTFE_ENGINE=off`; `--ctfe-analysis-only` stops the sub-compile after `.c.nif`; `<nimcache>/asmcache/`; median 12 ms per new evaluation; 47/47 corpus evaluations through the engine, 0 fallbacks, 0 differences; pin `src/nativenif.commit` -> 3d20d5c (jit/b1 + path fix + `runImage` budget). Open: one `bitabs` assertion on the in-memory `addMainModule` handoff worked around via `.asm.nif`; per-proc code cache and `emitRoots` closure not done) | merged from jit/b2 |
+| B3–B5 | planned | |

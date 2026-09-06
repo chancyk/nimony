@@ -27,6 +27,7 @@
 #   to its bin/). Tests and bench sources are taken from THIS checkout so both
 #   toolchains compile identical inputs.
 #
+# EXTRA="<flags>" adds nimony flags to every compile (e.g. EXTRA=--ctfe:engine).
 # Prints a table on stdout; everything else goes to a scratch directory that is
 # removed on exit. Set KEEP=1 to keep it.
 
@@ -39,6 +40,7 @@ runs=${3:-3}
 nimony="$root/bin/nimony"
 work=${TMPDIR:-/tmp}/devloop_bench.$$
 export NIMONY_VFS=${NIMONY_VFS:-disk}
+extra=${EXTRA:-}   # extra nimony flags for every compile, e.g. EXTRA=--ctfe:engine
 
 if [ ! -x "$nimony" ]; then
   echo "devloop_bench: $nimony not found" >&2
@@ -91,41 +93,41 @@ measure() {
 hello="$work/hello.nim"
 printf 'import std/syncio\necho "hello"\n' > "$hello"
 hc="$work/nc_hello"
-rm -rf "$hc"; "$nimony" c --silentMake --nimcache:"$hc" "$hello" >/dev/null 2>&1
-measure hello.forced   "$runs" ":" "$nimony" c -f --silentMake --nimcache:"$hc" "$hello"
-measure hello.nochange "$runs" ":" "$nimony" c --silentMake --nimcache:"$hc" "$hello"
-measure hello.edit     "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" c --silentMake --nimcache:"$hc" "$hello"
+rm -rf "$hc"; "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello" >/dev/null 2>&1
+measure hello.forced   "$runs" ":" "$nimony" c $extra -f --silentMake --nimcache:"$hc" "$hello"
+measure hello.nochange "$runs" ":" "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello"
+measure hello.edit     "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello"
 
 # ---- CTFE: tmyops (5 consts) ------------------------------------------------
 ctfe="$work/tmyops.nim"
 cp "$here/tests/nimony/consteval/tmyops.nim" "$ctfe"
 cc="$work/nc_ctfe"
-measure ctfe.cold   "$runs" "rm -rf $cc" "$nimony" c --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.warm   "$runs" ":" "$nimony" c --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.edit   "$runs" "printf 'echo \"edit\"\n' >> $ctfe" "$nimony" c --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.forced "$runs" ":" "$nimony" c -f --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.cold   "$runs" "rm -rf $cc" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.warm   "$runs" ":" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.edit   "$runs" "printf 'echo \"edit\"\n' >> $ctfe" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.forced "$runs" ":" "$nimony" c $extra -f --silentMake --nimcache:"$cc" "$ctfe"
 
 # ---- CTFE: bench/ctfe_bench.nim (14 consts) --------------------------------
 if [ -f "$here/bench/ctfe_bench.nim" ]; then
   cb="$work/ctfe_bench.nim"
   cp "$here/bench/ctfe_bench.nim" "$cb"
   bc="$work/nc_bench"
-  measure bench.cold "$runs" "rm -rf $bc" "$nimony" c --silentMake --nimcache:"$bc" "$cb"
-  measure bench.edit "$runs" "printf 'echo \"edit\"\n' >> $cb" "$nimony" c --silentMake --nimcache:"$bc" "$cb"
+  measure bench.cold "$runs" "rm -rf $bc" "$nimony" c $extra --silentMake --nimcache:"$bc" "$cb"
+  measure bench.edit "$runs" "printf 'echo \"edit\"\n' >> $cb" "$nimony" c $extra --silentMake --nimcache:"$bc" "$cb"
 fi
 
 # ---- stdlib-wide: tall.nim -------------------------------------------------
 tall="$here/tests/nimony/stdlib/tall.nim"
 sc="$work/nc_stdlib"
-measure stdlib.cold   "$runs" "rm -rf $sc" "$nimony" c --silentMake --nimcache:"$sc" "$tall"
-measure stdlib.forced "$runs" ":" "$nimony" c -f --silentMake --nimcache:"$sc" "$tall"
+measure stdlib.cold   "$runs" "rm -rf $sc" "$nimony" c $extra --silentMake --nimcache:"$sc" "$tall"
+measure stdlib.forced "$runs" ":" "$nimony" c $extra -f --silentMake --nimcache:"$sc" "$tall"
 # strutils edit: append a harmless proc to the TOOLCHAIN's copy (that is the one
 # nimony compiles), rebuild, and restore the file byte for byte afterwards.
 su="$root/lib/std/strutils.nim"
 cp "$su" "$work/strutils.orig"
-measure stdlib.edit "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $su" "$nimony" c --silentMake --nimcache:"$sc" "$tall"
+measure stdlib.edit "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $su" "$nimony" c $extra --silentMake --nimcache:"$sc" "$tall"
 cp "$work/strutils.orig" "$su"
 # the trailing runs left tall's cache built against the edited strutils; leave it.
 
 echo
-echo "label: $label   toolchain: $root   runs: $runs (median)   NIMONY_VFS=$NIMONY_VFS"
+echo "label: $label   toolchain: $root   runs: $runs (median)   NIMONY_VFS=$NIMONY_VFS   EXTRA=$extra"
