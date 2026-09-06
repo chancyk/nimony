@@ -102,6 +102,12 @@ compiled by **nimony** as well as by Nim. That shapes the implementation:
   `when defined(nimony)` style `vfs.nim` uses.
 - Floats are avoided end to end (integer EWMA, integer millisecond
   formatting), which also makes the NIF round trip exact.
+- `{.discardable.}` is not implemented: nimony reads a trailing call as the
+  proc's result expression and reports the type mismatch. Ignored results are
+  spelled `discard`.
+
+None of this is caught by `nim c`; `hastur boot` is the only test that compiles
+these two files with nimony, so it has to be run for every edit to them.
 
 ## 6. Deviations from the interface block in `JIT_IMPL.md`
 
