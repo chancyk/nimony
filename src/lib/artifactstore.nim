@@ -166,7 +166,6 @@ type
     generation: int64  ## `vfsNow()` at write time; the memory mtime
     diskMtime: int64   ## the mtime of the written-through copy, 0 if none
     onDisk: bool
-    cls: PathClass
 
   StoreStats* = object
     entries*: int
@@ -413,18 +412,26 @@ proc spillEntry(path: string; p: Payload) =
   inc store.stats.spills
 
 proc dropLargest(): bool =
-  ## Evict one entry: the largest that already has (or can be given) a disk
-  ## copy. Returns false when there is nothing left to evict, which is how the
+  ## Evict one entry. Two ranks, then size within a rank: an entry that is
+  ## already on the disk costs nothing to shed, while a memory-only one has to
+  ## be written out first, so the free ones go first however large the others
+  ## are. Returns false when there is nothing left to evict, which is how the
   ## budget stops being enforced rather than becoming a failure.
+  ##
+  ## Size is the whole ranking here. A1d replaces it with the ledger's
+  ## "cheapest to reload": never spill what costs less to recompute.
   var victim = ""
   var victimSize = -1
+  var victimFree = false
   for path, p in store.entries:
-    if p.bytes.len > victimSize:
-      # Under `spMemory` a memory-only entry stays: dropping it would lose the
-      # only copy, and spilling it is what `memory+spill` is named after.
-      if p.onDisk or store.policy != spMemory:
-        victim = path
-        victimSize = p.bytes.len
+    # Under `spMemory` a memory-only entry stays put: dropping it would lose
+    # the only copy, and writing it out is what `memory+spill` is named after.
+    if not p.onDisk and store.policy == spMemory: continue
+    if victimSize < 0 or (p.onDisk and not victimFree) or
+       (p.onDisk == victimFree and p.bytes.len > victimSize):
+      victim = path
+      victimSize = p.bytes.len
+      victimFree = p.onDisk
   if victimSize < 0: return false
   let p = entryOf(victim)
   if p == nil: return false
@@ -441,8 +448,7 @@ proc enforceBudget() =
 
 # --- the entry table ------------------------------------------------------
 
-proc putEntry(path: string; content: string; cls: PathClass;
-              onDisk: bool; diskMtime: int64) =
+proc putEntry(path, content: string; onDisk: bool; diskMtime: int64) =
   ## Install a NEW payload. The old one, if any, is left to whatever blobs
   ## still hold it.
   let old = entryOf(path)
@@ -450,7 +456,7 @@ proc putEntry(path: string; content: string; cls: PathClass;
     store.stats.residentBytes -= old.bytes.len
     dec store.stats.entries
   let p = Payload(bytes: content, repr: erText, generation: nextGeneration(),
-                  diskMtime: diskMtime, onDisk: onDisk, cls: cls)
+                  diskMtime: diskMtime, onDisk: onDisk)
   store.entries[path] = p
   inc store.stats.entries
   store.stats.residentBytes += content.len
@@ -468,7 +474,7 @@ proc storeWrite(path, content: string) {.nimcall.} =
     diskMtime = store.prevMtime(path)
     onDisk = true
     inc store.stats.writeThroughs
-  putEntry(path, content, cls, onDisk, diskMtime)
+  putEntry(path, content, onDisk, diskMtime)
 
 proc storeRead(path: string): string {.nimcall.} =
   inc store.stats.reads
@@ -482,7 +488,7 @@ proc storeRead(path: string): string {.nimcall.} =
   result = store.prevRead(path)
   # Admit it. It came from disk, so it is on disk, and evicting it later is
   # free. `classifyPath` still decides whether a later write goes through.
-  putEntry(path, result, classifyPath(path), true, store.prevMtime(path))
+  putEntry(path, result, true, store.prevMtime(path))
 
 proc storeOpenMmap(path: string): VfsBlob {.nimcall.} =
   inc store.stats.mmaps
@@ -550,13 +556,6 @@ proc installArtifactStore*(policy: StorePolicy;
   mtimeRelay = storeMtime
   nowRelay = storeNow
   removeRelay = storeRemove
-
-proc installArtifactStore*(policyName: string; budgetMB: int): bool =
-  ## The CLI form. False means the name was not a policy.
-  var p = spDisk
-  if not parseStorePolicy(policyName, p): return false
-  installArtifactStore(p, (if budgetMB > 0: budgetMB else: DefaultBudgetMB) * 1024 * 1024)
-  result = true
 
 proc uninstallArtifactStore*() =
   ## Put the captured relays back and forget every entry. Only the unit tests
@@ -694,7 +693,10 @@ proc spillTo*(dir: string) =
   ## Write a copy of every resident entry into `dir`, named by the artifact's
   ## own filename. For `--dump`-style inspection of a memory-only build: the
   ## point is to be able to look at every artifact that exists, which is the
-  ## debugging story JIT.md 5.1 asks the store to keep.
+  ## debugging story JIT.md 5.1 asks the store to keep. Flat on purpose --
+  ## two entries whose basenames collide (a module's `.c.nif` at the cache
+  ## root and its twin in a backend directory) land on one file, which is the
+  ## right trade for a dump you read by name.
   if not store.installed: return
   ensureDir(dir)
   for path, p in store.entries:

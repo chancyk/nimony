@@ -170,3 +170,127 @@ both, the flag winning, at startup.
   `mode` parameter defaulting to `""` so the A1a agent's edits elsewhere in
   the file stay mergeable.
 - `tests/vfs/` is new: host-Nim unit tests over `artifactstore.nim` directly.
+
+---
+
+# Phase A1b — what was built
+
+## The store
+
+`src/lib/artifactstore.nim`. One `ArtifactStore` per process, held in a
+module-level `var` because the relays it installs are `nimcall` procs with no
+context parameter — that is the shape `vfs.nim` defines, and everything else
+in the module is threaded through the object explicitly.
+
+`installArtifactStore(policy, budgetBytes)` captures all seven relays and
+installs wrappers for all seven. `spDisk` installs nothing at all.
+
+| policy | `--vfs:` | what it does |
+|---|---|---|
+| `spDisk` | `disk` | no adapter; today's behaviour exactly |
+| `spMemory` | `memory` | resident entries; ephemeral paths never reach the disk; the budget drops rather than spills them |
+| `spMemorySpill` | `memory+spill` | `memory`, plus `storeFlush` at the end of each tool's `main` and spilling under budget pressure |
+| `spVerify` | `verify` | everything written through, every memory-answered read compared against the disk copy |
+
+`--vfs-budget:<MB>` (default 512) caps residency. Over the budget the store
+evicts, preferring an entry that is already on the disk (free) over one that
+has to be written out first, and largest-first within each rank. A1d replaces
+the size ranking with the ledger's "cheapest to reload".
+
+## The write-through table
+
+`crossProcessSuffixes` and `crossProcessDirs` document what the pipeline hands
+to another process:
+
+| group | suffixes |
+|---|---|
+| nifler -> nimsem | `.p.nif` `.p.deps.nif` `.pc.nif` `.pc.deps.nif` `.cfg.nif` |
+| nimsem -> nimsem/hexer/deps | `.s.nif` `.s.idx.nif` `.s.deps.nif` `.sc.nif` `.sc.idx.nif` `.sc.deps.nif` |
+| hexer -> dce -> shoggoth -> lengc | `.x.nif` `.dce.nif` `.live.nif` `.c.nif` `.oc.nif` `.types.nif` |
+| CTFE result and P0a's read log | `.out.nif` `.out.nif.reads` |
+| nimony -> nifmake | `.build.nif` (covers `.final`/`.final1`/`.final2`/`.doc`/`.exec`) |
+| native backend, linker | `.asm.nif` `.in.nif` `.linkmanifest.nif` |
+| not our tools at all | `.c` `.cpp` `.h` `.o` `.obj` `.ll` `.s` `.a` `.lib` `.dylib` `.so` `.dll` `.exe` `.wasm` |
+| whole directories | `ocache/` (P0b), `ledger/` (A1a) |
+
+`classifyPath` does **not** decide from that list. It answers
+`pcCrossProcess` by default and consults `addEphemeralSuffix` — empty today —
+for exceptions, and a documented suffix outranks a declaration. Getting the
+default the other way round would turn a forgotten suffix into a silently
+stale build (JIT.md 10); this way it costs a write nobody needed.
+
+## The `runNodeRelay` seam
+
+```nim
+type
+  RunNodeStatus* = enum
+    RunSpawn, RunHandledOk, RunHandledFailed
+
+  RunNodeRequest* = object
+    name*: string        ## the `cmd` name from the DAG: `nifler`, `cc`, …
+    command*: string     ## the fully expanded shell line
+    inputs*, outputs*, args*: seq[string]
+    baseDir*: string
+
+var runNodeRelay*: proc (req: RunNodeRequest): RunNodeStatus {.nimcall.} =
+  spawnEverything
+```
+
+Both paths of `runDag` call `offerNode`, which returns `RunSpawn` without
+building the request while the relay is still the default. The sequential path
+turns `RunSpawn` into `executeCommand`; the parallel path adds the node to the
+batch `execProcesses` runs, and a handled node is counted as an executed
+command so `--report` and `--profile` keep their meaning.
+
+## Call sites converted
+
+| file | what | count |
+|---|---|---|
+| `src/nifler/nifler.nim` | the re-parse and re-config staleness checks | 8 |
+| `src/nifler/configcmd.nim` | `sourcesChangedImpl` | 3 |
+| `src/nimony/semos.nim` | `lastModTimeOrStale`, `parseFile`, `writeFileIfChanged`, the `writenif` precompile probe | 7 |
+| `src/nimony/programs.nim` | `needsRecompile` | 3 |
+| `src/nimony/deps.nim` | `getLastModTime`, `execNifler`, `loadDepsFile`'s probe, the ocache digest, the cached-config memo | 8 |
+| `src/nimony/macro_plugin.nim` | the plugin's `.p.deps.nif` and `macro_in_*.nif` | 2 |
+| `src/hexer/intramodinliner.nim` | `findForeignFile` | 2 |
+| `src/lengc/nifmodules.nim` | the foreign-module probe | 1 |
+| `src/lengc/shoggoth/optdriver.nim` | `.c.nif` in, `.oc.nif` out | 2 |
+
+36 expressions in 9 files. Everything else in the audit stayed direct:
+directories (~12 sites), executables (~6), user sources and plugin-declared
+data files (~20), debug-only dumps (~8), `nifmake`'s `generateMakefile`, and
+the ~14 process-execution calls. The header of `artifactstore.nim` carries
+that list with the reason per group.
+
+## Deviations from the plan, and why
+
+- **`--vfs` is not spliced into the `.build.nif`.** `JIT_IMPL.md` says
+  "forwarded to every tool". Doing that through `commandLineArgs` would put
+  the flag into the emitted build graph, and two modes would then produce
+  different `*.build.nif` bytes — which is precisely what the phase's gate
+  forbids. The flag is parsed in `cli.parseCommonOption` as specified, sets
+  `forwardArg = false`, and the resolved policy is exported as `NIMONY_VFS` /
+  `NIMONY_VFS_BUDGET`. Children inherit it: nifmake, and through it nifler,
+  nimsem, hexer, lengc, and the nested `nimony s` of a CTFE sub-compile. Each
+  tool also accepts the flag directly, which is what the tests drive.
+- **`spillTo(dir)` is flat.** Entries are keyed by absolute path and the dump
+  is meant to be read by name.
+- **A blob is not served over an mmap miss.** `storeOpenMmap` answers from an
+  entry the store already holds and otherwise lets the disk backend map the
+  file. Copying the bytes in to hand back a pointer into them would cost more
+  than it saves: JIT.md 3.3 measures mmap'd reads at ~0.1 ms per MB, and "disk
+  is not the cost".
+- **`bytesPtr` returns nil under nimony.** `hastur boot` compiles nimony,
+  nimsem and hexer with nimony itself, and nimony rejects `addr s[0]`. A
+  nimony-built compiler therefore installs the store but never serves an mmap
+  from it. Every entry is written through today, so that is a missed cache
+  hit and never a wrong answer.
+
+## What is deliberately not here
+
+- `memory` without write-through for anything: there is nothing to apply it to
+  until phases share a process. The mechanism, the table and the tests exist;
+  A2b and A2c populate `addEphemeralSuffix`.
+- `erBif` and `erTokens` are declared and unused. A2 fills them.
+- The ledger fields on an entry, the spill decision driven by
+  `load + parse < produce`, and `--stats` are A1d.
