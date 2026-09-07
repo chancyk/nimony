@@ -25,7 +25,8 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 ## In flight
 
-- **F2** (`jit/f2`, worktree under `.claude/worktrees/`): hexer's temp
+- **B3d** (`jit/b3d`, nativenif clone `/tmp/b3d/nativenif` branch `jit/b3d-native`): per-symbol blob validity in nifasm and per-proc asm splicing in arkham. On merge: fetch the nativenif branch into `/Users/chanc/Projects/nativenif`, re-pin `src/nativenif.commit`, run the routine, re-take the headline.
+- (merged) **F2** (`jit/f2`, worktree under `.claude/worktrees/`): hexer's temp
   counters (`xelim.Pass.nextTemp`, `intramodinliner.InlinerCtx.counter`, ...)
   scoped per top-level declaration. Gate: `decl-stability`'s `tempadd`
   phase drops from 18 to 1 changed lowering-output declarations, and the
@@ -53,7 +54,7 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 | | fork point | branch |
 |---|---|---|
-| live edit in `sem.nim`, rebuild | 2.91 s / 4.15 s cpu / 117 MB | 1.35 s / 1.39 s / 113 MB |
+| live edit in `sem.nim`, rebuild | 2.68 s / 3.87 s cpu / 117 MB | 1.26 s / 1.29 s / 114 MB (after F2) |
 | dead-proc edit (old headline) | 2.31 / 3.59 / 116 | 0.71 / 0.70 / 101 |
 | cold | 5.61 / 14.6 / 116 | 5.37 / 13.8 / 147 |
 

@@ -172,3 +172,20 @@ Conclusion: `--threads:off` for the tools that never thread (hexer, lengc,
 nifler, the nimony driver) is a 6 % item; nimsem needs threads for the
 engine's guest. The larger lever is in hexer's pipeline design (one copy of
 the module tree per pass), which is compiler work, not a cache trick.
+
+## Run 15: F2 (hexer's synthesized names per declaration) merged -- live edit, interleaved, 5 rounds, load ~12-17
+
+| sem.nim LIVE edit, rebuild | fork point | head | ratio |
+|---|---|---|---|
+| wall | 2.677 | 1.255 | 2.13x |
+| cpu | 3.866 | 1.292 | 2.99x |
+| peak rss | 117 MB | 114 MB | |
+
+F2 moved the live edit from 3 of 1785 changed lowering-output declarations
+to what hexer can prove (890 -> 3), but nifasm still records 627 fragments
+for `sem` because `blobcache.sameSource` validates per MODULE, and arkham
+still lowers the whole module; the wall gain from F2 alone is small
+(1.35 -> 1.26 s). The two next levers are therefore per-symbol blob
+validity in nifasm (627 -> ~3 stale) and per-proc splicing in arkham; after
+those, `dceLive` (0.39 s of whole-program liveness for a one-body edit)
+and the per-module sem re-check (0.44 s) are what is left.
