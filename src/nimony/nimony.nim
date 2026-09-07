@@ -77,9 +77,18 @@ Options:
   --silentMake              suppresses make output
   --profile                 print nifmake timing profile of executed commands
   --report                  print machine-readable per-command invocation
-                            counts on stdout (one line per nifmake call)
+                            counts on stdout (one line per build graph);
+                            `inproc=N` of those ran without a process
   --stats                   after build, print total LOC and module count
                             across the dep graph
+  --spawn:always|auto       `auto` (default) runs a build-graph node in this
+                            process when the cost ledger says a process is not
+                            worth it; `always` gives every node its own, which
+                            is the escape hatch and is implied by --vfs:disk
+  --jobs:N                  cap the per-graph-depth fan-out at N processes;
+                            --jobs:1 also runs the graph node by node
+  --inproc-k:N              a phase runs in this process while its estimated
+                            cost is under N spawn costs (default 3)
   --layout:FILE             native backend, bare-metal targets only: the BOARD
                             description (memory regions, stack slots, heap) that
                             arkham and nifasm build the image against. See
