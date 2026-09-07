@@ -15,6 +15,7 @@ import ".." / lib / nifreader
 from ".." / lib / nifcoreparse import parse
 import ".." / models / [tags]
 import nimony_model, decls, programs
+from semos import runNestedBuild, EvalBuildUnavailable
 
 type
   MacroPlugin* = object
@@ -276,7 +277,7 @@ proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
 
 proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
                          info: NifLineInfo;
-                         commandLineArgs: string): string =
+                         commandLineArgs: string; baseDir = ""): string =
   ## Build the plugin module straight from NIF (no Nim text round-trip), write
   ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
   ## entry point — same one CTFE uses in `semos.runEval`).
@@ -318,6 +319,19 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   # and tries to overwrite it — which on Windows fails because the outer
   # nimsem (currently paused waiting on this exec) still has it mmap'd.
   # Same rationale as `semos.runProgram` / `semos.prepareEval`.
+  # A2c: the same graphs in this process where a phase relay is installed. A
+  # macro plugin is an EXECUTABLE, so unlike a `const`'s sub-program this one
+  # still runs `lengc`, the C compiler and the linker -- what it stops paying
+  # for is the `nimony` process in front of them, and the second `deps` scan of
+  # the stdlib closure the caller has already walked.
+  let inproc = runNestedBuild(baseDir, progfile, nifcachePath, commandLineArgs,
+                              extraPath = srcLibPath, outFile = exePath)
+  if inproc != EvalBuildUnavailable:
+    if inproc != 0:
+      echo "Error compiling macro plugin for '", cleanSymbolName(pool.syms[macroSym]), "'"
+      return ""
+    return exePath
+
   let cmd = quoteShell(nimonyExe) & commandLineArgs &
             " --path:" & quoteShell(srcLibPath) &
             " --nimcache:" & quoteShell(nifcachePath) &

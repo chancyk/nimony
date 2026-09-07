@@ -19,6 +19,7 @@ when defined(nimony):
   {.feature: "untyped".}
 import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat, dirs, paths, algorithm, monotimes]
 import semos, nifconfig, nimony_model, semdata, langmodes
+from cli import parseCommonOption
 import ".." / gear2 / modnames
 when not defined(nimony):
   # The build-graph library, and with it the in-process scheduler. Gated
@@ -2320,6 +2321,7 @@ type
     report: bool
     profile: bool
     silent: bool
+    nested: bool               ## a build running INSIDE another compile
 
 proc inProcessMakeAvailable(): bool =
   ## Is the in-process scheduler in front of the DAG? `nimony`'s `main`
@@ -2332,7 +2334,7 @@ proc inProcessMakeAvailable(): bool =
     dag.relayInstalled()
 
 proc initMakeInvocation(nifmake, baseDir: string; flags: set[BuildFlag];
-                        rerun: bool; maxJobs: int): MakeInvocation =
+                        rerun: bool; maxJobs: int; nested = false): MakeInvocation =
   result = MakeInvocation(
     spawnPrefix: quoteShell(nifmake) &
       (if ForceRebuild in flags: " --force" else: "") &
@@ -2348,18 +2350,27 @@ proc initMakeInvocation(nifmake, baseDir: string; flags: set[BuildFlag];
     inProcess: inProcessMakeAvailable(),
     report: Report in flags,
     profile: Profile in flags,
-    silent: SilentMake in flags or Report in flags)
+    silent: SilentMake in flags or Report in flags,
+    nested: nested)
 
-proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int) =
+proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int): bool {.discardable.} =
   ## Run one build graph. Failure ends the compile with the same message the
   ## spawned form produced, so a caller cannot tell the two apart from the
   ## outside except by the process tree.
+  ##
+  ## A NESTED build (A2c: the sub-program of a compile-time evaluation, run
+  ## inside the very compiler that needs its result) is the one caller that
+  ## must not be ended by a failed graph: the spawned form of that build was a
+  ## child process whose non-zero exit code became the `const` site's error
+  ## message, and a `quit` here would turn a bad `const` into a dead compiler.
+  ## It gets `false` instead; every other caller keeps the `quit`.
+  result = true
   if not inv.inProcess:
     let progress =
       if inv.silent: ""
       else: "--progress:" & $lo & ":" & $hi & " "
     exec inv.spawnPrefix & progress & quoteShell(buildFile)
-    return
+    return true
 
   when not defined(nimony):
     # `--jobs:1` is sequential, not "one process at a time through
@@ -2402,12 +2413,14 @@ proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int) =
       # exactly the last `nifmake:`/`FAILURE:` lines, so the ordering is what
       # every `.msgs` golden of a failing compile depends on.
       stdout.flushFile()
+      if inv.nested: return false
       quit "FAILURE: build graph " & buildFile
 
-proc buildGraph*(config: sink NifConfig; project: string;
+proc buildGraphImpl(config: sink NifConfig; project: string;
     flags: set[BuildFlag];
     commandLineArgs, commandLineArgsLengc: string; moduleFlags: set[ModuleFlag]; cmd: Command;
-    passC, passL: string, executableArgs: string) =
+    passC, passL: string, executableArgs: string; nested: bool): bool =
+  result = true
   let nifler = findTool("nifler")
   let nifmake = findTool("nifmake")
   let forceRebuild = ForceRebuild in flags
@@ -2426,14 +2439,16 @@ proc buildGraph*(config: sink NifConfig; project: string;
     putEnv("CC", "gcc")
     putEnv("CXX", "g++")
   let nifmakeCommand = initMakeInvocation(nifmake, config.baseDir, flags,
-                                          rerun = false, maxJobs = makeJobs())
+                                          rerun = false, maxJobs = makeJobs(),
+                                          nested = nested)
   # A changed configuration invalidates every sem result, and now says so
   # directly instead of through a file the sem nodes pretended to read.
   # `--rerun`, not `--force`: the outputs must stay in place so nimsem's
   # OnlyIfChanged writes can still find a result unchanged and spare the
   # entire backend.
   let frontendCommand = initMakeInvocation(nifmake, config.baseDir, flags,
-                                           rerun = configChanged, maxJobs = makeJobs())
+                                           rerun = configChanged, maxJobs = makeJobs(),
+                                           nested = nested)
 
   # `nimony c` drives nifmake once for the frontend and once more for the
   # backend (or docs); `DoCheck` stops after the frontend. Hand each invocation
@@ -2441,7 +2456,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
   # indicator across the separate processes instead of restarting per phase.
   let twoPhase = cmd != DoCheck
 
-  runMake(frontendCommand, buildFilename, 0, if twoPhase: 50 else: 100)
+  if not runMake(frontendCommand, buildFilename, 0, if twoPhase: 50 else: 100):
+    return false
 
   if cmd == DoDoc:
     c = initDepContext(config, project, nifler, true, forceRebuild, moduleFlags, cmd)
@@ -2460,8 +2476,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
       if parent.len > 0 and parent != docOut:
         onRaiseQuit createDir(path(parent))
     let buildDocFilename = generateDocBuildFile(c)
-    runMake(nifmakeCommand, buildDocFilename, 50, 100)
-    return
+    return runMake(nifmakeCommand, buildDocFilename, 50, 100)
 
   if cmd != DoCheck:
     # Parse `.s.deps.nif`.
@@ -2488,7 +2503,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
     if useObjectCache:
       let analysisFile = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
                                                 fpAnalysis)
-      runMake(nifmakeCommand, analysisFile, 50, 60)
+      if not runMake(nifmakeCommand, analysisFile, 50, 60):
+        return false
       fillObjectCache(c, c.config.backendDirName(c.rootNode.files[0]),
                       commandLineArgsLengc, passC)
       if c.config.ctfeAnalysisOnly:
@@ -2501,7 +2517,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
         # The `Stats` block and the `DoRun` exec below are skipped with it:
         # nothing was built to report on, and a `.p.nif` sub-compile is never
         # `DoRun`.
-        return
+        return true
     var thisPhase = fpWhole
     if useObjectCache: thisPhase = fpCodegen
     let buildFinalFilename = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
@@ -2516,7 +2532,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
     let exeOutDir = exeOutPath.parentDir
     if exeOutDir.len > 0:
       onRaiseQuit createDir(path(exeOutDir))
-    runMake(nifmakeCommand, buildFinalFilename, 50, 100)
+    if not runMake(nifmakeCommand, buildFinalFilename, 50, 100):
+      return false
     if useObjectCache:
       publishObjectCache(c, c.config.backendDirName(c.rootNode.files[0]))
 
@@ -2574,3 +2591,163 @@ proc buildGraph*(config: sink NifConfig; project: string;
              quoteShell(c.config.wasmFile(c.rootNode.files[0], backend)) & executableArgs
       else:
         exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
+
+proc buildGraph*(config: sink NifConfig; project: string;
+    flags: set[BuildFlag];
+    commandLineArgs, commandLineArgsLengc: string; moduleFlags: set[ModuleFlag]; cmd: Command;
+    passC, passL: string, executableArgs: string) =
+  ## The driver's entry point. A failed graph ends the compile inside
+  ## `runMake`, so the `bool` is never anything but `true` here.
+  discard buildGraphImpl(ensureMove config, project, flags, commandLineArgs,
+                         commandLineArgsLengc, moduleFlags, cmd, passC, passL,
+                         executableArgs, nested = false)
+
+# ── A2c: the compile-time-evaluation sub-build, without the process ─────────
+#
+# `semos.runEval` used to compile a `const`'s sub-program by spawning
+# `nimony <forwarded args> --ctfe-analysis-only --nimcache:<nc> s <sfx>.p.nif`.
+# Since A2b that child ran every node of both its graphs in its own process
+# already (`inproc=5`, `inproc=10`), so what the spawn still bought was nothing
+# but a fresh set of frontend globals -- at the price of a process, its dyld
+# work and a second `deps` scan of a module closure the caller already knows.
+#
+# The two halves of doing it here instead:
+#
+# 1. **The child's state, rebuilt.** Everything the spawned form derived from
+#    its command line has to come out the same, because both forms write the
+#    same `<sfx>.build.nif` into the same nimcache and nifmake decides
+#    staleness from those bytes. `childArgs` below mirrors `nimony.nim`'s
+#    `handleCmdLine` + `compileProgram` for exactly the options that can reach
+#    a sub-compile: every nimony-specific option sets `forwardArg = false`, so
+#    `commandLineArgs` can only carry `--path`, `-d:release`/`-d:danger` and
+#    whatever `cli.parseCommonOption` forwards.
+# 2. **The caller's state, preserved.** That is `semos`' job, not this
+#    module's: see `takeFrontendState` there.
+
+proc splitForwardedArg(tok: string; key, val: var string) =
+  ## `--define:x` -> ("define", "x"). The forwarded args are built by
+  ## `nimony.nim`/`nimsem.nim` as `" --" & key & ":" & val` with a RAW value,
+  ## so there is no quoting to undo and no spaces to worry about -- the same
+  ## assumption `semos.subprocessCtfeArgs` already makes when it splits this
+  ## string on blanks.
+  key.setLen 0
+  val.setLen 0
+  var i = 0
+  while i < tok.len and tok[i] == '-': inc i
+  while i < tok.len and tok[i] != ':' and tok[i] != '=':
+    key.add tok[i]
+    inc i
+  if i < tok.len:
+    val = tok.substr(i+1)
+
+type
+  ChildArgs = object
+    ## What a spawned `nimony <commandLineArgs> s <project>` would hold after
+    ## its own option loop. Named fields rather than four `var` parameters so
+    ## the mirror of `handleCmdLine` reads as one thing.
+    config: NifConfig
+    moduleFlags: set[ModuleFlag]
+    forwarded: string      ## `commandLineArgs` as the child would rebuild it
+    forwardedLengc: string ## `commandLineArgsLengc`, derived the same way
+
+proc childArgs(baseDir, nimcachePath, commandLineArgs, extraPath, outFile: string;
+               analysisOnly: bool): ChildArgs =
+  result = ChildArgs(config: initNifConfig(baseDir), moduleFlags: {},
+                     forwarded: commandLineArgs, forwardedLengc: "")
+  var danger = false
+  var key = ""
+  var val = ""
+  for tok in commandLineArgs.split(' '):
+    if tok.len == 0 or tok[0] != '-': continue
+    splitForwardedArg(tok, key, val)
+    if key.len == 0: continue
+    var forwardArg = true
+    var forwardArgLengc = false
+    let keyNorm = normalize(key)
+    if keyNorm == "path" or keyNorm == "p":
+      result.config.paths.add val
+    elif (keyNorm == "define" or keyNorm == "d") and
+         (normalize(val) == "release" or normalize(val) == "danger"):
+      # `nimony.nim` handles these two before the common parser: they define
+      # the symbol AND imply the optimization level, and `danger` also turns
+      # every runtime check off, which is what `--flags` below carries.
+      result.config.addDefine val
+      result.config.optLevel = optSpeed
+      if normalize(val) == "danger": danger = true
+    elif parseCommonOption(key, val, result.config, result.moduleFlags,
+                           forwardArg, forwardArgLengc):
+      discard "handled by the common CLI parser"
+    if forwardArgLengc:
+      result.forwardedLengc.add " --" & key
+      if val.len > 0:
+        result.forwardedLengc.add ":" & val
+
+  if extraPath.len > 0:
+    result.config.paths.add extraPath
+    result.forwarded.add " --path:" & extraPath
+  if outFile.len > 0:
+    var fa = true
+    var fl = false
+    discard parseCommonOption("out", outFile, result.config, result.moduleFlags, fa, fl)
+    result.forwarded.add " --out:" & outFile
+
+  # `compileProgram`'s epilogue, in its order. The two `nimNative*` defines and
+  # the `--flags` are appended to the forwarded string as well because the
+  # child appends them to its own; `emitFrontendArgs` de-duplicates, so a
+  # caller that already carried them and one that did not produce the same
+  # `(cmd :nimsem …)`.
+  if result.config.backend == backendLLVM:
+    if result.config.linker.len == 0: result.config.linker = "clang"
+  elif result.config.linker.len == 0 and result.config.cc.len > 0:
+    result.config.linker = result.config.cc
+  let checkModes = if danger: {} else: DefaultSettings
+  if checkModes != DefaultSettings:
+    let f = genFlags(checkModes)
+    result.forwarded.add (if f.len > 0: " --flags:" & f else: " --flags")
+  result.config.checkFlags = genFlags(checkModes)
+  let nativeBackend = result.config.backend == backendNative
+  let optOutAll = result.config.isDefined("useLibc")
+  if nativeBackend or not (optOutAll or result.config.isDefined("useMimalloc")):
+    result.config.addDefine "nimNativeAlloc"
+    result.forwarded.add " --define:nimNativeAlloc"
+  if nativeBackend or not (optOutAll or result.config.isDefined("useLibcIo")):
+    result.config.addDefine "nimNativeIo"
+    result.forwarded.add " --define:nimNativeIo"
+  if nativeBackend:
+    result.config.addDefine "nimNoLibc"
+    result.forwarded.add " --define:nimNoLibc"
+
+  setupPaths(result.config)
+  # Last, so an explicit `--nimcache:` in the forwarded args cannot win over
+  # the one the caller is actually using: the spawned form passed it after
+  # everything else for the same reason.
+  result.config.nifcachePath = nimcachePath
+  result.config.ctfeAnalysisOnly = analysisOnly
+
+proc runEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
+                  extraPath, outFile: string; analysisOnly: bool): int {.nimcall.} =
+  ## `semos.evalBuildInProcess`. Answers the exit code the spawned
+  ## `nimony … s <project>` would have answered: 0 on success, 1 on a graph
+  ## that failed. `EvalBuildUnavailable` says the caller has to spawn -- there
+  ## is no phase relay in this process (a bare `nimsem`, or a nimony-built
+  ## nimony), so running the graph here would spawn a `nifmake` per graph and
+  ## be strictly worse than the one process it replaced.
+  if not inProcessMakeAvailable(): return EvalBuildUnavailable
+  let a = childArgs(baseDir, nimcachePath, commandLineArgs,
+                    extraPath, outFile, analysisOnly)
+  # `SilentMake` and nothing else: `-f`, `--profile`, `--report` and `--stats`
+  # are not forwarded to a sub-compile, so the spawned child had an empty set
+  # too; the progress bar is dropped because a nested build is not a phase of
+  # the outer one's 0..100 %.
+  let ok = buildGraphImpl(a.config, project, {SilentMake},
+                          a.forwarded, a.forwardedLengc, a.moduleFlags,
+                          DoCompile, "", "", "", nested = true)
+  result = if ok: 0 else: 1
+
+# Installed at module init rather than by a driver's `main`, because there are
+# two drivers (`nimony`, `nimsem`) and both import this module while neither
+# could import `phases`: `phases.nim` imports `nimsem`, so a `nimsem` that
+# imported it back would be a module cycle. `semos` cannot import `deps` either
+# (`deps` imports `semos`), which is what makes this a variable rather than a
+# call.
+semos.evalBuildInProcess = runEvalBuild
