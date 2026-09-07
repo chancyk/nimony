@@ -16,9 +16,13 @@
 ## - `step5` sits in the middle, which is where the line-shifting edit goes,
 ##   and the inserted proc goes in just after it, before `step6`.
 ##
-## Do not renumber or reorder these procs casually: the scenario edits them
-## by name (`b3b step five`, `var acc = x + 5`, `proc step6*(x: int): int =`)
-## and asserts bounds that depend on there being a dozen of them.
+## Do not renumber or reorder these procs casually: the scenario finds its
+## three edit sites by plain string replacement over this file -- step5's
+## string literal, step5's first statement, and step6's signature -- and
+## asserts bounds that depend on there being a dozen procs. For the same
+## reason nothing here, comments included, may repeat one of those three
+## strings: the first match wins, and a comment that quotes an edit site
+## would be edited instead of the code.
 
 proc step1*(x: int): int =
   var acc = x + 1

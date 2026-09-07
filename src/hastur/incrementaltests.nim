@@ -1045,6 +1045,18 @@ proc diffDecls*(before, after: seq[NifDecl]; blind: bool): DeclDelta =
     let consumed = used.getOrDefault(name, 0)
     if group.len > consumed: result.added += group.len - consumed
 
+proc editOnce(text, needle, replacement, what: string): string =
+  ## `replace` with the count checked. The scenario below finds its edit sites
+  ## by plain string match, so a second occurrence anywhere in the fixture --
+  ## a comment that quotes the site, most plausibly -- would silently edit the
+  ## wrong place and the failure would surface as a parse error three steps
+  ## later. Make it a named failure at the point of the mistake instead.
+  let n = text.count(needle)
+  if n != 1:
+    quit "decl-stability: the " & what & " edit site occurs " & $n &
+         " times in the fixture (expected exactly 1): " & needle
+  result = text.replace(needle, replacement)
+
 proc declUnchanged(before, after: seq[NifDecl]; needle: string): bool =
   ## Whether the one declaration whose name contains `needle` is byte-identical
   ## in both splits. Used to assert the invariant a new declaration must always
@@ -1138,7 +1150,8 @@ proc incrementalDeclStabilityTests*() =
 
   # (a) in-place, same length: `"b3b step five"` -> `"b3b step FIVE"`.
   inc phases
-  writeFile(lib, originalLib.replace("b3b step five", "b3b step FIVE"))
+  writeFile(lib, editOnce(originalLib, "b3b step five", "b3b step FIVE",
+                          "in-place"))
   build("in-place")
   let sInplace = diffDecls(sBase, splitNifDecls(sNif), false)
   expect sInplace.changed == 1 and sInplace.added == 0 and sInplace.removed == 0,
@@ -1162,10 +1175,10 @@ proc incrementalDeclStabilityTests*() =
   # what comes after is the generic instantiations spliced in from imports,
   # which is why `sem.nim` sees 465 of 1227 for an appended proc.
   inc phases
-  writeFile(lib, originalLib.replace("proc step6*(x: int): int =",
+  writeFile(lib, editOnce(originalLib, "proc step6*(x: int): int =",
     "proc b3bInserted*(x: int): int =\n  var acc = x + 11\n" &
     "  let s = \"b3b inserted\"\n  result = acc + s.len\n\n" &
-    "proc step6*(x: int): int ="))
+    "proc step6*(x: int): int =", "insert"))
   build("insert")
   let sInsertNow = splitNifDecls(sNif)
   let sInsertRaw = diffDecls(sBase, sInsertNow, false)
@@ -1189,8 +1202,8 @@ proc incrementalDeclStabilityTests*() =
 
   # (c) one statement inserted into a proc in the middle of the file.
   inc phases
-  writeFile(lib, originalLib.replace("  var acc = x + 5\n",
-                                     "  var acc = x + 5\n  acc = acc + 0\n"))
+  writeFile(lib, editOnce(originalLib, "  var acc = x + 5\n",
+                          "  var acc = x + 5\n  acc = acc + 0\n", "stmtadd"))
   build("stmtadd")
   let sStmtNow = splitNifDecls(sNif)
   let sStmtRaw = diffDecls(sBase, sStmtNow, false)
