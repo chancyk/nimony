@@ -50,7 +50,15 @@ type
     ## `deps.runEvalBuild`, reached through a variable because the module
     ## graph forbids the direct call: `deps` imports `semos`.
 
-var evalBuildInProcess*: EvalBuildProc = nil
+proc noEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
+                 extraPath, outFile: string; analysisOnly: bool): int {.nimcall.} =
+  ## The default: there is no in-process sub-build here, spawn as before. A
+  ## real proc rather than `nil` for the same reason `dag.spawnEverything` is
+  ## one -- nimony has no nil proc value, and this file is compiled by nimony
+  ## in `hastur boot`.
+  EvalBuildUnavailable
+
+var evalBuildInProcess*: EvalBuildProc = noEvalBuild
   ## The ONE module-level `var` this phase adds, and it exists for the same
   ## reason `dag.runNodeRelay` does: a lower module has to call into a higher
   ## one. `deps.nim` assigns it at module init, so every binary that links
@@ -780,7 +788,6 @@ proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
   ## (`phases.runPhaseInproc` turns those into a failed node, but `deps` itself
   ## can raise on an I/O error) must not leave the outer compile without its
   ## pool.
-  if evalBuildInProcess == nil: return EvalBuildUnavailable
   var saved = takeFrontendState()
   try:
     result = evalBuildInProcess(baseDir, project, nimcachePath, commandLineArgs,

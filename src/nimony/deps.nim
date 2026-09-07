@@ -2960,7 +2960,8 @@ proc childArgs(baseDir, nimcachePath, commandLineArgs, extraPath, outFile: strin
     if result.config.linker.len == 0: result.config.linker = "clang"
   elif result.config.linker.len == 0 and result.config.cc.len > 0:
     result.config.linker = result.config.cc
-  let checkModes = if danger: {} else: DefaultSettings
+  var checkModes: set[CheckMode] = DefaultSettings
+  if danger: checkModes = {}
   if checkModes != DefaultSettings:
     let f = genFlags(checkModes)
     result.forwarded.add (if f.len > 0: " --flags:" & f else: " --flags")
