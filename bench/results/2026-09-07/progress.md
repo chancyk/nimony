@@ -204,3 +204,19 @@ rebuild after an edit only), hexer 0.27, arkham 0.26 (3 modules), dceEmit
 label/temp renames only; no image hash moved; one arm64 nativecg golden
 regenerated. Left: arkham splicing (~0.26 -> ~0.1 s), an incremental live
 set for dceLive (0.36 s), the per-module sem re-check (0.34 s, owner).
+
+## Run 17: H1 merged (dceLive's fixpoint no longer deep-copies a module per pop) -- interleaved, load ~20 (B3e building)
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB | wall |
+|---|---|---|---|
+| sem.nim live edit, body only (`self.editbody`) | 2.567 / 3.869 / 117 | 1.175 / 1.217 / 107 | 2.18x |
+| sem.nim live edit that adds a proc AND a call (`self.editcall`, new) | 2.286 / 3.541 / 117 | 1.140 / 1.178 / 147 | 2.01x |
+
+`self.editcall` is the edit that changes the call graph every round, so
+`dceLive` runs every round (a body-only edit leaves the `.dce.nif`
+byte-identical after round 0, H1's finding); its peak is `dceLive`'s
+147 MB. H1: `dceLive` 0.36 -> 0.05 s (`markLive` took the module table by
+value: a whole `ModuleAnalysis` deep-copied per worklist pop, 7867 times),
+131 live files byte-identical; the incremental live set was measured as
+worth ~11 ms and not built. Absolutes this run carry B3e's build load; the
+ratios and the per-stage numbers in h1.txt are the evidence.

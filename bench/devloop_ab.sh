@@ -9,6 +9,7 @@
 #   scenario: stdlib.forced (default) | stdlib.cold | hello.forced | ctfe.forced
 #             | self.editbody (a statement inserted into a called proc of sem.nim)
 #             | self.editdead (a private, never-called proc appended: DCE removes it)
+#             | self.editcall (a new proc AND a call to it from semStmt: the call graph changes)
 #             | self.cold | self.run   (native backend; BACKEND=c for the C path)
 # Prints per-round wall/cpu for both, then median and min of each.
 set -u
@@ -33,7 +34,7 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
-  self.editbody|self.editdead|self.cold|self.run)
+  self.editbody|self.editdead|self.editcall|self.cold|self.run)
     # The compiler compiling itself (fork-point sources, copied per side) with
     # the native backend; `self.run` is `nimony r ... --version`.
     selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
@@ -50,7 +51,7 @@ A=$(cd "$A" && pwd); B=$(cd "$B" && pwd)
 cmdfor() {  # cmdfor <side> <nc> -> prints the command line
   eval "t=\$$1"
   case $scen in
-    self.editbody|self.editdead) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.editbody|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.cold)     echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
     *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
@@ -65,6 +66,15 @@ case $scen in
   if isNewScope: discard $i
 " $work/self_$side/src/nimony/sem.nim' ;;
   self.editdead) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
+  # A live edit that also changes the CALL GRAPH every round: a new private
+  # proc, and a call to it from `semStmt`. That is what re-runs `dceLive`
+  # (whose input, the module's `.dce.nif`, does not change for a body-only
+  # edit after the first round -- notes/h1.md).
+  self.editcall) prep='sed -i "" "/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =\$/i\\
+proc devloopCall$i(x: int): int = x + $i
+" $work/self_$side/src/nimony/sem.nim; sed -i "" "/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =\$/a\\
+  if isNewScope: discard devloopCall$i($i)
+" $work/self_$side/src/nimony/sem.nim' ;;
   self.run)      prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
   self.cold)     prep='rm -rf $nc' ;;
 esac

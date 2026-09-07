@@ -10,7 +10,8 @@ compiler produces. This file is the decision aid; `JIT.md` is the design,
 
 | scenario | before | after | peak RSS before / after |
 |---|---|---|---|
-| compiler compiling itself, a statement added to a called proc in `sem.nim` | 2.65 s | 1.08 s | 117 / 107 MB |
+| compiler compiling itself, a statement added to a called proc in `sem.nim` | 2.57 s | 1.18 s | 117 / 107 MB |
+| same, the edit also adds a proc and a call to it (call graph changes) | 2.29 s | 1.14 s | 117 / 147 MB |
 | same file, a private never-called proc appended (DCE deletes it) | 2.31 s | 0.71 s | 116 / 101 MB |
 | after the edit, run the compiler from memory (`nimony r`) | no such command | build + ~20 ms | |
 | hello world, edit, build and run | 0.32 s | 0.033 s | 18 / 26 MB |
@@ -31,7 +32,7 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 
 | # | change | touches | why it is sound | verify with |
 |---|---|---|---|---|
-| 1 | **Bugs fixed** (P0a/P0c): `-f` was forwarded into every CTFE sub-compile; `runEval` never consulted its own memo; `.live.nif` was hash-ordered so `OnlyIfChanged` never held and every edit re-emitted all modules' `.c.nif` | `nimony.nim`, `semos.nim`, `dce2.nim`, `dce1.nim` | same outputs, fewer re-runs; 127 `.c.nif` byte-identical before/after | `hastur test tests/incremental` |
+| 1 | **Bugs fixed** (P0a/P0c/H1): `-f` was forwarded into every CTFE sub-compile; `runEval` never consulted its own memo; `.live.nif` was hash-ordered so `OnlyIfChanged` never held and every edit re-emitted all modules' `.c.nif`; `dceLive`'s fixpoint deep-copied a whole module analysis per worklist pop (0.36 → 0.05 s, 19 lines) | `nimony.nim`, `semos.nim`, `dce2.nim`, `dce1.nim` | same outputs, fewer re-runs; 127 `.c.nif` byte-identical before/after | `hastur test tests/incremental` |
 | 2 | **Ownership rule**: the main module never owns a generic instantiation another module also offers | `dce2.resolveSymbolConflicts` | a shared module's `.c.nif` no longer depends on which main it links with; what makes caches hit | `hastur boot` byte-identical |
 | 3 | **Caches**: content-addressed `.o` (`ocache/`), `.c.nif` for CTFE's stdlib closure (`ccache/`), arkham's `asmcache/`, nifasm's per-symbol `blobcache/` | `deps.nim`, `engine.nim`, nativenif `blobcache.nim` | keyed on content + tool stamp; a wrong hit is a loud unresolved symbol, not wrong code; `NIMONY_CCACHE=off`, `--no-blobcache` | `tests/ctfe_engine`, nativenif `tests/tester.nim` |
 | 4 | **CTFE on the engine** (B2/A2c): after `.c.nif`, arkham + nifasm in-process into an arena, `main` called; the sub-compile's frontend runs in the parent with its pools snapshotted | `engine.nim`, `semos.nim`, `exprexec.nim`; nimsem links arkham/nifasm (+2.7 MB) | runs arkham's AOT bytes ("CT eval is real compilation"); any `AsmError` falls back to the subprocess; `--ctfe:subprocess`, `NIMONY_CTFE_ENGINE=off`; default `auto` = engine on macOS/arm64 only | `tests/ctfe_diff` (0 differences) |
