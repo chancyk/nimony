@@ -741,16 +741,30 @@ machine, with one script. The rule, from 2026-09-06 on:
 
 ## Small items found by measuring (not phases)
 
-- `findTool("nimony")` resolves to a file named `nimony` in the current
+- ~~`findTool("nimony")` resolves to a file named `nimony` in the current
   directory when one exists (a freshly built program called `nimony`), and
   the CTFE sub-compile then fails with `/bin/sh: nimony: command not found`.
   Pre-existing at the fork point. Fix: resolve tools next to the running
-  executable only.
-- The scheduler runs a depth's in-process nodes before its fan-out instead
+  executable only.~~ **done** (`jit/small-items`): `findTool` is `bin*/` and
+  absolute names only -- no cwd, no bare name, no `PATH`; external programs
+  (`cc`, `nim`, the system linker) resolve in `dag.resolveProgram`;
+  `demandTool` names the directory searched. `incrementalToolShadowTests`.
+- ~~The scheduler runs a depth's in-process nodes before its fan-out instead
   of alongside it (progress.md run 3b); worth ~0.1 s on a forced stdlib
-  rebuild.
-- The no-change floor of a 127-module build is 0.11 s of dependency scan and
-  graph emission (run 6).
+  rebuild.~~ **done** (`jit/small-items`), and it is worth nothing on this
+  tip: the relay is asked for the whole depth first (`decideOnly`), the
+  spawned half starts, the accepted half runs on the main thread beside it
+  (`dag.SpawnBatch` in place of `execProcesses`). Measured neutral because a
+  depth is never MIXED -- every depth holds one phase, so an in-process depth
+  has no spawned peer. Run 3b's 0.1 s is in-process time at `ready=1` depths;
+  reaching it needs cross-depth pipelining, not this.
+- ~~The no-change floor of a 127-module build is 0.11 s of dependency scan and
+  graph emission (run 6).~~ **done** (`jit/small-items`): 74 -> 35 ms.
+  `toPair` memoized in `DepContext` (32.9 ms of `getCurrentDir` +
+  `relativePath`), `openLedger` deferred to the first question that needs it
+  (9.6 ms), build files `OnlyIfChanged`. What remains is 20 ms of dependency
+  scan and 13 ms of `runMake` parsing the two `.build.nif` files.
+  `bench/results/2026-09-07/small-items.txt`.
 - `std/rawthreads` has no `nimNoLibc` arm outside linux/x64 (B0); it keeps
   the stdlib-wide corpus off the native backend on macOS.
 - nifasm's foreign-symbol lookup is the 0.07 s left in B3's incremental

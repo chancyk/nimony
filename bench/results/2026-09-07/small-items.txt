@@ -1,0 +1,182 @@
+Small items found by measuring (JIT_IMPL.md, "Small items found by measuring")
+branch jit/small-items, three commits, each measured against the one before it.
+
+machine:  macOS 26.6.2 arm64, Apple M5 (10 cores), Nim 2.2.10, load 2-5
+base:     fast-devloop tip 213b1a0b (B3c merged, nativenif pin c3f27fc)
+method:   bench/devloop_ab.sh (interleaved A/B) for the scheduler item;
+          a per-item toolchain built from `git archive <commit>` into
+          /tmp/si_before* for the "before" side, so the comparison is against
+          THIS branch's previous commit and not against the fork point.
+
+
+1. findTool and the current directory                       commit c363c449
+----------------------------------------------------------------------------
+Not a timing item: a build that failed.
+
+Reproduction on 213b1a0b, from a scratch cwd that already holds a file
+called `nimony` (the previous round's `--out:./nimony`):
+
+  $ nimony c --spawn:always --nimcache:./nc --out:./nimony t.nim
+  t.nim(4, 12) Error: cannot evaluate expression at compile time: f(13)
+  /bin/sh: nimony: command not found
+  FAILURE: .../bin/nifmake --base:'' --rerun -j run --progress:0:50 nc/tymsha01.build.nif
+
+`findTool` began with `fileExists(name)` -- the cwd -- and returned the bare
+name it matched, which a shell then resolves through PATH. Under the default
+scheduler the CTFE sub-compile is in-process (A2c), so only `--spawn:always`
+(and any build whose sem runs in its own process) reaches the shell with the
+tool's name in it; that is the mode the failure was found in.
+
+After: both rounds succeed and the program runs.
+
+  $ nimony c --spawn:always --nimcache:./nc --out:./nimony t.nim   # twice
+  $ ./nimony
+  40
+
+Test: `incrementalToolShadowTests` in src/hastur/incrementaltests.nim, called
+twice from tests/incremental/setup.nim (default scheduler and
+`--spawn:always`). Both rounds build from a fresh nimcache in a scratch cwd
+with `--out:./nimony`, run the program, and assert the decoy was actually
+written -- otherwise the second round would be testing nothing.
+
+  tool-shadow: 2 / 2 phases successful in 1.81s.
+  tool-shadow (--spawn:always): 2 / 2 phases successful in 2.51s.
+
+
+2. In-process nodes overlap the depth's fan-out             commit 9505d74c
+----------------------------------------------------------------------------
+A = the branch at commit 1 (c363c449 tree, /tmp/si_before), B = commit 2.
+Interleaved, median of 5 (3 for stdlib.cold), separate nimcaches per side.
+
+  scenario                    A wall / cpu      B wall / cpu     B/A cpu
+  stdlib.forced (BACKEND=c)   1.969 /  9.111    1.970 /  9.042   0.992
+  self.editbody (native)      1.251 /  1.282    1.249 /  1.283   1.001
+  stdlib.cold   (BACKEND=c)   5.141 / 27.869    5.151 / 27.886   1.001
+
+raw:
+  stdlib.forced A wall 1.946 1.947 1.970 1.977 1.969  cpu 9.015 9.029 9.111 9.128 9.132
+                B wall 1.960 1.964 1.982 1.970 1.982  cpu 8.978 9.058 9.051 9.019 9.042
+  self.editbody A wall 1.262 1.253 1.241 1.251 1.247  cpu 1.282 1.290 1.274 1.281 1.283
+                B wall 1.261 1.257 1.249 1.238 1.247  cpu 1.298 1.291 1.283 1.278 1.279
+  stdlib.cold   A wall 5.073 5.141 5.182  cpu 27.288 27.869 28.101
+                B wall 5.104 5.151 5.262  cpu 27.441 27.886 27.960
+
+Neutral. The finding is why: on this tip a DAG depth is never MIXED, so the
+in-process nodes have no fan-out to overlap with. `NIMONY_PROFILE_NODES=1`
+over a cold stdlib build (`nimony c`, node counts by depth):
+
+  131 spawn nifler ready=134 + 3 spawn pluginbuild ready=134
+    1 inproc nimsem ready=1
+   22/7/9/14/9/20/3/2/3/4/6 spawn nimsem   (per depth, all spawned)
+    1 inproc nimsem ready=1
+   99 spawn hexer ready=99
+    1 inproc dceLive ready=1
+   99 inproc dceEmit ready=99
+   99 spawn lengc ready=99
+   99 spawn cc ready=99
+    1 spawn link ready=1
+
+Every depth holds one phase, and the rule decides per depth, so a depth is
+either all in-process or all spawned. The in-process nodes run 3b attributed
+0.1 s to are the `ready=1`/`ready=2` ones: on a warm forced stdlib build the
+frontend graph reports 0.115 s in-process over 8 nodes at such depths and the
+backend 0.033 s over 1. Nothing is beside them to hide that time behind.
+Cross-depth pipelining (starting module M's `lengc` as soon as M's `dceEmit`
+is done, rather than after all 99) is where that 0.1 s actually is; this item
+is not that, and the serialization it names is gone either way.
+
+Measured and rejected on the way: waiting on one live child unconditionally
+(no `waitpid(-1)`, which would race with an in-process nimsem's sub-compile)
+cost 11 % of stdlib.forced's wall -- 1.969 -> 2.188 s, cpu 9.183 -> 8.693 --
+because the other job slots sat idle behind the slowest child. The shipped
+`drain` polls on a 1 ms tick only while commands are still queued and blocks
+exactly once the queue is empty.
+
+`--report` byte-identical: nine reports over tests/incremental/sample.nim
+(cold / no-change / forced, each under the default scheduler,
+`--spawn:always` and `--vfs:memory+spill`) diff clean between A and B,
+`inproc=` included.
+
+
+3. The no-change floor of a 127-module build                commit 39789cd2
+----------------------------------------------------------------------------
+`nimony n --silentMake` on an up-to-date self-compilation: 127 modules,
+/tmp/devloop_base/src copied to a scratch tree, `--out` outside it, both DAGs
+empty (`--profile` prints two nifmake blocks with `0 of 0 commands`).
+
+A = the branch at commit 2, B = commit 3. Interleaved, 9 rounds each,
+one nimcache per side, both warmed by their own toolchain first.
+
+  A(commit 2)  median 74.3 ms  min 73.7 ms
+               raw 79.2 74.3 73.9 75.5 74.7 73.8 73.7 73.9 74.7
+  B(commit 3)  median 34.8 ms  min 34.6 ms
+               raw 34.8 34.6 34.7 35.6 34.9 34.8 34.9 34.8 34.9
+
+(run 6's 0.11 s floor had already come down to 0.074 s on the tip.)
+
+The split, `getMonoTime` around each stage of the driver, warm, one run:
+
+  stage                        before      after
+  cmdline + store               0.03        0.04
+  installPhaseRelay (openLedger) 9.60        0.01
+  initDepContext (frontend)     31.4        14.1
+  generateCachedConfigFile       0.02        0.02
+  generateFrontendBuildFile      0.69        0.65
+  runMake (frontend)             3.81        4.17
+  initDepContext (backend)      16.0         6.13
+  generateFinalBuildFile         1.54        1.49
+  runMake (backend)              8.70        9.27
+  storeFlush                     0.00        0.00
+                               ------      ------
+                                ~72          ~36
+
+Inside the dependency scan, before:
+
+  frontend  nifler 1.35  processFileDeps 1.64  loadDepsFile 2.45 (247 files)
+            resolveFile 1.31 (1259 calls)  toPair 21.19 (1596)  fileExists 0.60
+  backend   loadDepsFile 1.22 (127 files)
+            resolveFile 0.03 (1653)  toPair 11.69 (1781)  fileExists 0.90
+
+So 32.9 of the 72 ms was `toPair` -> `moduleSuffix`: one `getCurrentDir` and
+one `relativePath` per search path, per import, and the scan asks for the same
+path once per module that imports it. Memoized in `DepContext.pairs`.
+
+The other 9.6 ms was `openLedger` inside `installPhaseRelay`, folding ~700
+fragments across 100 directories for a table whose only reader
+(`depthWantsInproc`) a no-change build never reaches. `PhaseSchedule` now
+holds the path and opens on first use.
+
+Not worth cutting: the `.deps.nif` reads. `loadDepsFile` is 2.45 ms for 247
+files (frontend) and 1.22 ms for 127 (backend); a cached digest would replace
+3.7 ms with a stat sweep and a new staleness rule. Also measured: mmap vs read
+for those files in isolation is 14.8 vs 7.1 ms per 298 files, but inside the
+compiler the page cache is already warm and the whole line is 3.7 ms.
+
+Build files are now emitted `OnlyIfChanged` (they are byte-identical on a
+no-change run). It is a wash for time -- reading 112 KB + 262 KB back to
+compare costs about what writing them did, 0.69 -> 0.65 and 1.54 -> 1.49 ms --
+and is kept for the mtime: an unchanged graph now looks older rather than
+newer, which is the safe direction for anything that compares against it.
+
+What is left of the 35 ms: 20.2 ms of dependency scan (two passes, 254 + 127
+`.deps.nif` parses and ~2900 import resolutions) and 13.4 ms of `runMake`
+parsing two `.build.nif` files (112 KB + 262 KB), sorting them and asking
+`needsRebuild` about every node.
+
+
+Verification (final branch, all commands from the worktree)
+----------------------------------------------------------------------------
+  bin/hastur test tests/incremental   16/16 x3 modes, tool-shadow 2/2 x2,
+                                      inproc 4/4, incremental-live 5/5 x2,
+                                      ctfe-ocache 2/2 x3, decl-stability 3/3
+  bin/hastur tests/inproc             3 / 3 tests successful in 27.12s
+  bin/hastur test tests/ledger        [ledger] all ledger tests passed
+  bin/hastur test tests/nifcache      nifcache: all checks passed
+                                      (--vfs:verify 0 mismatches, 101 artifacts
+                                       byte for byte)
+  bin/hastur test tests/ctfe_diff     19 files, 50 artifacts, 79 .s.nif,
+                                      0 differences
+  bin/hastur tests/nimony             794 / 794 tests successful in 135.70s
+  bin/hastur boot --boot-backend:native
+                                      stages 1 and 2 byte-identical,
+                                      stages 2 and 3 byte-identical, 44.35s
