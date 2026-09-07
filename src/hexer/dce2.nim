@@ -71,7 +71,23 @@ proc translate(resolved: ResolveTable; sym: SymId): SymId =
   else:
     result = sym
 
-proc markLive(moduleGraphs: Table[string, ModuleAnalysis]; resolved: ResolveTable): Table[string, HashSet[SymId]] =
+proc markLive(moduleGraphs: var Table[string, ModuleAnalysis];
+              resolved: ResolveTable): Table[string, HashSet[SymId]] =
+  ## The reachability fixpoint: start from every module's roots and follow
+  ## `uses` until nothing new becomes live.
+  ##
+  ## `moduleGraphs` is a `var` parameter and the two lookups below are written
+  ## as chained `getOrQuit` calls ON PURPOSE, and neither is cosmetic.
+  ## `getOrQuit` has a mutable and an immutable overload (`lib/compat2.nim`);
+  ## the immutable one returns `B` BY VALUE. Binding
+  ## `let graph = moduleGraphs.getOrQuit(moduleName)` therefore deep-copied a
+  ## whole `ModuleAnalysis` -- a `Table[SymId, HashSet[SymId]]` plus two
+  ## `HashSet`s, thousands of entries for a module like `sem` -- on EVERY
+  ## worklist pop, and `graph.uses.getOrQuit(sym)` copied the dependency set
+  ## on top of that. On the self-compilation that is 7867 pops over 131
+  ## modules and it cost 313 ms of `dceLive`'s 356 ms; taking the mutable
+  ## overload instead makes the same fixpoint 7 ms (`notes/h1.md` section 1).
+  ## The result is bit-for-bit the same set -- the copies were pure waste.
   var worklist = newSeq[SymId](0)
 
   result = initTable[string, HashSet[SymId]]()
@@ -90,9 +106,8 @@ proc markLive(moduleGraphs: Table[string, ModuleAnalysis]; resolved: ResolveTabl
     if not result.getOrQuit(moduleName).containsOrIncl(sym):
       # Process dependencies from the symbol's own module
       if moduleName in moduleGraphs:
-        let graph = moduleGraphs.getOrQuit(moduleName)
-        if sym in graph.uses:
-          for dep in graph.uses.getOrQuit(sym):
+        if moduleGraphs.getOrQuit(moduleName).uses.hasKey(sym):
+          for dep in moduleGraphs.getOrQuit(moduleName).uses.getOrQuit(sym):
             let s = translate(resolved, dep)
             let sowner = extractModule(pool.syms[s])
             # Check if dependency is already live in its owning module
