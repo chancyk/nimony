@@ -268,3 +268,32 @@ re-run and re-emit identical `.c.nif` files. Two consequences:
 2. B3's target is the 1.28 s `cc` of one large module (arkham lowers a file
    that size in ~0.2 s, B0); that is the half of the loop no scheduler can
    remove.
+
+## Run 5: where a COLD self-compilation spends its time (baseline, taken late)
+
+This profile should have been taken before any phase was planned; it was
+taken after P0c. `nimony c --profile src/nimony/nimony.nim` (127 modules,
+debug, fork-point sources), one run each, A2c building in the background.
+
+| phase | base cpu (invocations) | head cpu (invocations) |
+|---|---|---|
+| cc | 17.443 s (127) | 20.697 s (127) |
+| nimsem | 4.717 s (129) | 4.113 s (129) |
+| hexer | 3.536 s (121) | 3.783 s (121) |
+| dceEmit | 1.839 s (127) | 0.345 s (127) |
+| lengc | 1.533 s (127) | 1.834 s (127) |
+| nifler | 0.927 s (165) | 1.022 s (165) |
+| dceLive | 0.370 s | 0.391 s |
+| frontend graph wall | 2.551 s | 1.462 s + 0.628 s in-process |
+| backend graph wall | 4.173 s | 4.109 s + 0.736 s in-process |
+| total wall | 7.73 s | 7.81 s |
+
+Reading: the C compiler is 57 % of the cpu and about half of the wall of a
+cold self-compilation; the frontend's 2.5 s of wall is 4.7 s of nimsem cpu
+on an import chain that parallelizes only ~1.8x. Largest C files:
+`sem` 1.96 MB, `deps` 0.62 MB, `sigmatch` 0.60 MB, `codegen` 0.50 MB.
+So for the headline scenario the levers are, in order: (1) B3, replacing
+`cc` with arkham (B0: 127 modules in 1.3 s of arkham + 0.85 s of nifasm
+against 17 s of cc cpu); (2) the frontend chain, which only a faster or
+threaded nimsem shortens; (3) the scheduler's in-process serial time
+(0.6-0.7 s per graph here), which is the overlap item.
