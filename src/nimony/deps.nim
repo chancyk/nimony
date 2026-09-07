@@ -286,6 +286,15 @@ type
                                   ## already on disk when the graph was emitted,
                                   ## so its `lengc` and `cc` nodes are left out
                                   ## of the graph entirely.
+    ccache: Table[string, string] ## modname -> `<nimcache>/ccache/<hash>.c.nif`,
+                                  ## the content-addressed Leng IR of a
+                                  ## non-main module of a compile-time-eval
+                                  ## sub-program. Empty everywhere else; see
+                                  ## `fillCNifCache`.
+    ccacheHit: HashSet[string]    ## the subset of `ccache` that was already on
+                                  ## disk, so this build wrote the module's
+                                  ## `.c.nif` from the cache instead of running
+                                  ## `dceEmit` for it.
 
 proc toPair(c: DepContext; f: string): FilePair =
   if f.endsWith(".nif"):
@@ -1130,8 +1139,11 @@ type
   FinalPhase = enum
     ## Which slice of the backend build graph `generateFinalBuildFile` emits.
     fpWhole    ## everything, in one graph: what every ordinary build uses
-    fpAnalysis ## hexer + split DCE only; stops before codegen, so the `.c.nif`
-               ## files exist when the second graph is emitted
+    fpLive     ## hexer + `dce` + `dceLive` only; stops before `dceEmit`, so the
+               ## shared `<main>.live.nif` exists when the NEXT graph is emitted
+               ## and the per-module `.c.nif` cache can be resolved from it
+    fpAnalysis ## the same plus `dceEmit`; stops before codegen, so the `.c.nif`
+               ## files exist when the third graph is emitted
     fpCodegen  ## the whole graph again, now with the object cache resolved
 
 proc ocacheDir(config: NifConfig): string =
@@ -1246,11 +1258,222 @@ proc publishObjectCache(c: DepContext; backend: string) =
     except:
       discard  # the only consequence is a miss next time
 
+# ── A2c: the content-addressed `.c.nif` cache ───────────────────────────────
+#
+# `dceEmit` rewrites one module's `.x.nif` into the `.c.nif` of ONE program,
+# because the live set it prunes against is the program's. Every compile-time
+# evaluation of one compile is a different program, so the seven stdlib modules
+# of `std/writenif`'s closure are re-emitted per sub-program -- measured on
+# `tests/nimony/consteval/tmyops.nim`: 35 `dceEmit` runs producing 12 distinct
+# files, 9.6 ms per sub-program of which 6.3 ms is re-parsing `system.x.nif`.
+#
+# What a non-main module's `.c.nif` is a function of is exactly the two inputs
+# of its `dceEmit` node: its own `.x.nif`, which is program-INDEPENDENT (it
+# lives at the top of the nimcache and every sub-program shares it), and the
+# shared `<main>.live.nif`. And `.live.nif` is already partitioned by module:
+# `(live (mod "<suffix>" <syms…>) …)` plus one global `(resolved (kv …) …)`
+# table naming the owner of every generic instance.
+#
+# So the key is the module's own slice of that file. The `resolved` entries
+# owned by the MAIN module are left out, and that is what makes the key stable
+# across sub-programs: they are the instances that only the snippet offers
+# (P0b's ownership rule already guarantees the main module never wins an
+# instance some other module also offers), and a stdlib module's `.x.nif` --
+# byte-identical from one sub-program to the next -- cannot name a symbol that
+# did not exist when it was written. Verified rather than only argued: over
+# five sub-programs of `tmyops` the keys partition the 35 emissions into
+# exactly the 12 distinct outputs, i.e. no two different `.c.nif` files ever
+# share a key, and `tests/ctfe_engine` re-checks that by compiling the corpus
+# with `NIMONY_CCACHE=off` and byte-comparing every `.c.nif`.
+
+proc ccacheDir(config: NifConfig): string =
+  ## Beside `ocache/`, and with the same lifetime: inside the build cache, so
+  ## `--nimcache:<dir>` scopes it and `hastur clean` is the eviction.
+  config.nifcachePath / "ccache"
+
+proc ccacheEnabled(): bool =
+  ## `NIMONY_CCACHE=off` turns the cache off without a flag, the way
+  ## `NIMONY_CTFE_ENGINE` turns the engine off: a flag would be spliced into the
+  ## `*.build.nif` and the two settings would stop emitting identical bytes.
+  ## A nimony-built compiler has no environment API and simply caches.
+  when defined(nimony):
+    true
+  else:
+    getEnv("NIMONY_CCACHE") != "off"
+
+type
+  LiveScan = object
+    ## `<main>.live.nif`, sliced the way `dceEmit` consumes it.
+    ok: bool                            ## false = do not cache from this file
+    resolved: string                    ## the `kv` children not owned by main,
+                                        ## sorted, one per line
+    perModule: Table[string, string]    ## module suffix -> its live symbols,
+                                        ## sorted and blank-separated
+
+proc skipNifString(t: string; i: var int) =
+  ## Step `i` past a `"…"` literal. NIF escapes every special byte as `\XX`, so
+  ## a raw quote inside a literal cannot occur; the backslash skip is belt and
+  ## braces.
+  inc i
+  while i < t.len and t[i] != '"':
+    if t[i] == '\\': inc i
+    inc i
+  if i < t.len: inc i
+
+proc childrenOf(t: string; head: string; res: var seq[string]): bool =
+  ## Collect the raw text of every direct child list of the first `(head` tree
+  ## in `t`. False when the tree is absent or unbalanced, which means "do not
+  ## cache" rather than "guess".
+  res.setLen 0
+  let at = t.find(head)
+  if at < 0: return false
+  var i = at + head.len
+  var depth = 1
+  while i < t.len:
+    if t[i] == '"':
+      skipNifString(t, i)
+    elif t[i] == '(':
+      let start = i
+      var d = 0
+      while i < t.len:
+        if t[i] == '"': skipNifString(t, i)
+        elif t[i] == '(':
+          inc d
+          inc i
+        elif t[i] == ')':
+          dec d
+          inc i
+          if d == 0: break
+        else: inc i
+      if d != 0: return false
+      res.add t.substr(start, i-1)
+    elif t[i] == ')':
+      dec depth
+      if depth == 0: return true
+      inc i
+    else:
+      inc i
+  result = false
+
+proc scanLiveFile(liveFile, mainSuffix: string): LiveScan =
+  ## Slice `<main>.live.nif` per module. Anything unexpected answers `ok =
+  ## false`, and the caller then caches nothing.
+  result = LiveScan(ok: false, resolved: "", perModule: initTable[string, string]())
+  var text = ""
+  try:
+    text = vfsRead(liveFile)
+  except:
+    return
+  var kvs: seq[string] = @[]
+  if not childrenOf(text, "(resolved", kvs): return
+  var mods: seq[string] = @[]
+  if not childrenOf(text, "(live", mods): return
+
+  let mainTail = "." & mainSuffix
+  var lines: seq[string] = @[]
+  for kv in kvs:
+    # `(kv "<instance key>" <owning symbol>)`: the owner is the last token.
+    let inner = kv.substr(1, kv.len-2)
+    let toks = splitWhitespace(inner)
+    if toks.len < 3: return
+    let owner = toks[^1]
+    if owner.endsWith(mainTail): continue
+    lines.add inner
+  sort lines, cmpNames
+  for l in lines:
+    result.resolved.add l
+    result.resolved.add "\n"
+
+  for m in mods:
+    # `(mod "<suffix>" <syms…>)`
+    let inner = m.substr(1, m.len-2)
+    let toks = splitWhitespace(inner)
+    if toks.len < 2 or toks[0] != "mod": return
+    let q = toks[1]
+    if q.len < 3 or q[0] != '"' or q[^1] != '"': return
+    var syms = toks[2 .. ^1]
+    sort syms, cmpNames
+    var joined = ""
+    for sym in syms:
+      joined.add sym
+      joined.add " "
+    result.perModule[q.substr(1, q.len-2)] = joined
+  result.ok = true
+
+proc fillCNifCache(c: var DepContext; backend: string) =
+  ## Between the `fpLive` and `fpAnalysis` graphs: give every non-main module a
+  ## content-addressed `.c.nif` path, and where the cache already holds one,
+  ## WRITE it into the sub-program's backend directory.
+  ##
+  ## Writing rather than omitting the node (which is how `fillObjectCache`
+  ## resolves an object) is what keeps this change small: `vfsWrite` goes
+  ## through a temp file and a rename, so the `.c.nif` comes out newer than the
+  ## `.x.nif` and the `.live.nif` it would have been derived from, and
+  ## `nifmake.needsRebuild` skips the `dceEmit` node on its own. The graph the
+  ## two modes emit therefore stays byte-identical.
+  if not ccacheEnabled(): return
+  let backendDir = c.config.nifcachePath / backend
+  let mainSuffix = c.rootNode.files[0].modname
+  let scan = scanLiveFile(backendDir / mainSuffix & ".live.nif", mainSuffix)
+  if not scan.ok: return
+  let dir = ccacheDir(c.config)
+  onRaiseQuit createDir(path(dir))
+  # Everything that is the same for every module of this build. `dceEmit` is
+  # hexer, so its binary's stamp invalidates the whole cache on a rebuild --
+  # the same guard `fillObjectCache` puts on the object cache.
+  let common = "dceEmit\n" & $c.config.bits & "\n" &
+               $ord(c.config.targetCPU) & "\n" & $ord(c.config.targetOS) & "\n" &
+               c.config.checkFlags & "\n" &
+               $getLastModTime(findTool("hexer")) & "\n"
+  for i in 1 ..< c.nodes.len:
+    let f = c.nodes[i].files[0]
+    let xfile = c.config.hexedFile(f)
+    # The `.x.nif` is identified by size and mtime rather than digested:
+    # `system.x.nif` alone is 1.1 MB and hashing it would cost more than the
+    # `dceEmit` this is here to avoid. Within one nimcache that is exactly as
+    # sound as `fillObjectCache`'s tool stamps -- a file is only rewritten by
+    # the `hexer` node above, which changes its mtime.
+    if not vfsExists(xfile): continue
+    var key = common
+    key.add "x "
+    key.add xfile
+    key.add " "
+    key.add $getLastModTime(xfile)
+    key.add "\n"
+    key.add "live "
+    key.add scan.perModule.getOrDefault(f.modname, "")
+    key.add "\n"
+    key.add scan.resolved
+    let cached = dir / computeChecksum(key) & ".c.nif"
+    c.ccache[f.modname] = cached
+    if not vfsExists(cached): continue
+    try:
+      vfsWrite(c.config.lengcFile(f, backend), vfsRead(cached))
+      c.ccacheHit.incl f.modname
+    except:
+      discard  # a cache that cannot be read is a slower compile, not a failed one
+
+proc publishCNifCache(c: DepContext; backend: string) =
+  ## After the `fpAnalysis` graph: offer every freshly emitted `.c.nif` to the
+  ## cache. Same publish-don't-write-in-place rule as `publishObjectCache`.
+  for i in 1 ..< c.nodes.len:
+    let f = c.nodes[i].files[0]
+    let cached = c.ccache.getOrDefault(f.modname, "")
+    if cached.len == 0 or c.ccacheHit.contains(f.modname): continue
+    if vfsExists(cached): continue
+    let produced = c.config.lengcFile(f, backend)
+    if not vfsExists(produced): continue
+    try:
+      vfsWrite(cached, vfsRead(produced))
+    except:
+      discard
+
 proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
                             passC, passL: string;
                             phase: FinalPhase = fpWhole): string =
   var stem = ".final.build.nif"
-  if phase == fpAnalysis: stem = ".final1.build.nif"
+  if phase == fpLive: stem = ".final0.build.nif"
+  elif phase == fpAnalysis: stem = ".final1.build.nif"
   elif phase == fpCodegen: stem = ".final2.build.nif"
   result = c.config.nifcachePath / c.rootNode.files[0].modname & stem
   var b = nifbuilder.open(result)
@@ -1500,6 +1723,10 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
       # independent (all share live.nif as a read-only input), so nifmake
       # parallelises them across cores.
       for i, n in pairs c.nodes:
+        if phase == fpLive:
+          # The live graph stops here: `<main>.live.nif` is all it owes, and
+          # `fillCNifCache` needs it before the emit nodes are decided.
+          break
         b.withTree "do":
           b.addIdent "dceEmit"
           b.withTree "args":
@@ -1548,7 +1775,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
 
       # Link executable
       var objFiles = initHashSet[string]()
-      if phase == fpAnalysis:
+      if phase in {fpAnalysis, fpLive}:
         # The analysis graph stops after DCE: no codegen, no objects, nothing
         # to link. The object cache is resolved from the `.c.nif` files this
         # graph produces, and the `fpCodegen` graph does the rest.
@@ -1722,7 +1949,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
                 b.addStrLit obj
 
       for i, v in pairs c.nodes:
-        if phase != fpAnalysis and not native and not wasm and
+        if phase notin {fpAnalysis, fpLive} and not native and not wasm and
             not ocacheHitFor(c, v.files[0]):
           let obj = objFileOf(c, v.files[0], backend)
           if not objFiles.containsOrIncl(obj):
@@ -1757,7 +1984,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
         else:
           lengcInput = c.config.lengcFile(v.files[0], backend)
 
-        if phase == fpAnalysis or ocacheHitFor(c, v.files[0]):
+        if phase in {fpAnalysis, fpLive} or ocacheHitFor(c, v.files[0]):
           discard  # the analysis graph stops before codegen (see above), and a
                    # module whose object is already cached needs no C at all
         elif wasm:
@@ -2501,12 +2728,21 @@ proc buildGraphImpl(config: sink NifConfig; project: string;
                          c.config.optLevel notin {optSpeed, optSize} and
                          c.backendTools.len == 0 and c.bundles.len == 0
     if useObjectCache:
+      let backendName = c.config.backendDirName(c.rootNode.files[0])
+      # A2c: hexer + `dce` + `dceLive` first, so `<main>.live.nif` exists and
+      # every non-main module's `.c.nif` can be looked up in the shared
+      # `<nimcache>/ccache/` before its `dceEmit` node is offered to nifmake.
+      let liveFile = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
+                                            fpLive)
+      if not runMake(nifmakeCommand, liveFile, 50, 55):
+        return false
+      fillCNifCache(c, backendName)
       let analysisFile = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
                                                 fpAnalysis)
-      if not runMake(nifmakeCommand, analysisFile, 50, 60):
+      if not runMake(nifmakeCommand, analysisFile, 55, 60):
         return false
-      fillObjectCache(c, c.config.backendDirName(c.rootNode.files[0]),
-                      commandLineArgsLengc, passC)
+      publishCNifCache(c, backendName)
+      fillObjectCache(c, backendName, commandLineArgsLengc, passC)
       if c.config.ctfeAnalysisOnly:
         # `--ctfe-analysis-only`: the compiler that spawned this one runs these
         # `.c.nif` files itself (`semos.runEval` -> `engine.nim`), so the
