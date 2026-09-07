@@ -1530,7 +1530,9 @@ proc incrementalDeclStabilityTests*() =
          "served its purpose -- tighten the bound below to 1 and delete this"
   # 11 of 23 on this fixture (every `stepN` plus `total`). A ceiling, so a
   # change that makes hexer's numbering MORE position-dependent fails here.
-  expect dTempOut <= 11,
+  # 18 on the merged fixture (F1's follow-ups added guard*/loop*/total after
+  # `step10`, all renumbered by the edit); F2 tightens this to 1.
+  expect dTempOut <= 18,
          "tempadd: " & $dTempOut & " of " & $dBase.len & " declarations " &
          "changed by the .decls.nif lowering-output digest (expected at most " &
          "11); hexer's lowering became more position-dependent, not less"
