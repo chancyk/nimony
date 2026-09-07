@@ -356,3 +356,173 @@ strictly more information than the `0.0` A1b's seam recorded.
 The ledger keeps working unchanged: an in-process node's `produce` is written
 by the tool's own `PhaseTimer` (the same code runs), and its `spawn` is
 nothing at all, because `SpawnLog` only ever hears about `RunSpawn` nodes.
+
+---
+
+# Phase A2b — what was built
+
+## The split
+
+`src/nifmake/dag.nim` is the graph (parse, topo sort, staleness, `runDag`, the
+Makefile writer, the relay seam); `nifmake.nim` is 184 lines of option parsing,
+help text and two write calls. `hastur build nifmake` is unchanged and the
+generated Makefile of a real hello-world build is byte-identical through both
+graphs, which is the check that `expandCommand` survived being split into
+`expandCommandArgs` + `renderCommand`.
+
+Three things changed shape rather than only moving:
+
+- **`runDag` takes `maxJobs` as a parameter.** It read a module-level
+  `gMaxJobs` only the option parser could write; a second caller in one process
+  would have inherited it.
+- **`--report` and `--profile` are strings.** `reportLine` and `profileText`,
+  written by whoever called; two programs emit those bytes now.
+- **`Command.tokens: TokenBuf` became `slots: seq[CmdSlot]`.** This one is
+  load-bearing rather than cosmetic: `input`/`output`/`args` are not master
+  tags, so their `TagId`s belong to the `globalTags` that parsed this build
+  file — and every in-process phase calls `resetPools()` on entry. A `Dag` that
+  still needed the pool to read its own commands would decode garbage after the
+  first in-process node. Holding strings and ints makes the graph independent
+  of pool state.
+
+## The registry, as implemented
+
+| DAG `cmd` | in-process entry | reset |
+|---|---|---|
+| `nimsem` | `nimsem.runNimsem` | `semmain.resetFrontendGlobals` |
+| `hexer` (`hexer c`) | `hexer.runHexer` | + `hexer.resetHexerGlobals` |
+| `dce` (`hexer d`) | `hexer.runHexer` | + `hexer.resetHexerGlobals` |
+| `dceLive` (`hexer dl`) | `hexer.runHexer` | + `hexer.resetHexerGlobals` |
+| `dceEmit` (`hexer de`) | `hexer.runHexer` | + `hexer.resetHexerGlobals` |
+| `lengc` | `lengc.runLengc` | + `lengc.resetLengcGlobals` (empty) |
+
+`resetFrontendGlobals()` runs before **every** in-process node and the phase's
+own reset on top of it: it is the superset (pools, `prog`, identstyle, the
+file-line cache) and `resetHexerGlobals` covers only the first two.
+
+Unregistered, and therefore spawned: `nifler`, `cc`, `link`, `nifasmObj`,
+`arkham`, `ithaqua`, `optimize`, `dagon`, `doclink`, `idetools`,
+`pluginbuild`, every `{.plugin.}` and every `{.build.}` tool.
+
+### Why nifler is not on that list
+
+Three findings, each sufficient on its own:
+
+1. Linking it needs `--path:$nim/compiler`, which puts `compiler/platform.nim`
+   and `src/lib/platform.nim` in one module graph. Nim names an object file
+   after the module basename, so both are `@pplatform.nim.c.o`, one overwrites
+   the other, and the link fails on `CPU`/`OS` referenced from `nifconfig` and
+   `deps`. Which one survives is a build-order accident, which is worse than
+   the failure.
+2. `nifler/configcmd.nim` reaches `compiler/commands`, `nimconf`,
+   `cmdlinehelper` and from there `cgen`, `jsgen`, `vm`, `docgen`, `sem`:
+   nimony would contain a second, whole Nim compiler.
+3. `hastur boot` compiles nimony with nimony, which cannot compile the Nim
+   compiler at all.
+
+Both (1) and (2) were reproduced, not reasoned about: the flags were added to
+`buildNimony`, the compile succeeded through ~300 extra modules, and the link
+failed on `_CPU__OOZlibZplatform_u747`. Getting nifler in-process needs
+`src/lib/platform.nim` renamed, or nifler's parser vendored the way
+`nimparser/parser.nim` already is — a change to files this phase does not own.
+
+## The rule, as implemented
+
+`phases.wantsInproc(schedule, request)` is the whole decision and takes no
+build graph, so it reads as JIT.md 6.2 does:
+
+```
+if mode == smAlways                                     -> spawn
+if the phase is not registered                          -> spawn
+if the expansion carries `.args` tokens                 -> spawn
+est   = estimate(ledger, (phase, module), "").produceNs
+spawn = max(estimate(...).spawnNs, 1 ms)
+if est < spawn * k        (k = 3, `--inproc-k:`)        -> in-process
+else                                                    -> readyAtDepth < countProcessors()
+```
+
+Two details worth naming:
+
+- **The toolhash is empty on purpose.** `ledger.stampMatches` documents the
+  door: the scheduler is weighing somebody *else's* tool, and stamping the
+  query with nimony's own hash would filter every entry out.
+- **`readyAtDepth` is new information**, so `runDag`'s parallel path became two
+  passes over each depth: pass 1 runs `needsRebuild` and collects the ids that
+  will run, pass 2 offers each with the count in hand. The same set, the same
+  number of `needsRebuild` calls. The sequential path reports 1, which is the
+  truth there.
+
+`--jobs:1` drops the batch and takes the sequential path; `--spawn:always`
+installs no relay at all, so `deps.runMake` spawns `nifmake` and `nifmake`
+spawns every node — the process tree of the release before this one. An
+explicit `--vfs:disk` on the command line implies it.
+
+## Where the driver lives
+
+`deps.nim` imports `nifmake/dag` and nothing else new; `nimony.nim` is the only
+binary that imports `phases.nim`. So **nimsem links no extra tools**, which
+keeps `hastur boot`'s nimsem stage untouched and leaves A2c's job (the CTFE
+graph inside nimsem's own process) intact.
+
+nimony links nimsem, hexer and lengc: **2.91 MB -> 4.77 MB**, and its own
+compile went from ~1.6 s to ~4.0 s.
+
+## What is behind a define, and why
+
+`hastur boot` compiles nimony with nimony, and `dag.nim` is not in nimony's
+language yet. Boot stage 1 named four things:
+
+- `osproc.execProcesses` with `beforeRunEvent`/`afterRunEvent` callbacks;
+- `topologicalSort`'s comparison closure over `addr dag.nodes`;
+- `strutils.align` (the progress bar) and `alignLeft` (`profileText`);
+- `sequtils.foldl` (`profileText`'s totals).
+
+So `deps.nim` and `nimony.nim` import the library and the scheduler under
+`when not defined(nimony)`, and `deps.inProcessMakeAvailable()` answers `false`
+in a booted compiler. It then spawns `nifmake` for every graph — the previous
+release's behaviour exactly, and `nifmake` is a carry tool (host-Nim built at
+every boot stage), so nothing is lost but the speed-up. `hastur boot` reaches a
+byte-identical stage2 == stage3.
+
+Two smaller consequences of the same gate: `makeJobs()` answers "all cores" in
+a booted compiler (no environment API), and `--jobs`/`--spawn`/`--inproc-k` are
+parsed and ignored there. `parseInt` + `except ValueError` also had to become a
+hand-rolled digit scan, since `except ValueError` is not nimony's language
+either.
+
+## What still `quit`s in-process
+
+Unchanged from §3.1, and now with a `try`/`except CatchableError`/`Defect`
+around every `run*` call so an *exception* becomes a failed node with its
+message. A `quit` still ends the compiler:
+
+| where | what |
+|---|---|
+| `nifreader.open` (`src/lib/nifreader.nim:574`) and lengc's copy (`nifmodules.nim:401,388,389`) | an input the DAG promised is missing or malformed |
+| `hexer_context.EContext.error`/`errorAt` (`:94-107`, `{.noreturn.}`, ~200 call sites) | malformed Leng IR |
+| `hexer/duplifier.nim:1540,1572,1606` | move-type diagnostics |
+| `lengc/codegen.error`/`errorAt` (`:193-220`, `{.noreturn.}`) plus `llvmcodegen.nim:142,154,166,175`, `leng_model.nim:17,26`, `genexprs.nim:321`, `noptions.nim:61` | malformed `.c.nif` |
+| `cli.parseCommonOption` for `--help`/`--version` (`cli.nim:54,56`) | never passed by a DAG node |
+| `dag.nim`'s own parse/expand/cycle quits | nimony emitted a build file it cannot read |
+
+Every one of these is "the previous phase of this same build produced something
+the next one cannot read", i.e. a compiler bug rather than a user input. In the
+spawning arrangement the cost was one dead child and a `FAILURE:` line; now it
+is the compiler. Turning ~200 `{.noreturn.}` call sites into an error channel
+is a phase of its own.
+
+## Tests
+
+- `tests/incremental` runs the existing 15 + 2 phases three times: default,
+  `--vfs:memory+spill`, and `--spawn:always`. The assertions are per phase and
+  come out identical.
+- `incrementalInprocTests` adds four phases: cold `inproc >= 5`; a one-line
+  edit leaving the frontend graph with no spawned node but nifler and the
+  backend graph with none but `cc`/`link`; byte identity of every `.nif`/`.c`
+  between the scheduler and `--spawn:always` with each nimcache's own path
+  normalised away (the ledger snapshot and `.ledger/` fragments excluded —
+  they record *how* the build ran); and a `const` sub-compile leaving no
+  `spawn` sample for `nimsem`/`hexer`/`dce*`/`lengc` in `<nimcache>/ledger.nif`
+  while leaving one for `cc`/`link`, which is what proves the assertion is not
+  passing on a build that never happened.
+- `tests/ctfe_diff` gains a third mode pair, `--spawn:always` vs the default.
