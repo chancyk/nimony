@@ -435,13 +435,40 @@ build graph, so it reads as JIT.md 6.2 does:
 if mode == smAlways                                     -> spawn
 if the phase is not registered                          -> spawn
 if the expansion carries `.args` tokens                 -> spawn
+if readyAtDepth < cores                                 -> in-process
 est   = estimate(ledger, (phase, module), "").produceNs
-spawn = max(estimate(...).spawnNs, 1 ms)
-if est < spawn * k        (k = 3, `--inproc-k:`)        -> in-process
-else                                                    -> readyAtDepth < countProcessors()
+spawn = max(estimate(...).spawnNs, 3 ms)
+est * readyAtDepth < spawn * k * cores  (k = 3)         -> in-process
+else                                                    -> spill inputs, spawn
 ```
 
-Two details worth naming:
+### Two deviations from the literal text of JIT.md 6.2, both measured
+
+**The cost clause is scaled to the depth.** The literal form asks "is this node
+worth a process" one node at a time, but in-process nodes run *sequentially* —
+so at a depth of 99 cheap `hexer` nodes it answers "not worth it" ninety-nine
+times and then runs them one after another. Measured with `nimony c -f
+--profile` on a cold `tests/nimony/stdlib/tall.nim`: 0.606 s of `hexer` and
+0.776 s of `nimsem` serialised, and stdlib.cold 11.3 % slower in wall time than
+`--spawn:always` where the gate allows 10 %. It also contradicts JIT.md 6.3's
+own expectation that "a cold 100-module build still fans out". Comparing
+`est * readyAtDepth` against `spawn * k * cores` — this depth run serially,
+against one full fan-out — is the same statement at the boundary
+(`readyAtDepth == cores` reduces it to `est < spawn * k`) and only tightens
+past the core count. stdlib.cold came back to +0.5 %, and every small-build
+number was unchanged.
+
+**The spawn estimate has a 3 ms floor, not just a 3 ms default.**
+`ledger.estimate` answers from an existing entry as soon as there is one, a
+phase that runs in-process never produces a spawn observation, and `foldSpawn`
+leaves such an entry's `spawnNs` at 0. Without the floor one in-process build
+drives the threshold to zero and the next build sends the phase back to a
+process — the scheduler oscillating on its own measurements. 3 ms is what
+`ledger.defaultSample` gives every phase and what JIT.md 6.2 names, and what a
+spawn costs is a property of the machine rather than of whether the last build
+used one.
+
+Two more details worth naming:
 
 - **The toolhash is empty on purpose.** `ledger.stampMatches` documents the
   door: the scheduler is weighing somebody *else's* tool, and stamping the
@@ -451,6 +478,9 @@ Two details worth naming:
   will run, pass 2 offers each with the count in hand. The same set, the same
   number of `needsRebuild` calls. The sequential path reports 1, which is the
   truth there.
+- **A node whose expansion carries `.args` tokens always spawns.** Those are
+  pre-split shell words nifmake never reconstructed an argv for, so the argv
+  handed to a `run*` proc would be a guess.
 
 `--jobs:1` drops the batch and takes the sequential path; `--spawn:always`
 installs no relay at all, so `deps.runMake` spawns `nifmake` and `nifmake`
@@ -525,4 +555,34 @@ is a phase of its own.
   `spawn` sample for `nimsem`/`hexer`/`dce*`/`lengc` in `<nimcache>/ledger.nif`
   while leaving one for `cc`/`link`, which is what proves the assertion is not
   passing on a build that never happened.
-- `tests/ctfe_diff` gains a third mode pair, `--spawn:always` vs the default.
+- `tests/ctfe_diff` gains a third mode pair, `--spawn:always` vs the default:
+  18 files, 46 evaluation artifacts, 0 differences.
+
+Two existing suites became cross-checks of this phase for free, because they
+already drove `--vfs:disk` against another mode and an explicit `--vfs:disk`
+now implies `--spawn:always`: `tests/nifcache` compares `disk` against
+`verify` and reports the same 235 `.nif` artifacts byte for byte, and
+`tests/ctfe_diff`'s first pair compares `disk` against `memory+spill`.
+
+## Numbers
+
+`bench/results/2026-09-06/a2b.txt` carries the three tables and the raw runs.
+The short version, wall / cpu against the fork point:
+
+| scenario | wall | cpu |
+|---|---|---|
+| hello.nochange | -60 % | -58 % |
+| hello.edit | -21 % | -6 % |
+| ctfe.edit | -64 % | -49 % |
+| ctfe.forced | -64 % | -71 % |
+| bench.cold (14 consts) | -22 % | -56 % |
+| bench.edit | -76 % | -70 % |
+| stdlib.cold | +1.3 % | -14 % |
+| stdlib.edit | +4.5 % | -56 % |
+| stdlib.forced | +15 % | -20 % |
+
+`stdlib.forced` is the one wall regression and it is the sequential-phase
+price: a forced rebuild re-runs all 101 `nimsem` nodes, whose import chain
+gives depths narrower than the ten cores, so JIT.md 6.2's second clause keeps
+them here. Threads are what would fix it, and JIT.md 6.1 defers those until a
+ledger shows they would pay.
