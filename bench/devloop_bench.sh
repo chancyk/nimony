@@ -48,6 +48,11 @@ nimony="$root/bin/nimony"
 work=${TMPDIR:-/tmp}/devloop_bench.$$
 export NIMONY_VFS=${NIMONY_VFS:-disk}
 extra=${EXTRA:-}   # extra nimony flags for every compile, e.g. EXTRA=--ctfe:engine
+# The backend: `n` (arkham + nifasm, no C compiler, no linker) is the dev
+# workflow the plan is for and the default here; BACKEND=c measures the C path.
+# The stdlib-wide scenarios stay on `c`: `tall.nim` imports `std/rawthreads`,
+# which has no nimNoLibc implementation on this host yet (B0, native_status.md).
+backend=${BACKEND:-n}
 
 if [ ! -x "$nimony" ]; then
   echo "devloop_bench: $nimony not found" >&2
@@ -100,27 +105,27 @@ measure() {
 hello="$work/hello.nim"
 printf 'import std/syncio\necho "hello"\n' > "$hello"
 hc="$work/nc_hello"
-rm -rf "$hc"; "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello" >/dev/null 2>&1
-measure hello.forced   "$runs" ":" "$nimony" c $extra -f --silentMake --nimcache:"$hc" "$hello"
-measure hello.nochange "$runs" ":" "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello"
-measure hello.edit     "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" c $extra --silentMake --nimcache:"$hc" "$hello"
+rm -rf "$hc"; "$nimony" $backend $extra --silentMake --nimcache:"$hc" "$hello" >/dev/null 2>&1
+measure hello.forced   "$runs" ":" "$nimony" $backend $extra -f --silentMake --nimcache:"$hc" "$hello"
+measure hello.nochange "$runs" ":" "$nimony" $backend $extra --silentMake --nimcache:"$hc" "$hello"
+measure hello.edit     "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" $backend $extra --silentMake --nimcache:"$hc" "$hello"
 
 # ---- CTFE: tmyops (5 consts) ------------------------------------------------
 ctfe="$work/tmyops.nim"
 cp "$here/tests/nimony/consteval/tmyops.nim" "$ctfe"
 cc="$work/nc_ctfe"
-measure ctfe.cold   "$runs" "rm -rf $cc" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.warm   "$runs" ":" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.edit   "$runs" "printf 'echo \"edit\"\n' >> $ctfe" "$nimony" c $extra --silentMake --nimcache:"$cc" "$ctfe"
-measure ctfe.forced "$runs" ":" "$nimony" c $extra -f --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.cold   "$runs" "rm -rf $cc" "$nimony" $backend $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.warm   "$runs" ":" "$nimony" $backend $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.edit   "$runs" "printf 'echo \"edit\"\n' >> $ctfe" "$nimony" $backend $extra --silentMake --nimcache:"$cc" "$ctfe"
+measure ctfe.forced "$runs" ":" "$nimony" $backend $extra -f --silentMake --nimcache:"$cc" "$ctfe"
 
 # ---- CTFE: bench/ctfe_bench.nim (14 consts) --------------------------------
 if [ -f "$here/bench/ctfe_bench.nim" ]; then
   cb="$work/ctfe_bench.nim"
   cp "$here/bench/ctfe_bench.nim" "$cb"
   bc="$work/nc_bench"
-  measure bench.cold "$runs" "rm -rf $bc" "$nimony" c $extra --silentMake --nimcache:"$bc" "$cb"
-  measure bench.edit "$runs" "printf 'echo \"edit\"\n' >> $cb" "$nimony" c $extra --silentMake --nimcache:"$bc" "$cb"
+  measure bench.cold "$runs" "rm -rf $bc" "$nimony" $backend $extra --silentMake --nimcache:"$bc" "$cb"
+  measure bench.edit "$runs" "printf 'echo \"edit\"\n' >> $cb" "$nimony" $backend $extra --silentMake --nimcache:"$bc" "$cb"
 fi
 
 # ---- stdlib-wide: tall.nim -------------------------------------------------
@@ -147,7 +152,7 @@ selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
 if [ -d "$selfsrc" ]; then
   selfdir="$work/self"; mkdir -p "$selfdir"; cp -R "$selfsrc" "$selfdir/src"
   selfc="$work/nc_self"; selfbin="$work/self_nimony"
-  selfcmd="$nimony c $extra --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim"
+  selfcmd="$nimony $backend $extra --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim"
   measure self.cold     "$runs" "rm -rf $selfc" sh -c "cd $selfdir && $selfcmd"
   measure self.nochange "$runs" ":"              sh -c "cd $selfdir && $selfcmd"
   measure self.editbody "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
@@ -158,4 +163,4 @@ else
 fi
 
 echo
-echo "label: $label   toolchain: $root   runs: $runs (median)   NIMONY_VFS=$NIMONY_VFS   EXTRA=$extra"
+echo "label: $label   toolchain: $root   runs: $runs (median)   backend=$backend (stdlib.* on c)   NIMONY_VFS=$NIMONY_VFS   EXTRA=$extra"

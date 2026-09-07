@@ -1308,105 +1308,6 @@ proc ccacheEnabled(): bool =
   else:
     getEnv("NIMONY_CCACHE") != "off"
 
-type
-  LiveScan = object
-    ## `<main>.live.nif`, sliced the way `dceEmit` consumes it.
-    ok: bool                            ## false = do not cache from this file
-    resolved: string                    ## the `kv` children not owned by main,
-                                        ## sorted, one per line
-    perModule: Table[string, string]    ## module suffix -> its live symbols,
-                                        ## sorted and blank-separated
-
-proc skipNifString(t: string; i: var int) =
-  ## Step `i` past a `"…"` literal. NIF escapes every special byte as `\XX`, so
-  ## a raw quote inside a literal cannot occur; the backslash skip is belt and
-  ## braces.
-  inc i
-  while i < t.len and t[i] != '"':
-    if t[i] == '\\': inc i
-    inc i
-  if i < t.len: inc i
-
-proc childrenOf(t: string; head: string; res: var seq[string]): bool =
-  ## Collect the raw text of every direct child list of the first `(head` tree
-  ## in `t`. False when the tree is absent or unbalanced, which means "do not
-  ## cache" rather than "guess".
-  res.setLen 0
-  let at = t.find(head)
-  if at < 0: return false
-  var i = at + head.len
-  var depth = 1
-  while i < t.len:
-    if t[i] == '"':
-      skipNifString(t, i)
-    elif t[i] == '(':
-      let start = i
-      var d = 0
-      while i < t.len:
-        if t[i] == '"': skipNifString(t, i)
-        elif t[i] == '(':
-          inc d
-          inc i
-        elif t[i] == ')':
-          dec d
-          inc i
-          if d == 0: break
-        else: inc i
-      if d != 0: return false
-      res.add t.substr(start, i-1)
-    elif t[i] == ')':
-      dec depth
-      if depth == 0: return true
-      inc i
-    else:
-      inc i
-  result = false
-
-proc scanLiveFile(liveFile, mainSuffix: string): LiveScan =
-  ## Slice `<main>.live.nif` per module. Anything unexpected answers `ok =
-  ## false`, and the caller then caches nothing.
-  result = LiveScan(ok: false, resolved: "", perModule: initTable[string, string]())
-  var text = ""
-  try:
-    text = vfsRead(liveFile)
-  except:
-    return
-  var kvs: seq[string] = @[]
-  if not childrenOf(text, "(resolved", kvs): return
-  var mods: seq[string] = @[]
-  if not childrenOf(text, "(live", mods): return
-
-  let mainTail = "." & mainSuffix
-  var lines: seq[string] = @[]
-  for kv in kvs:
-    # `(kv "<instance key>" <owning symbol>)`: the owner is the last token.
-    let inner = kv.substr(1, kv.len-2)
-    let toks = splitWhitespace(inner)
-    if toks.len < 3: return
-    let owner = toks[^1]
-    if owner.endsWith(mainTail): continue
-    lines.add inner
-  sort lines, cmpNames
-  for l in lines:
-    result.resolved.add l
-    result.resolved.add "\n"
-
-  for m in mods:
-    # `(mod "<suffix>" <syms…>)`
-    let inner = m.substr(1, m.len-2)
-    let toks = splitWhitespace(inner)
-    if toks.len < 2 or toks[0] != "mod": return
-    let q = toks[1]
-    if q.len < 3 or q[0] != '"' or q[^1] != '"': return
-    var syms = toks[2 .. ^1]
-    sort syms, cmpNames
-    var joined = ""
-    for sym in syms:
-      joined.add sym
-      joined.add " "
-    result.perModule[q.substr(1, q.len-2)] = joined
-  result.ok = true
-
 proc xNifDigest(dir, xfile, modname: string): string =
   ## The digest of a module's `.x.nif`, memoized beside the cache.
   ##
@@ -1447,9 +1348,6 @@ proc fillCNifCache(c: var DepContext; backend: string) =
   ## two modes emit therefore stays byte-identical.
   if not ccacheEnabled(): return
   let backendDir = c.config.nifcachePath / backend
-  let mainSuffix = c.rootNode.files[0].modname
-  let scan = scanLiveFile(backendDir / mainSuffix & ".live.nif", mainSuffix)
-  if not scan.ok: return
   let dir = ccacheDir(c.config)
   onRaiseQuit createDir(path(dir))
   # Everything that is the same for every module of this build. `dceEmit` is
@@ -1471,10 +1369,24 @@ proc fillCNifCache(c: var DepContext; backend: string) =
     key.add " "
     key.add xdig
     key.add "\n"
+    # The module's OWN live file (P0c): its live set and the resolve entries
+    # its `dceEmit` consults, serialized sorted, so its bytes are the exact
+    # input `dceEmit` derives the `.c.nif` from. Before P0c this sliced the
+    # whole-program file; after it, `<main>.live.nif` is the main module's
+    # per-module file, and slicing it gave every stdlib module an empty live
+    # set and one key for every sub-program -- a wrong hit surfaced as an
+    # unresolved `writeNifInt` in arkham (semantic merge conflict, fixed in
+    # the integrator's review).
+    let liveFile = backendDir / f.modname & ".live.nif"
+    if not vfsExists(liveFile): continue
+    var liveDig = ""
+    try:
+      liveDig = computeChecksum(vfsRead(liveFile))
+    except:
+      continue
     key.add "live "
-    key.add scan.perModule.getOrDefault(f.modname, "")
+    key.add liveDig
     key.add "\n"
-    key.add scan.resolved
     let cached = dir / computeChecksum(key) & ".c.nif"
     c.ccache[f.modname] = cached
     if not vfsExists(cached): continue
