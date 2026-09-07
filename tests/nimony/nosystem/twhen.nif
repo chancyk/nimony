@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 660              )
+(.indexat 666              )
 (stmts@,1,tests/nimony/nosystem/twhen.nim
  (import
   (kv mwhzgh6nt1 "tests/nimony/nosystem/deps/mwhen.nim"))
@@ -16,7 +16,7 @@
  (proc@,R :not.0.@5
   (not). .
   (params@B
-   (param@1 :x.0 . .
+   (param@1 :x.0`not`0 . .
     (bool@3).))
   (bool@B)
   (pragmas@R
