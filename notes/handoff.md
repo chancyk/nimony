@@ -70,3 +70,34 @@ dceLive 0.05, dceEmit 0.05.
 - B3b proper (declaration-level hexer/arkham) after F2; B4 hot reload; B5
   platforms; `std/rawthreads` nimNoLibc on macOS; the C-backend bug with a
   value-returning proc catching a ref exception (`notes/f1.md` §8.3).
+
+## Upstream (checked 2026-09-07 after the pause)
+
+`https://github.com/nim-lang/nimony` master is at e1da48e9, six commits past
+the fork point f69b8afc (which is its ancestor):
+
+```
+e1da48e9 nifsyms refactor (#2483)
+38f67463 std/http: thread the tag space instead of keeping one per process (#2484)
+c6be04e1 no globals in nifcore (#2482)
+b7c7daa6 newest nativenif (#2478)        -> upstream pin f9af5b24; ours 5f6f011e, both from d0781a48
+c6db98b6 sem: a sum type constructor over a `ref object` produces the `ref` (#2481)
+4aa797d5 sem: `import` is not a shadowing boundary (#2479)
+```
+
+Upstream diff since the fork: 114 files, +2480/-1343. A trial merge into
+`fast-devloop` conflicts in 30 files, almost all of them the hexer passes
+F2 touched (`xelim`, `intramodinliner`, `lambdalifting`, `coro_transform`,
+`cps`, `desugar`, `duplifier`, `iterinliner`, `stringcases`,
+`vtables_backend`, `lengcgen`, `dce1`, `dce2`), plus `sem.nim`/`sembasics`
+(F1 vs the nifsyms refactor), `controlflow`/`derefs`/`contracts*` (F1
+follow-ups), `nifmake.nim`, `lengc/nifmodules.nim` and the nativenif pin.
+"no globals in nifcore" and "thread the tag space" overlap A2a's
+`resetPools`/`resetFrontendGlobals` in intent and may make parts of them
+redundant. Recommended path for a fresh session: rebase phase by phase onto
+upstream master (P0*, A1*, A2*, B* first -- they conflict little; then F1,
+F1 follow-ups, F2 on top of the nifsyms refactor, re-running
+`decl-stability` as the gate), and rebase the nativenif branches
+(`jit/b1` .. `jit/b3e-native`) onto upstream's new pin f9af5b24 with
+`tools/refactor_gate.sh` as the gate at each step. Do not merge upstream
+into `fast-devloop` blind: the 30 conflicts are semantic, not textual.
