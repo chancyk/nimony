@@ -1729,19 +1729,23 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
       # Split DCE — phase 1: collect every module's .dce.nif analysis,
       # compute the global live set + generic-instance resolve table,
       # write the shared <main>.live.nif. Single small serial node.
-      b.withTree "do":
-        b.addIdent "dceLive"
-        for i, n in pairs c.nodes:
-          # The .dce.nif sits next to its corresponding .x.nif.
-          var dceFile = ""
-          if i == 0:
-            dceFile = backendDir / n.files[0].modname & ".dce.nif"
-          else:
-            dceFile = c.config.nifcachePath / n.files[0].modname & ".dce.nif"
-          b.withTree "input":
-            b.addStrLit dceFile
-        b.withTree "output":
-          b.addStrLit liveFile
+      if phase != fpAnalysis:
+        # Not in the second graph either, and for the same reason as hexer
+        # above: `.live.nif` is written OnlyIfChanged, so a repeated node
+        # would look stale and recompute the live set a second time.
+        b.withTree "do":
+          b.addIdent "dceLive"
+          for i, n in pairs c.nodes:
+            # The .dce.nif sits next to its corresponding .x.nif.
+            var dceFile = ""
+            if i == 0:
+              dceFile = backendDir / n.files[0].modname & ".dce.nif"
+            else:
+              dceFile = c.config.nifcachePath / n.files[0].modname & ".dce.nif"
+            b.withTree "input":
+              b.addStrLit dceFile
+          b.withTree "output":
+            b.addStrLit liveFile
 
       # Split DCE — phase 2: per-module emit. Each `(do dceEmit ...)` is
       # independent (all share live.nif as a read-only input), so nifmake
@@ -2047,49 +2051,56 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
             b.withTree "output":
               b.addStrLit c.config.genFile(v.files[0], backend)
 
-        # Build .x.nif files from .s.nif files via hexer.
-        # For the root module (i==0) the output is backend-specific so that
-        # its --isMain version does not overwrite the shared .x.nif that other
-        # compilations produce when this module is a non-main dependency.
-        b.withTree "do":
-          b.addIdent "hexer"
-          if i == 0:
-            b.withTree "args":
-              b.addStrLit "--isMain"
-            b.withTree "args":
-              b.addStrLit "--app:" & $c.config.appType
-            b.withTree "args":
-              b.addStrLit "--outdir:" & backendDir
-          b.withTree "input":
-            b.addStrLit c.config.semmedFile(v.files[0], v.plugin)
-          # Cross-module hexer dep: imports' `.s.idx.nif` carries both the
-          # interface checksum and inline-proc body hashes (see
-          # `processForChecksum`'s inline path). Listing imports' `.s.idx.nif`
-          # — and *not* the bulkier `.s.nif` — gives finer-grained incremental:
-          # a non-inline private body change in import A keeps A's
-          # `.s.idx.nif` byte-identical (mtime preserved), so B's hexer
-          # doesn't rerun. Same-module `.s.idx.nif` is intentionally omitted
-          # — hexer reads its own embedded index out of `.s.nif`.
-          var seenImports = initHashSet[string]()
-          for depIdx in v.deps:
-            let idxFile = c.config.indexFile(c.nodes[depIdx].files[0], c.nodes[depIdx].plugin)
-            if not seenImports.containsOrIncl(idxFile):
-              b.withTree "input":
-                b.addStrLit idxFile
-          b.withTree "output":
+        if phase != fpAnalysis:
+          # `fpAnalysis` is the SECOND graph of a compile-time-eval sub-program
+          # and emits nothing but `dceEmit`. `fpLive` has just run these nodes,
+          # and hexer writes `.x.nif` OnlyIfChanged -- so a node repeated here
+          # looks stale to nifmake's mtime rule and runs a second time. On a
+          # forced rebuild, where hexer is the phase that is genuinely stale,
+          # that was +48 ms per evaluation.
+          # Build .x.nif files from .s.nif files via hexer.
+          # For the root module (i==0) the output is backend-specific so that
+          # its --isMain version does not overwrite the shared .x.nif that other
+          # compilations produce when this module is a non-main dependency.
+          b.withTree "do":
+            b.addIdent "hexer"
             if i == 0:
-              b.addStrLit backendDir / v.files[0].modname & ".x.nif"
-            else:
-              b.addStrLit c.config.hexedFile(v.files[0])
-          # `.dce.nif` is emitted alongside `.x.nif` by `bin/hexer c`. It
-          # is consumed only by the split-DCE `dceLive` node, but listing
-          # it here lets nifmake track it as a real artifact and order
-          # `dceLive` after every per-module hexer.
-          b.withTree "output":
-            if i == 0:
-              b.addStrLit backendDir / v.files[0].modname & ".dce.nif"
-            else:
-              b.addStrLit c.config.nifcachePath / v.files[0].modname & ".dce.nif"
+              b.withTree "args":
+                b.addStrLit "--isMain"
+              b.withTree "args":
+                b.addStrLit "--app:" & $c.config.appType
+              b.withTree "args":
+                b.addStrLit "--outdir:" & backendDir
+            b.withTree "input":
+              b.addStrLit c.config.semmedFile(v.files[0], v.plugin)
+            # Cross-module hexer dep: imports' `.s.idx.nif` carries both the
+            # interface checksum and inline-proc body hashes (see
+            # `processForChecksum`'s inline path). Listing imports' `.s.idx.nif`
+            # — and *not* the bulkier `.s.nif` — gives finer-grained incremental:
+            # a non-inline private body change in import A keeps A's
+            # `.s.idx.nif` byte-identical (mtime preserved), so B's hexer
+            # doesn't rerun. Same-module `.s.idx.nif` is intentionally omitted
+            # — hexer reads its own embedded index out of `.s.nif`.
+            var seenImports = initHashSet[string]()
+            for depIdx in v.deps:
+              let idxFile = c.config.indexFile(c.nodes[depIdx].files[0], c.nodes[depIdx].plugin)
+              if not seenImports.containsOrIncl(idxFile):
+                b.withTree "input":
+                  b.addStrLit idxFile
+            b.withTree "output":
+              if i == 0:
+                b.addStrLit backendDir / v.files[0].modname & ".x.nif"
+              else:
+                b.addStrLit c.config.hexedFile(v.files[0])
+            # `.dce.nif` is emitted alongside `.x.nif` by `bin/hexer c`. It
+            # is consumed only by the split-DCE `dceLive` node, but listing
+            # it here lets nifmake track it as a real artifact and order
+            # `dceLive` after every per-module hexer.
+            b.withTree "output":
+              if i == 0:
+                b.addStrLit backendDir / v.files[0].modname & ".dce.nif"
+              else:
+                b.addStrLit c.config.nifcachePath / v.files[0].modname & ".dce.nif"
 
 proc cachedConfigFile(config: NifConfig): string =
   config.nifcachePath / "cachedconfigfile.txt"
