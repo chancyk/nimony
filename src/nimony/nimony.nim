@@ -21,6 +21,14 @@ import ".." / lib / [tooldirs, argsfinder, nimversion, vfs, artifactstore]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
+when not defined(nimony):
+  # The in-process scheduler. Gated for the reason `deps.nim` states at its own
+  # `import`: `hastur boot` compiles nimony with nimony, which cannot compile
+  # `nifmake/dag.nim` yet. A booted nimony parses `--spawn`/`--jobs`/
+  # `--inproc-k` exactly the same way -- they only ever set environment
+  # variables -- and then spawns `nifmake` for every graph, which is what it
+  # did before this phase.
+  import phases
 
 include ".." / lib / compat2
 
@@ -69,9 +77,18 @@ Options:
   --silentMake              suppresses make output
   --profile                 print nifmake timing profile of executed commands
   --report                  print machine-readable per-command invocation
-                            counts on stdout (one line per nifmake call)
+                            counts on stdout (one line per build graph);
+                            `inproc=N` of those ran without a process
   --stats                   after build, print total LOC and module count
                             across the dep graph
+  --spawn:always|auto       `auto` (default) runs a build-graph node in this
+                            process when the cost ledger says a process is not
+                            worth it; `always` gives every node its own, which
+                            is the escape hatch and is implied by --vfs:disk
+  --jobs:N                  cap the per-graph-depth fan-out at N processes;
+                            --jobs:1 also runs the graph node by node
+  --inproc-k:N              a phase runs in this process while its estimated
+                            cost is under N spawn costs (default 3)
   --layout:FILE             native backend, bare-metal targets only: the BOARD
                             description (memory regions, stack slots, heap) that
                             arkham and nifasm build the image against. See
@@ -206,6 +223,34 @@ proc createCmdOptions(baseDir: sink string): CmdOptions =
     executableArgs: ""
   )
 
+proc parsePositiveInt(val: string): int =
+  ## A digit-only parse that answers 0 for anything else, so the caller can
+  ## reject with its own message. Hand-rolled rather than `parseInt` because
+  ## `except ValueError` is not in nimony's language and this file is compiled
+  ## by nimony in `hastur boot`; `cli.parseBudgetMB` has the same shape for
+  ## the same reason.
+  result = 0
+  if val.len == 0: return 0
+  for c in val:
+    if c < '0' or c > '9': return 0
+    result = result * 10 + (ord(c) - ord('0'))
+
+proc rememberForChildren(key, val: string) =
+  ## A2b's three settings travel in the environment rather than in
+  ## `c.commandLineArgs`, for the reason A1b gives for `--vfs`: a forwarded
+  ## flag is spliced into the `.build.nif`, and two settings would then emit
+  ## different build files -- which is what the phase's byte-identity gate
+  ## forbids. The environment reaches every child instead, the nested
+  ## `nimony s` of a compile-time evaluation included.
+  ##
+  ## A nimony-built compiler has no environment API and no in-process
+  ## scheduler to configure, so it parses the flags and ignores them. That is
+  ## the same gap `deps.inProcessMakeAvailable` documents.
+  when not defined(nimony):
+    putEnv(key, val)
+  else:
+    discard
+
 proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
   for kind, key, val in getopt(cmdLineArgs):
     case kind
@@ -230,6 +275,15 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
         var forwardArgLengc = false
         # Handle special cases first, then try common parser
         let keyNorm = normalize(key)
+        if keyNorm == "vfs" and normalize(val) == "disk":
+          # JIT.md 6.2: "`--vfs:disk` forces today's behaviour entirely". It is
+          # the EXPLICIT flag that implies it, not the resolved policy: A1b
+          # left the default policy at `disk` until A2c flips it, so reading
+          # the resolved value here would leave the whole in-process path dead
+          # at its own default. `--spawn:` given later still wins, which is
+          # what makes `--vfs:disk --spawn:auto` mean "old store, new
+          # scheduler" for a bisect.
+          rememberForChildren("NIMONY_SPAWN", "always")
         if keyNorm == "help":
           echo Usage
           quit(QuitSuccess)
@@ -284,6 +338,40 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
             else: quit "invalid value for --boundchecks"
           of "silentmake":
             c.buildFlags.incl SilentMake
+            forwardArg = false
+          of "spawn":
+            # `always` is the escape hatch of JIT.md 6.2: every DAG node gets a
+            # process, and so does `nifmake` itself, so the process tree is
+            # literally the one the release before A2b produced. It isolates a
+            # scheduler bug from a store bug because the store stays installed.
+            #
+            # In the environment rather than in `c.commandLineArgs` for the
+            # reason A1b gives for `--vfs`: a forwarded flag is spliced into
+            # the `.build.nif`, and the two modes would then emit different
+            # build files -- exactly what this phase's gate forbids the tests
+            # from tolerating. The environment reaches every child, the nested
+            # `nimony s` of a compile-time evaluation included.
+            case normalize(val)
+            of "always": rememberForChildren("NIMONY_SPAWN", "always")
+            of "auto", "": rememberForChildren("NIMONY_SPAWN", "auto")
+            else: quit "invalid value for --spawn; expected always or auto"
+            forwardArg = false
+          of "jobs":
+            # The per-DAG-depth process cap. `--jobs:1` also drops the batch
+            # entirely and runs the graph node by node, which is what makes a
+            # build's output readable when something in it fails.
+            let n = parsePositiveInt(val)
+            if n < 1: quit "invalid value for --jobs; expected a process count >= 1"
+            rememberForChildren("NIMONY_JOBS", $n)
+            forwardArg = false
+          of "inproc-k", "inprock":
+            # JIT.md 6.2's `k`: a registered phase runs in-process while its
+            # estimated cost is under `k` spawn costs. Exposed because the
+            # right value is a property of the machine, and 3 is a measurement
+            # on one of them.
+            let n = parsePositiveInt(val)
+            if n < 1: quit "invalid value for --inproc-k; expected a number >= 1"
+            rememberForChildren("NIMONY_INPROC_K", $n)
             forwardArg = false
           of "profile":
             c.buildFlags.incl Profile
@@ -471,6 +559,15 @@ when isMainModule:
   # from a command line rather than from a path it was handed.
   requestLedgerDir(c.config.nifcachePath)
   applyRequestedStore()
+  # The in-process scheduler (JIT.md 6.1-6.2). Installed here, after the
+  # command line and after the store, because it reads the cost ledger out of
+  # the nimcache and the nimcache is a command-line answer. `--spawn:always`
+  # installs nothing, which is what makes the escape hatch exact rather than
+  # approximate: no relay, so `deps.runMake` spawns `nifmake` and `nifmake`
+  # spawns every node, the way it always did.
+  when not defined(nimony):
+    installPhaseRelay(spawnModeFromEnv(smAuto), c.config.nifcachePath,
+                      inprocKFromEnv(DefaultInprocK))
   compileProgram(c)
   storeFlush()
   # The driver is the parent of every other tool process, so its own VFS time

@@ -107,7 +107,14 @@ proc buildNimsem*(showProgress = false) =
             validatePassesFlag() & engineFlags())
 
 proc buildNimony*(showProgress = false) =
-  buildTool("nimony", "src/nimony/nimony.nim", showProgress, validatePassesFlag())
+  ## Unlike every other tool here, nimony links three of them: `nimsem`,
+  ## `hexer` and `lengc`, because the in-process scheduler
+  ## (`src/nimony/phases.nim`) calls their `run*` procs. `engineFlags()` therefore
+  ## has to reach nimony too — the compile-time-evaluation engine lives behind
+  ## `-d:nimonyEngine` in nimsem, and a nimsem phase running inside nimony
+  ## would otherwise silently be an engine-less one.
+  buildTool("nimony", "src/nimony/nimony.nim", showProgress,
+            validatePassesFlag() & engineFlags())
 
 proc buildControlflow*(showProgress = false) =
   buildTool("controlflow", "src/nimony/controlflow.nim", showProgress)

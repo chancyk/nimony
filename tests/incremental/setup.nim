@@ -22,4 +22,14 @@ incrementalOCacheTests()
 incrementalTests()
 incrementalOCacheTests("--vfs:memory+spill")
 incrementalTests("--vfs:memory+spill")
+# A2b: the same sequence again with every DAG node forced into its own
+# process. The counts asserted above are per PHASE, not per process, so they
+# must come out the same whether nimony called the phase or spawned it -- which
+# is the cheapest possible detector for a scheduler that changed what gets
+# rebuilt.
+incrementalOCacheTests("--spawn:always")
+incrementalTests("--spawn:always")
+# ... and the scheduler's own assertions: the `inproc` field, byte identity
+# against `--spawn:always`, and a spawn-free compile-time evaluation.
+incrementalInprocTests()
 echo "SUCCESS."

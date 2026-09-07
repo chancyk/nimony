@@ -17,9 +17,19 @@
 when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
-import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat, dirs, paths, algorithm]
+import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat, dirs, paths, algorithm, monotimes]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
+when not defined(nimony):
+  # The build-graph library, and with it the in-process scheduler. Gated
+  # because `hastur boot` compiles nimony WITH nimony, and `dag.nim` is not in
+  # nimony's language yet: `osproc.execProcesses` takes two callbacks,
+  # `topologicalSort` sorts through a comparison closure, and `strutils.align`
+  # / `alignLeft` / `sequtils.foldl` are not there. A booted nimony therefore
+  # spawns `nifmake` for every graph -- which is exactly the behaviour of the
+  # release before this one, and `nifmake` is a carry tool (host-Nim built at
+  # every boot stage), so nothing is lost but the speed-up.
+  import ".." / nifmake / dag
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs, ledger]
 from ".." / lib / artifactstore import storeStatsLine
 from ".." / lib / nifchecksums import computeChecksum
@@ -2260,11 +2270,139 @@ proc buildGraphForEval*(config: NifConfig; mainNifFile: string; dependencyNifFil
   exec(nifmakeCmd)
   exec(exeFile)
 
-proc progArg(flags: set[BuildFlag]; lo, hi: int): string =
-  # nifmake itself routes the bar (terminal-only); we only suppress it where
-  # nimony asked for silence or machine-readable output.
-  if SilentMake in flags or Report in flags: ""
-  else: "--progress:" & $lo & ":" & $hi & " "
+# --- driving the build graph ----------------------------------------------
+#
+# One graph, run one of two ways (JIT_IMPL.md A2b):
+#
+# * a `nifmake` process, which is what every release before this one did and
+#   what `--spawn:always` still does, down to the argv;
+# * or `nifmake/dag.runDag` in *this* process, with `src/nimony/phases.nim`'s
+#   scheduler deciding per node whether the node itself is worth a process.
+#
+# `dag.relayInstalled()` is the whole switch: `nimony`'s `main` installs the
+# scheduler unless the user asked for the escape hatch, and nothing else in
+# the toolchain installs a relay. So a `nimsem` that reaches this code (the
+# legacy `nimsem e` path) keeps spawning, and so does a nimony-built nimony
+# that decided some phase could not be linked.
+
+proc makeJobs(): int =
+  ## The per-depth process cap. `nimony --jobs:N` puts it in the environment
+  ## rather than in `c.commandLineArgs` for the reason A1b gives for `--vfs`:
+  ## a forwarded flag lands in the `.build.nif`, and two settings would then
+  ## produce different build files. 0 means "all cores", nifmake's default and
+  ## the bare `-j` every release before this one passed.
+  ##
+  ## A nimony-built compiler has no environment API, so it always answers "all
+  ## cores" -- the same gap `inProcessMakeAvailable` documents, and the same
+  ## consequence: a booted compiler behaves like the release before this one.
+  when defined(nimony):
+    0
+  else:
+    let v = getEnv("NIMONY_JOBS")
+    if v.len == 0: return 0
+    try:
+      result = parseInt(v)
+      if result < 1: result = 0
+    except ValueError:
+      result = 0
+
+type
+  MakeInvocation = object
+    ## Everything both paths need, resolved once per build so the two cannot
+    ## drift apart. Deliberately holds no type out of `dag.nim`: the object has
+    ## to exist in a nimony-built compiler too, where that module is not
+    ## imported at all.
+    spawnPrefix: string        ## `nifmake … run ` (a trailing space)
+    baseDir: string
+    force, rerun: bool
+    maxJobs: int
+    inProcess: bool
+    report: bool
+    profile: bool
+    silent: bool
+
+proc inProcessMakeAvailable(): bool =
+  ## Is the in-process scheduler in front of the DAG? `nimony`'s `main`
+  ## installs it unless the user asked for `--spawn:always`, and nothing else
+  ## in the toolchain installs a relay -- so a `nimsem` that reaches this code
+  ## (the legacy `nimsem e` path) keeps spawning and links none of the tools.
+  when defined(nimony):
+    false
+  else:
+    dag.relayInstalled()
+
+proc initMakeInvocation(nifmake, baseDir: string; flags: set[BuildFlag];
+                        rerun: bool; maxJobs: int): MakeInvocation =
+  result = MakeInvocation(
+    spawnPrefix: quoteShell(nifmake) &
+      (if ForceRebuild in flags: " --force" else: "") &
+      (if Profile in flags: " --profile" else: "") &
+      (if Report in flags: " --report" else: "") &
+      " --base:" & quoteShell(baseDir) &
+      (if rerun: " --rerun" else: "") &
+      (if maxJobs == 1: "" elif maxJobs > 0: " -j:" & $maxJobs else: " -j") & " run ",
+    baseDir: baseDir,
+    force: ForceRebuild in flags,
+    rerun: rerun,
+    maxJobs: maxJobs,
+    inProcess: inProcessMakeAvailable(),
+    report: Report in flags,
+    profile: Profile in flags,
+    silent: SilentMake in flags or Report in flags)
+
+proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int) =
+  ## Run one build graph. Failure ends the compile with the same message the
+  ## spawned form produced, so a caller cannot tell the two apart from the
+  ## outside except by the process tree.
+  if not inv.inProcess:
+    let progress =
+      if inv.silent: ""
+      else: "--progress:" & $lo & ":" & $hi & " "
+    exec inv.spawnPrefix & progress & quoteShell(buildFile)
+    return
+
+  when not defined(nimony):
+    # `--jobs:1` is sequential, not "one process at a time through
+    # `execProcesses`": the whole point of asking for it is a build whose
+    # output interleaving and node order are the DAG's, so it takes the path
+    # that has no batch in it.
+    var opt: set[dag.CliOption] = if inv.maxJobs == 1: {} else: {dag.Parallel}
+    if inv.force: opt.incl dag.Force
+    if inv.rerun: opt.incl dag.Rerun
+    if inv.profile: opt.incl dag.Profile
+    if inv.report: opt.incl dag.Report
+    if not inv.silent: opt.incl dag.Progress
+    var profile = dag.initProfileData()
+    let parseStart = getMonoTime()
+    var d = dag.parseNifFile(buildFile, inv.baseDir)
+    profile.parseTime = dag.toSeconds(getMonoTime() - parseStart)
+    let wantProfile = inv.profile or inv.report
+    let ok = dag.runDag(d, opt, (if wantProfile: addr profile else: nil), lo, hi, inv.maxJobs)
+    if inv.profile: stderr.write dag.profileText(profile)
+    if inv.report:
+      stdout.write dag.reportLine(profile)
+      # A spawned nifmake flushed at process exit, i.e. before nimony went on
+      # to link or to run the program. In-process the line would sit in this
+      # process's buffer until `main` returns and surface AFTER the built
+      # program's own output, which reads as a different build order than it
+      # is.
+      stdout.flushFile()
+    if not ok:
+      # The spawned form died inside `exec`, which prints the nifmake command
+      # line it could not complete. In-process there is no command line for
+      # the graph, and `runDag` has already named the node that failed, so the
+      # build file is the useful identifier.
+      #
+      # Flush first. A failing node's diagnostics went to THIS process's
+      # stdout, which is block-buffered when the compiler's output is a pipe,
+      # while `quit` writes its message straight to stderr -- so without this
+      # the trailer arrives before the error it is a trailer for. The spawned
+      # form got the ordering for free because the child exited (and flushed)
+      # before `exec` returned, and `hastur`'s `removeMakeErrors` strips
+      # exactly the last `nifmake:`/`FAILURE:` lines, so the ordering is what
+      # every `.msgs` golden of a failing compile depends on.
+      stdout.flushFile()
+      quit "FAILURE: build graph " & buildFile
 
 proc buildGraph*(config: sink NifConfig; project: string;
     flags: set[BuildFlag];
@@ -2287,19 +2425,15 @@ proc buildGraph*(config: sink NifConfig; project: string;
   when defined(windows) and not defined(nimony):
     putEnv("CC", "gcc")
     putEnv("CXX", "g++")
-  let nifmakeBase = quoteShell(nifmake) &
-    (if forceRebuild: " --force" else: "") &  # Use generic force flag
-    (if Profile in flags: " --profile" else: "") &
-    (if Report in flags: " --report" else: "") &
-    " --base:" & quoteShell(config.baseDir)
-  let nifmakeCommand = nifmakeBase & " -j run "
+  let nifmakeCommand = initMakeInvocation(nifmake, config.baseDir, flags,
+                                          rerun = false, maxJobs = makeJobs())
   # A changed configuration invalidates every sem result, and now says so
   # directly instead of through a file the sem nodes pretended to read.
   # `--rerun`, not `--force`: the outputs must stay in place so nimsem's
   # OnlyIfChanged writes can still find a result unchanged and spare the
   # entire backend.
-  let frontendCommand = nifmakeBase &
-    (if configChanged: " --rerun" else: "") & " -j run "
+  let frontendCommand = initMakeInvocation(nifmake, config.baseDir, flags,
+                                           rerun = configChanged, maxJobs = makeJobs())
 
   # `nimony c` drives nifmake once for the frontend and once more for the
   # backend (or docs); `DoCheck` stops after the frontend. Hand each invocation
@@ -2307,7 +2441,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
   # indicator across the separate processes instead of restarting per phase.
   let twoPhase = cmd != DoCheck
 
-  exec frontendCommand & progArg(flags, 0, if twoPhase: 50 else: 100) & quoteShell(buildFilename)
+  runMake(frontendCommand, buildFilename, 0, if twoPhase: 50 else: 100)
 
   if cmd == DoDoc:
     c = initDepContext(config, project, nifler, true, forceRebuild, moduleFlags, cmd)
@@ -2326,7 +2460,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
       if parent.len > 0 and parent != docOut:
         onRaiseQuit createDir(path(parent))
     let buildDocFilename = generateDocBuildFile(c)
-    exec nifmakeCommand & progArg(flags, 50, 100) & quoteShell(buildDocFilename)
+    runMake(nifmakeCommand, buildDocFilename, 50, 100)
     return
 
   if cmd != DoCheck:
@@ -2354,7 +2488,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
     if useObjectCache:
       let analysisFile = generateFinalBuildFile(c, commandLineArgsLengc, passC, passL,
                                                 fpAnalysis)
-      exec nifmakeCommand & progArg(flags, 50, 60) & quoteShell(analysisFile)
+      runMake(nifmakeCommand, analysisFile, 50, 60)
       fillObjectCache(c, c.config.backendDirName(c.rootNode.files[0]),
                       commandLineArgsLengc, passC)
       if c.config.ctfeAnalysisOnly:
@@ -2382,7 +2516,7 @@ proc buildGraph*(config: sink NifConfig; project: string;
     let exeOutDir = exeOutPath.parentDir
     if exeOutDir.len > 0:
       onRaiseQuit createDir(path(exeOutDir))
-    exec nifmakeCommand & progArg(flags, 50, 100) & quoteShell(buildFinalFilename)
+    runMake(nifmakeCommand, buildFinalFilename, 50, 100)
     if useObjectCache:
       publishObjectCache(c, c.config.backendDirName(c.rootNode.files[0]))
 

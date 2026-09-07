@@ -1,0 +1,223 @@
+Phase A2b — nifmake as a library: the phase registry and the scheduling rule
+===========================================================================
+
+commit:   jit/a2b, f281154d (forked from fast-devloop ae5f8d51)
+machine:  macOS 26 (Darwin 25.6.0), Apple M5, 10 cores, Nim 2.2.10, Apple clang
+date:     2026-09-06
+script:   bench/devloop_bench.sh, 3 runs per scenario, median reported
+base:     /tmp/devloop_base, the fork point f69b8afc
+modes:    base            the fork-point toolchain (no scheduler exists there)
+          head            this branch, default (`--spawn:auto`)
+          head-spawn      this branch, EXTRA=--spawn:always (the escape hatch:
+                          `nifmake` is spawned and so is every DAG node, i.e.
+                          the process tree of the release before this one)
+
+All three runs carry NIMONY_VFS=disk, which the script sets. That does NOT
+disable the in-process path: only an explicit `--vfs:disk` on the command line
+implies `--spawn:always` (see notes/a2b.md §4.5), because A1b left the default
+policy at `disk` until A2c flips it and reading the resolved policy here would
+leave this phase dead at its own default.
+
+The three runs were taken sequentially with nothing else on the machine.
+
+
+Wall time (s, median of 3)
+--------------------------
+
+  scenario         base     head   head-spawn    head vs base   head vs spawn
+  hello.forced    0.430    0.406       0.429          -5.6%          -5.4%
+  hello.nochange  0.015    0.006       0.012         -60.0%         -50.0%
+  hello.edit      0.081    0.064       0.084         -21.0%         -23.8%
+  ctfe.cold       2.539    2.187       2.312         -13.9%          -5.4%
+  ctfe.warm       0.012    0.008       0.012         -33.3%         -33.3%
+  ctfe.edit       0.197    0.072       0.092         -63.5%         -21.7%
+  ctfe.forced     3.722    1.335       1.392         -64.1%          -4.1%
+  bench.cold      6.028    4.679       5.309         -22.4%         -11.9%
+  bench.edit      0.423    0.100       0.119         -76.4%         -16.0%
+  stdlib.cold     5.445    5.516       5.488          +1.3%          +0.5%
+  stdlib.forced   2.053    2.361       2.055         +15.0%         +14.9%
+  stdlib.edit     0.444    0.464       0.424          +4.5%          +9.4%
+
+
+CPU sum of the process tree (s, median of 3) — read this one first
+------------------------------------------------------------------
+
+  scenario         base     head   head-spawn    head vs base
+  hello.forced    0.682    0.635       0.693          -6.9%
+  hello.nochange  0.012    0.005       0.010         -58.3%
+  hello.edit      0.100    0.094       0.109          -6.0%
+  ctfe.cold       3.804    2.470       3.002         -35.1%
+  ctfe.warm       0.010    0.007       0.010         -30.0%
+  ctfe.edit       0.196    0.100       0.117         -49.0%
+  ctfe.forced     5.528    1.594       2.294         -71.2%
+  bench.cold      9.296    4.129       5.361         -55.6%
+  bench.edit      0.428    0.129       0.157         -69.9%
+  stdlib.cold    30.066   25.746      29.871         -14.4%
+  stdlib.forced   9.342    7.509       9.580         -19.6%
+  stdlib.edit     1.299    0.575       0.741         -55.7%
+
+
+The gates
+---------
+
+1. "Zero spawns before `cc` for a one-module edit of hello world."
+   MET for the build graph, MISSED by one process overall.
+
+   `nimony c --report` after appending one line to a one-module program:
+
+     nifmake-report nimsem=1 total=1 inproc=1
+     nifmake-report cc=1 dceEmit=1 dceLive=0 hexer=1 lengc=1 link=1 total=5 inproc=3
+
+   Every node of both graphs before `cc` ran in this process. The one process
+   left is `nifler`, and it is not a DAG node here at all: `deps.execNifler`
+   re-parses the edited module during dependency discovery, before the graph
+   is emitted. Nifler is the one frontend phase that could not be registered —
+   linking it needs `--path:$nim/compiler`, which collides
+   `compiler/platform.nim` with `src/lib/platform.nim` under one object-file
+   name and breaks the link on `CPU`/`OS`; notes/a2b.md §3.2 and the header of
+   `src/nimony/phases.nim` carry the full finding.
+
+2. "A new CTFE evaluation with `--ctfe:engine` <= 0.2 s, and the frontend of it
+   spawn-free."
+   NOT MEASURABLE HERE for the engine half; the spawn-free half is MET.
+
+   This machine has no `../nativenif` checkout, so nimsem is built without
+   `-d:nimonyEngine` and `--ctfe:engine` falls back to the subprocess for every
+   evaluation (`tests/ctfe_diff` says so and skips its own engine pair). What
+   can be measured is the subprocess path, and it moved:
+
+     ctfe.cold   2.539 s -> 2.187 s wall, 3.804 s -> 2.470 s cpu
+     ctfe.edit   0.197 s -> 0.072 s wall  (five `const`s, all memo hits)
+     bench.cold  6.028 s -> 4.679 s wall, 9.296 s -> 4.129 s cpu (14 `const`s)
+
+   Spawn-free is asserted rather than timed, by `incrementalInprocTests`
+   phase 4: after compiling `tests/incremental/ctfedep.nim` into a fresh
+   nimcache, `<nimcache>/ledger.nif` holds no `spawn` sample for `nimsem`,
+   `hexer`, `dce`, `dceLive`, `dceEmit` or `lengc` and does hold one for
+   `cc`/`link`. That covers the sub-compile's own two build graphs as well as
+   the outer build's, because both write into the same nimcache.
+
+   `--stats` on a hello world shows the same thing directly:
+
+     [stats] phase       samples   produce ms   spawn ms
+     [stats] cc                4          0.0       53.9
+     [stats] dceEmit           4          0.2        0.0
+     [stats] dceLive           1          9.2        0.0
+     [stats] hexer             4         11.6        0.0
+     [stats] lengc             4          0.5        0.0
+     [stats] link              1          0.0      197.1
+     [stats] nifler           30          0.4        5.2
+     [stats] nimsem            4         18.7        0.0
+
+3. "Cold stdlib-wide build within 10 % of `--spawn:always` wall time."
+   MET: 5.516 s against 5.488 s, +0.5 %.
+
+   This is the gate the scheduling rule was tuned against. The literal
+   per-node form of JIT.md 6.2's cost clause answers "not worth a process" for
+   each of 99 cheap `hexer` nodes at one DAG depth and then runs them one
+   after another — 0.606 s of `hexer` plus 0.776 s of `nimsem` serialised,
+   measured with `nimony c -f --profile`, and stdlib.cold 11 % over. Scaling
+   the clause to the depth (`est * readyAtDepth < spawn * k * cores`, which
+   reduces to the written rule at `readyAtDepth == cores`) recovers it. See
+   the commit f281154d and notes/a2b.md.
+
+
+The one regression
+------------------
+
+`stdlib.forced` is +15 % wall against both base and `--spawn:always`, while
+costing 20 % less CPU. A forced rebuild of 101 stdlib modules re-runs every
+`nimsem` node, and those sit in an import chain whose depths are mostly
+narrower than the 10 cores — so JIT.md 6.2's second clause ("fewer ready nodes
+than cores -> in-process") keeps them here and they run one after another,
+where the fan-out would have used the two or three cores a narrow depth can
+fill. It is the cost of in-process phases being sequential, which JIT.md 6.1
+takes on deliberately and defers until a ledger shows threads would pay.
+
+It is not a dev-loop scenario: `stdlib.edit`, which is, is +4.5 % wall for
+-56 % cpu, and every hello/ctfe/bench scenario is faster on both axes.
+
+
+Raw runs
+--------
+
+base (toolchain /tmp/devloop_base, NIMONY_VFS=disk, EXTRA=)
+
+hello.forced    wall   0.430  cpu   0.682   raw wall: 0.435 0.428 0.430  cpu: 0.682 0.680 0.682
+hello.nochange  wall   0.015  cpu   0.012   raw wall: 0.015 0.014 0.015  cpu: 0.013 0.012 0.012
+hello.edit      wall   0.081  cpu   0.100   raw wall: 0.085 0.081 0.079  cpu: 0.107 0.094 0.100
+ctfe.cold       wall   2.539  cpu   3.804   raw wall: 2.781 2.539 2.514  cpu: 3.804 3.766 3.837
+ctfe.warm       wall   0.012  cpu   0.010   raw wall: 0.012 0.012 0.012  cpu: 0.010 0.010 0.010
+ctfe.edit       wall   0.197  cpu   0.196   raw wall: 0.197 0.196 0.201  cpu: 0.207 0.188 0.196
+ctfe.forced     wall   3.722  cpu   5.528   raw wall: 3.693 3.772 3.722  cpu: 5.528 5.518 5.545
+bench.cold      wall   6.028  cpu   9.296   raw wall: 6.761 5.853 6.028  cpu: 9.363 9.210 9.296
+bench.edit      wall   0.423  cpu   0.428   raw wall: 0.442 0.423 0.419  cpu: 0.471 0.428 0.421
+stdlib.cold     wall   5.445  cpu  30.066   raw wall: 5.245 5.454 5.445  cpu: 29.311 30.066 30.508
+stdlib.forced   wall   2.053  cpu   9.342   raw wall: 2.086 2.007 2.053  cpu: 9.332 9.342 9.397
+stdlib.edit     wall   0.444  cpu   1.299   raw wall: 0.461 0.444 0.442  cpu: 1.299 1.295 1.300
+
+head (toolchain ., NIMONY_VFS=disk, EXTRA=)
+
+hello.forced    wall   0.406  cpu   0.635   raw wall: 0.402 0.407 0.406  cpu: 0.618 0.638 0.635
+hello.nochange  wall   0.006  cpu   0.005   raw wall: 0.006 0.006 0.006  cpu: 0.005 0.005 0.005
+hello.edit      wall   0.064  cpu   0.094   raw wall: 0.065 0.064 0.064  cpu: 0.094 0.094 0.080
+ctfe.cold       wall   2.187  cpu   2.470   raw wall: 2.455 2.187 2.110  cpu: 2.476 2.453 2.470
+ctfe.warm       wall   0.008  cpu   0.007   raw wall: 0.008 0.008 0.008  cpu: 0.007 0.007 0.007
+ctfe.edit       wall   0.072  cpu   0.100   raw wall: 0.071 0.072 0.072  cpu: 0.100 0.101 0.099
+ctfe.forced     wall   1.335  cpu   1.594   raw wall: 2.026 1.329 1.335  cpu: 1.721 1.594 1.586
+bench.cold      wall   4.679  cpu   4.129   raw wall: 5.666 4.591 4.679  cpu: 4.312 4.113 4.129
+bench.edit      wall   0.100  cpu   0.129   raw wall: 0.121 0.100 0.100  cpu: 0.172 0.129 0.128
+stdlib.cold     wall   5.516  cpu  25.746   raw wall: 5.386 5.516 5.589  cpu: 25.167 25.746 26.007
+stdlib.forced   wall   2.361  cpu   7.509   raw wall: 2.295 2.361 2.372  cpu: 7.406 7.509 7.578
+stdlib.edit     wall   0.464  cpu   0.575   raw wall: 0.464 0.407 0.575  cpu: 0.500 0.575 0.639
+
+head-spawn (toolchain ., NIMONY_VFS=disk, EXTRA=--spawn:always)
+
+hello.forced    wall   0.429  cpu   0.693   raw wall: 0.429 0.437 0.429  cpu: 0.693 0.682 0.695
+hello.nochange  wall   0.012  cpu   0.010   raw wall: 0.012 0.012 0.012  cpu: 0.010 0.010 0.010
+hello.edit      wall   0.084  cpu   0.109   raw wall: 0.084 0.084 0.083  cpu: 0.105 0.111 0.109
+ctfe.cold       wall   2.312  cpu   3.002   raw wall: 2.715 2.308 2.312  cpu: 3.007 2.987 3.002
+ctfe.warm       wall   0.012  cpu   0.010   raw wall: 0.012 0.012 0.012  cpu: 0.010 0.010 0.010
+ctfe.edit       wall   0.092  cpu   0.117   raw wall: 0.091 0.093 0.092  cpu: 0.106 0.120 0.117
+ctfe.forced     wall   1.392  cpu   2.294   raw wall: 2.009 1.362 1.392  cpu: 2.303 2.261 2.294
+bench.cold      wall   5.309  cpu   5.361   raw wall: 6.288 5.309 5.190  cpu: 5.486 5.361 5.333
+bench.edit      wall   0.119  cpu   0.157   raw wall: 0.142 0.118 0.119  cpu: 0.216 0.148 0.157
+stdlib.cold     wall   5.488  cpu  29.871   raw wall: 5.294 5.509 5.488  cpu: 29.049 29.871 30.526
+stdlib.forced   wall   2.055  cpu   9.580   raw wall: 2.049 2.055 2.056  cpu: 9.586 9.547 9.580
+stdlib.edit     wall   0.424  cpu   0.741   raw wall: 0.424 0.414 0.504  cpu: 0.741 0.734 1.398
+
+An earlier `head` run, before the cost clause was scaled to the DAG depth
+(commit f281154d), for the record — it is the measurement that motivated the
+change, and every scenario but the stdlib three is within noise of the final
+numbers:
+
+hello.forced    wall   0.417  cpu   0.651
+hello.nochange  wall   0.006  cpu   0.005
+hello.edit      wall   0.069  cpu   0.087
+ctfe.cold       wall   2.139  cpu   2.489
+ctfe.warm       wall   0.008  cpu   0.007
+ctfe.edit       wall   0.072  cpu   0.102
+ctfe.forced     wall   1.366  cpu   1.587
+bench.cold      wall   4.617  cpu   4.167
+bench.edit      wall   0.102  cpu   0.130
+stdlib.cold     wall   6.108  cpu  22.288      <- +11.3 % over --spawn:always
+stdlib.forced   wall   2.533  cpu   7.057
+stdlib.edit     wall   0.505  cpu   0.518
+
+
+Binary sizes and build time
+---------------------------
+
+nimony links nimsem, hexer and lengc, because the registry calls their `run*`
+procs. Nothing else in `bin/` changed size by more than the noise of a
+recompile.
+
+  binary     before      after     delta
+  nimony    2914648    4772664    +63.7%
+  nimsem    2812216    2812376      +0.0%
+  hexer     1975896    1975896       0.0%
+  lengc     1048760    1048760       0.0%
+  nifmake    406632     403832      -0.7%   (the CLI is 184 lines now)
+
+`nim c -d:release src/nimony/nimony.nim` went from ~1.6 s to ~4.0 s of Nim
+front-end time on this machine.
