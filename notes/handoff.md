@@ -25,7 +25,8 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 ## In flight
 
-- **B3d** (`jit/b3d`, nativenif clone `/tmp/b3d/nativenif` branch `jit/b3d-native`): per-symbol blob validity in nifasm and per-proc asm splicing in arkham. On merge: fetch the nativenif branch into `/Users/chanc/Projects/nativenif`, re-pin `src/nativenif.commit`, run the routine, re-take the headline.
+- **B3e** (`jit/b3e`, nativenif clone `/tmp/b3e/nativenif` branch `jit/b3e-native`): arkham per-proc splice. **H1** (`jit/h1`): incremental live set in hexer. Both launched 2026-09-07 after B3d; merge each by the routine below (fetch the nativenif branch, re-pin, rebuild, suites, boot, A/B).
+- (merged) **B3d** (`jit/b3d`, nativenif clone `/tmp/b3d/nativenif` branch `jit/b3d-native`): per-symbol blob validity in nifasm and per-proc asm splicing in arkham. On merge: fetch the nativenif branch into `/Users/chanc/Projects/nativenif`, re-pin `src/nativenif.commit`, run the routine, re-take the headline.
 - (merged) **F2** (`jit/f2`, worktree under `.claude/worktrees/`): hexer's temp
   counters (`xelim.Pass.nextTemp`, `intramodinliner.InlinerCtx.counter`, ...)
   scoped per top-level declaration. Gate: `decl-stability`'s `tempadd`
@@ -54,14 +55,13 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 | | fork point | branch |
 |---|---|---|
-| live edit in `sem.nim`, rebuild | 2.68 s / 3.87 s cpu / 117 MB | 1.26 s / 1.29 s / 114 MB (after F2) |
+| live edit in `sem.nim`, rebuild | 2.65 s / 3.83 s cpu / 117 MB | 1.08 s / 1.12 s / 107 MB (after B3d) |
 | dead-proc edit (old headline) | 2.31 / 3.59 / 116 | 0.71 / 0.70 / 101 |
 | cold | 5.61 / 14.6 / 116 | 5.37 / 13.8 / 147 |
 
-Where the live edit's 1.35 s goes: nimsem 0.44, dceLive 0.39, hexer 0.28,
-arkham 0.27, link 0.33 (overlapping). F2 targets hexer's renumbering, which
-is also what makes `.dce.nif`/`.c.nif`/asm change module-wide (dceLive,
-arkham, link).
+Where the live edit's 1.08 s goes: nimsem 0.34, dceLive 0.36, hexer 0.27,
+arkham 0.26, dceEmit 0.05, link 0.12 (overlapping). H1 targets dceLive,
+B3e arkham; nimsem is the owner's decision.
 
 ## Open decisions and follow-ups (owner's)
 

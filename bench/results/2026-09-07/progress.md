@@ -189,3 +189,18 @@ still lowers the whole module; the wall gain from F2 alone is small
 validity in nifasm (627 -> ~3 stale) and per-proc splicing in arkham; after
 those, `dceLive` (0.39 s of whole-program liveness for a one-body edit)
 and the per-module sem re-check (0.44 s) are what is left.
+
+## Run 16: B3d (per-declaration blob validity in nifasm, per-proc names in arkham) merged -- interleaved, load decaying from 21
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB | wall | cpu |
+|---|---|---|---|---|
+| sem.nim LIVE edit, rebuild | 2.650 / 3.832 / 117 | 1.084 / 1.124 / 107 | 2.44x | 3.41x |
+| compiler, cold | 5.447 / 14.308 / 116 | 5.405 / 13.928 / 147 | 1.01x | 1.03x |
+
+Per stage on the live edit (b3d.txt): nimsem 0.34, dceLive 0.36 (first
+rebuild after an edit only), hexer 0.27, arkham 0.26 (3 modules), dceEmit
+0.05, link 0.12 (was 0.32; blob recorded 627 -> 18). Pin: nativenif
+7b838ec. The arkham commit changes 137 of 2583 refactor-gate artifacts by
+label/temp renames only; no image hash moved; one arm64 nativecg golden
+regenerated. Left: arkham splicing (~0.26 -> ~0.1 s), an incremental live
+set for dceLive (0.36 s), the per-module sem re-check (0.34 s, owner).
