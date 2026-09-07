@@ -446,3 +446,23 @@ current directory fails at the fork point and on head alike --
 time: firstField(VersionFile)` then `/bin/sh: nimony: command not found` --
 the CTFE sub-compile resolves the tool name `nimony` to the file in the cwd.
 Pre-existing; noted in JIT_IMPL.md.
+
+## Run 8: the headline with B3's code cache wired in (interleaved, 5 rounds)
+
+head = b4eb15c6 (B3 nativenif + nimony halves, pin f8d2676). `bench/devloop_ab.sh
+/tmp/devloop_base . self.editbody 5`, load decaying from the test runs before it.
+
+| sem.nim body edit, native, rebuild | fork point | head | ratio |
+|---|---|---|---|
+| wall | 2.403 | 1.383 | 1.74x |
+| cpu | 3.635 | 1.420 | 2.56x |
+
+`nimony r src/nimony/nimony.nim --version` after each of five successive
+body edits (head only; the fork point has no `r`): wall 1.328 1.342 1.346
+1.339 1.347, cpu ~1.38. Native bootstrap: 46.8 s, stages 1 == 2 == 3.
+
+What is left in the 1.38 s (run 6 + B3's per-stage line): assemble 0.48 s
+(of which 0.32 s is following foreign names and validating layout stamps --
+a symbol-table cache in nifasm, JIT_IMPL.md small items), nimsem ~0.45 s,
+hexer ~0.36 s, arkham ~0.4 s on the edited module (B3b), ~0.15 s of dceEmit,
+dependency scan and graph emission.
