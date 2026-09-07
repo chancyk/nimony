@@ -2082,6 +2082,17 @@ proc typeToString*(n: Cursor; renderFlags: RenderFlags = {}): string =
     typ = payload
   result = renderTree(typ, renderFlags = renderFlags, renderType = true)
 
+proc asNimSym*(symId: SymId): string {.inline.} =
+  ## How a diagnostic NAMES a symbol: the identifier the user wrote, never the
+  ## compiler's bookkeeping around it. The counterpart of `asNimCode` for the
+  ## messages that hold a `SymId` rather than a tree — the tree renderer already
+  ## strips the same way (`gsub`'s `Symbol`/`SymbolDef` arms).
+  ##
+  ## `symparser.sourceIdent` carries the argument for the rule; the short of it
+  ## is that a message already says WHERE, so it never has to say `a.6` to mean
+  ## the `a` at line 68.
+  sourceIdent(pool.syms[symId])
+
 proc typeExprToString*(n: Cursor): string {.inline.} =
   ## Like `typeToString`, but always unwraps `(err …)` to the wrapped type.
   typeToString(n)

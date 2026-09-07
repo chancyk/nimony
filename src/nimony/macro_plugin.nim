@@ -23,14 +23,6 @@ type
 
 func hash(s: SymId): Hash {.borrow.}
 
-proc cleanSymbolName(s: string): string =
-  ## Extract the base name from a fully-qualified symbol (strip `.0.suffix`).
-  let dotPos = s.find('.')
-  if dotPos >= 0:
-    result = substr(s, 0, dotPos - 1)
-  else:
-    result = s
-
 # ----------------------------------------------------------------------------
 # NIF builder helpers (no string rendering involved)
 # ----------------------------------------------------------------------------
@@ -245,7 +237,7 @@ proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
   ## Symbols from the post-sem macro decl are rewritten to idents at the end
   ## so the plugin module re-runs through sem with its own scope.
   result = createTokenBuf(128)
-  let macroName = cleanSymbolName(pool.syms[macroSym])
+  let macroName = sourceIdent(pool.syms[macroSym])
   let implName = macroName & "Impl"
   let paramCount = countParams(macroDecl)
 
@@ -329,7 +321,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     commandLineArgs: commandLineArgs, extraPath: srcLibPath, outFile: exePath))
   if inproc != EvalBuildUnavailable:
     if inproc != 0:
-      echo "Error compiling macro plugin for '", cleanSymbolName(pool.syms[macroSym]), "'"
+      echo "Error compiling macro plugin for '", sourceIdent(pool.syms[macroSym]), "'"
       return ""
     return exePath
 
@@ -349,7 +341,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     echo "Macro plugin: failed to invoke ", cmd
     return ""
   if exitCode != 0:
-    echo "Error compiling macro plugin for '", cleanSymbolName(pool.syms[macroSym]), "':"
+    echo "Error compiling macro plugin for '", sourceIdent(pool.syms[macroSym]), "':"
     echo output
     return ""
 
