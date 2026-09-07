@@ -26,16 +26,10 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 ## In flight
 
-- **B3e** (nativenif clone `/tmp/b3e/nativenif` branch `jit/b3e-native`, nimony clone `/tmp/b3e/nimony_clone` branch `jit/b3e` if it needed a nimony change): arkham per-proc splice. Merge by the routine below (fetch the nativenif branch into `/Users/chanc/Projects/nativenif`, re-pin `src/nativenif.commit`, rebuild, suites, boot, A/B).
-- (merged) **H1**: not the incremental live set -- a deep-copy bug in `markLive`; `dceLive` 0.36 -> 0.05 s.
-- (merged) **B3d** (`jit/b3d`, nativenif clone `/tmp/b3d/nativenif` branch `jit/b3d-native`): per-symbol blob validity in nifasm and per-proc asm splicing in arkham. On merge: fetch the nativenif branch into `/Users/chanc/Projects/nativenif`, re-pin `src/nativenif.commit`, run the routine, re-take the headline.
-- (merged) **F2** (`jit/f2`, worktree under `.claude/worktrees/`): hexer's temp
-  counters (`xelim.Pass.nextTemp`, `intramodinliner.InlinerCtx.counter`, ...)
-  scoped per top-level declaration. Gate: `decl-stability`'s `tempadd`
-  phase drops from 18 to 1 changed lowering-output declarations, and the
-  live `sem.nim` edit changes <= 3 instead of 890 of 1794. On merge: tighten
-  the `expect dTempOut <= 18` bound in `src/hastur/incrementaltests.nim`
-  to 1 (the comment above it says so), re-take the headline.
+Nothing. Paused on the owner's instruction after B3e merged (2026-09-07).
+All `jit/*` branches are merged; `git worktree list` should show only the
+main tree and `/tmp/devloop_base`. `../nativenif` is at pin 5f6f011
+(`jit/b3e-native`).
 
 ## How a phase is merged (the routine used throughout)
 
@@ -57,13 +51,14 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 | | fork point | branch |
 |---|---|---|
-| live edit in `sem.nim`, rebuild | 2.57 s / 3.87 s cpu / 117 MB | 1.18 s / 1.22 s / 107 MB (after H1, under load) |
-| live edit that adds a proc + call | 2.29 / 3.54 / 117 | 1.14 / 1.18 / 147 |
+| live edit in `sem.nim`, rebuild | 2.30 s / 3.56 s cpu / 117 MB | 0.92 s / 0.94 s / 107 MB (after B3e) |
+| live edit that adds a proc + call | 2.69 / 3.87 / 117 | 1.14 / 1.15 / 147 |
 | dead-proc edit (old headline) | 2.31 / 3.59 / 116 | 0.71 / 0.70 / 101 |
 | cold | 5.61 / 14.6 / 116 | 5.37 / 13.8 / 147 |
 
-Where the live edit goes now: nimsem 0.34, hexer 0.27, arkham 0.26 (B3e),
-dceLive 0.05, dceEmit 0.05, link 0.12. nimsem is the owner's decision.
+Where the live edit's 0.92 s goes: nimsem 0.34 (owner's decision), hexer
+0.27 (B3b's incremental expand, floor ~0.11 s), link 0.12, arkham 0.09,
+dceLive 0.05, dceEmit 0.05.
 
 ## Open decisions and follow-ups (owner's)
 

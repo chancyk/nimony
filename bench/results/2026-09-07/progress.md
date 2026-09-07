@@ -220,3 +220,20 @@ value: a whole `ModuleAnalysis` deep-copied per worklist pop, 7867 times),
 131 live files byte-identical; the incremental live set was measured as
 worth ~11 ms and not built. Absolutes this run carry B3e's build load; the
 ratios and the per-stage numbers in h1.txt are the evidence.
+
+## Run 18: B3e (arkham splices unchanged procs) merged -- interleaved, nothing else running, load decaying from 21
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB | wall | cpu |
+|---|---|---|---|---|
+| sem.nim live edit, body only | 2.304 / 3.562 / 117 | 0.917 / 0.938 / 107 | 2.51x | 3.80x |
+| sem.nim live edit, new proc + call | 2.686 / 3.866 / 117 | 1.136 / 1.154 / 147 | 2.36x | 3.35x |
+| compiler, cold | 5.676 / 14.666 / 116 | 5.198 / 13.919 / 147 | 1.09x | 1.05x |
+
+B3e: `--asmcache:DIR` on the arkham node; `<mod>.arkham.nif` sidecar of
+per-proc digests and byte ranges into the module's previous `.asm.nif`;
+arkham 0.259 -> 0.089 s on the live edit (523/526 procs spliced); 8 cache
+states x 5 targets byte-identical; refactor gate byte-identical; pin
+nativenif 5f6f011. Paused here (owner's instruction). What is left in the
+0.92 s: nimsem ~0.34 (the per-module re-check, owner's decision), hexer
+~0.27 (whole-module lowering; B3b's incremental `expand`, floor ~0.11 s),
+link 0.12, arkham 0.09, dceEmit 0.05.
