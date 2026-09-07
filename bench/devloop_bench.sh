@@ -57,6 +57,12 @@ set -u
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=${1:?"usage: devloop_bench.sh <toolchain-root> [label] [runs]"}
+# Absolute, always: the `self.*` scenarios run their command under `cd` into a
+# scratch copy of the sources, so a relative root (`.`, which is what the
+# measurement protocol in JIT_IMPL.md spells) would resolve `./bin/nimony`
+# against the wrong directory and every `self.*` row would silently be the
+# 5 ms of a failing `sh -c`.
+root=$(cd "$root" && pwd)
 label=${2:-$(basename "$root")}
 runs=${3:-3}
 nimony="$root/bin/nimony"

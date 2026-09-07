@@ -1,0 +1,158 @@
+B1 (nimony half) -- `nimony r`: build with the native backend and run `main`
+from the compiler's own memory.  JIT_IMPL.md phase B1, JIT.md 7.3.
+
+Branch jit/b1-nimony, forked from fast-devloop at ff427b65.
+Host: macOS 26.6.2, Apple M5 (10 cores), Nim 2.2.10, NIMONY_VFS=disk.
+Toolchain: this worktree, `hastur build all` against a PINNED private clone of
+nativenif at 736b491 (`/tmp/b1n/nativenif`, with `/tmp/b1n/nimony` symlinked to
+this worktree so nativenif's sibling-relative `nim.cfg` paths resolve).  The
+real sibling `../nativenif` had moved to the B3 agent's working tree
+(a993d072 + uncommitted changes) partway through, and `hastur` builds
+arkham/nifasm from whatever is there -- so everything below was re-measured on
+a toolchain rebuilt from scratch against the pin.
+
+The machine was NOT quiet: the B3 agent was building and benchmarking in
+`../nativenif` throughout.  Read the pairs against each other, not the
+absolutes.
+
+  uptime before: 22:09  up 17 days, 22:05, 5 users, load averages: 9.87 11.82 9.39
+  uptime after:  22:11  up 17 days, 22:07, 5 users, load averages: 6.37 9.97 8.99
+
+
+== bench/devloop_bench.sh . head 3 (median of 3, backend=n, stdlib.* on c) ====
+
+hello.forced    wall   0.336  cpu   0.475   raw wall: 0.345 0.333 0.336  cpu: 0.473 0.489 0.475
+hello.nochange  wall   0.006  cpu   0.005   raw wall: 0.007 0.006 0.006  cpu: 0.006 0.005 0.005
+hello.edit      wall   0.038  cpu   0.033   raw wall: 0.037 0.038 0.039  cpu: 0.032 0.033 0.034
+hello.nrun      wall   0.320  cpu   0.046   raw wall: 0.188 0.332 0.320  cpu: 0.039 0.050 0.046
+hello.run       wall   0.033  cpu   0.030   raw wall: 0.032 0.033 0.033  cpu: 0.029 0.030 0.030
+ctfe.cold       wall   1.373  cpu   2.070   raw wall: 1.766 1.373 1.168  cpu: 2.629 2.070 1.780
+ctfe.warm       wall   0.010  cpu   0.009   raw wall: 0.011 0.010 0.010  cpu: 0.010 0.009 0.009
+ctfe.edit       wall   0.062  cpu   0.055   raw wall: 0.060 0.062 0.065  cpu: 0.053 0.055 0.057
+ctfe.forced     wall   1.171  cpu   1.729   raw wall: 1.175 1.171 0.987  cpu: 1.813 1.729 1.532
+bench.cold      wall   1.421  cpu   1.974   raw wall: 1.424 1.404 1.421  cpu: 1.980 1.945 1.974
+bench.edit      wall   0.070  cpu   0.065   raw wall: 0.085 0.070 0.070  cpu: 0.090 0.065 0.064
+stdlib.cold     wall   8.375  cpu  42.498   raw wall: 8.528 8.375 8.363  cpu: 43.010 42.498 42.258
+stdlib.forced   wall   3.038  cpu  13.204   raw wall: 3.038 3.040 3.018  cpu: 13.268 13.204 13.179
+stdlib.edit     wall   0.424  cpu   0.792   raw wall: 0.482 0.424 0.413  cpu: 0.854 0.792 0.759
+self.cold       wall   6.427  cpu  15.110   raw wall: 6.427 6.407 6.466  cpu: 15.061 15.110 15.137
+self.nochange   wall   0.106  cpu   0.104   raw wall: 0.109 0.104 0.106  cpu: 0.107 0.103 0.104
+self.editbody   wall   1.911  cpu   1.951   raw wall: 1.898 1.911 1.951  cpu: 1.940 1.951 1.989
+self.nrun       wall   2.044  cpu   1.902   raw wall: 2.232 2.004 2.044  cpu: 1.950 1.862 1.902
+self.run        wall   1.929  cpu   1.976   raw wall: 1.933 1.914 1.929  cpu: 1.978 1.960 1.976
+self.edit       wall   2.101  cpu   2.230   raw wall: 2.042 2.101 2.644  cpu: 2.169 2.230 2.847
+self.forced     wall   7.182  cpu  18.142   raw wall: 6.249 7.182 7.416  cpu: 16.241 18.142 18.334
+
+label: head   toolchain: <this worktree>   runs: 3 (median)   backend=n (stdlib.* on c)   NIMONY_VFS=disk   EXTRA=
+
+
+== the pair the phase is judged on ==========================================
+
+| scenario                     | `nimony n -r` | `nimony r` | ratio |
+|------------------------------|---------------|------------|-------|
+| hello, one-line edit  (wall)  | 0.320 s       | 0.033 s    | 9.7x  |
+| hello, one-line edit  (cpu)   | 0.046 s       | 0.030 s    | 1.5x  |
+| compiler, sem.nim body (wall) | 2.044 s       | 1.929 s    | 1.06x |
+| compiler, sem.nim body (cpu)  | 1.902 s       | 1.976 s    | 0.96x |
+
+`self.editbody` -- the same edit with no run at all, just `nimony n` writing
+the executable -- is 1.911 s.  So on the compiler:
+
+    self.run (1.929) ~= self.editbody (1.911) + 0.018
+
+which is what was predicted before measuring: `nimony r` is the build plus the
+whole-image assemble, and the assemble did not get cheaper by moving into the
+compiler's address space -- it only stopped being followed by a Mach-O write,
+an ad-hoc code signature and an exec.  Those three are the 0.115 s between
+`self.nrun` and `self.run`, and they are a fixed cost, which is why the same
+three are 0.287 s of hello's 0.320 s: for a tiny program the exec IS the
+scenario.
+
+The number that matters for the dev loop is therefore still 1.07 s of assemble
+per run, and it is B3's, not B1's.  B1 removed everything around it.
+
+cpu-sum reads the other way on the compiler (1.976 vs 1.902) because the
+assemble now runs on the compiler's own thread and is counted, where nifasm's
+was a child whose cpu the harness also sums -- the two are the same work; the
+0.07 s is the process nifasm no longer is, minus the arena mapping.
+
+
+== per-stage engine timings ==================================================
+
+`--verbose --profile`, over the fork-point sources, after appending a private
+proc to `src/nimony/sem.nim` (the `self.editbody` edit), warm nimcache.
+
+nimony r  (130 modules, 2.35 MB of code):
+
+    frontend graph   nimsem  0.435 s  (1 invocation, in-process)
+                     wall 0.000 s + 0.435 s in-process, serial
+
+    backend graph    hexer   0.329 s  (1)
+                     arkham  0.318 s  (3 modules)
+                     dceEmit 0.054 s  (1)
+                     wall 0.254 s + 0.383 s in-process, serial
+
+    run engine       [run-engine] nim08ho4n1
+                       assemble = 1070.58 ms
+                       lay      =    6.30 ms
+                       bind     =    0.19 ms
+                       code = 2347472 B   data = 33488 B   ext = 37
+
+nimony n -r, same edit, same nimcache:
+
+    backend graph    link (nifasm)  1.162 s  (1)
+                     arkham         0.335 s  (3)
+                     hexer          0.325 s  (1)
+                     dceEmit        0.055 s  (1)
+                     wall 1.431 s + 0.380 s in-process, serial
+
+So the like-for-like comparison of the step that moved:
+
+    nifasm as a spawned linker writing a signed Mach-O   1.162 s
+    the same assemble in-process, into an arena          1.077 s  (assemble+lay+bind)
+
+37 external symbols, all resolved by `dlsym` against the compiler's own libc;
+no arkham runs beyond the 3 the graph did (the engine runs none: arkham stays
+in the build graph, see notes/b1-nimony.md §4).
+
+hello (4 modules, 21 KB of code), same treatment:
+
+    nimony r      arkham 0.005 s (1), hexer 0.001 s, dceEmit 0.000 s
+                  [run-engine] b1nyj6fzm assemble=7.03ms lay=0.08ms bind=0.02ms
+                               code=21092B data=13128B ext=6
+    nimony n -r   link 0.018 s, arkham 0.004 s, hexer 0.001 s, dceEmit 0.000 s
+
+i.e. 7 ms of in-process assemble against 18 ms of nifasm-the-process -- and
+then `nimony n -r` pays ~290 ms more that never shows up in nifmake's profile
+at all, because it is the kernel exec'ing and validating a freshly signed
+4.8 MB image.
+
+
+== correctness ==============================================================
+
+    bin/hastur test tests/nimony_r      17/17 checks     (see the report)
+    bin/hastur test tests/ctfe_engine   all checks passed
+    bin/hastur test tests/ctfe_diff     0 differences over 4 mode pairs
+    bin/hastur test tests/incremental   SUCCESS
+    bin/hastur tests/nimony             794 / 794 in 231.69s
+    bin/hastur boot --boot-backend:native
+                                        stage 1 38.64s, stage 2 37.29s,
+                                        stage 3 35.69s, total 112.52s;
+                                        stages 1 and 2 byte-identical,
+                                        stages 2 and 3 byte-identical
+
+
+== a bug in the benchmark script, fixed here ================================
+
+`devloop_bench.sh <root>` kept `root` as given, and the `self.*` scenarios run
+their command under `cd` into a scratch copy of the sources.  With the `.` that
+JIT_IMPL.md's measurement protocol spells, `./bin/nimony` then resolved against
+the wrong directory and every `self.*` row was the 5 ms of a failing `sh -c`:
+
+    self.cold       wall   0.006  cpu   0.004
+    self.editbody   wall   0.005  cpu   0.004
+    ...
+    (stderr: sh: ./bin/nimony: No such file or directory, x21)
+
+`root` is absolutised now.  Any earlier table whose `self.*` rows are single-
+digit milliseconds was measuring nothing.
