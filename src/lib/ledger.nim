@@ -41,6 +41,14 @@
 ## timings are not a continuation of the old tool's), and `estimate` ignores an
 ## entry stamped by another tool build. The entry stays on disk until the next
 ## sample overwrites it.
+##
+## Memory (M1). `rss` is the one bucket that is not a duration and not about
+## the artifact: it is the peak resident size of the *process* that took the
+## sample. The design's low-memory goal (doc/design.md, JIT.md 5.2) is a gate
+## beside the wall-time one, and a gate that is not measured is a wish, so
+## every tool reports what it cost the machine in the same fragment it reports
+## what it cost the clock. See the "what a process cost the machine" section
+## for why an in-process sample and a spawned one are kept in two averages.
 
 when defined(nimony):
   import std / [os, dirs, paths, strutils, monotimes]
@@ -59,10 +67,22 @@ type
   LedgerSample* = object
     produceNs*, serializeNs*, writeNs*, loadNs*, parseNs*, spawnNs*: int64
     bytes*: int64
+    rssBytes*: int64  ## peak resident size of the process that took the sample
+    rssInproc*: bool  ## that peak is the DRIVER's, not the phase's own; see
+                      ## "what a process cost the machine" below. Meaningful on
+                      ## a sample handed to `record` and on the answer
+                      ## `estimate` gives; always false in a stored entry,
+                      ## where the two kinds live in two fields.
 
   LedgerEntry* = object
     key*: LedgerKey
-    ewma*: LedgerSample  ## exponentially weighted, alpha 0.3
+    ewma*: LedgerSample  ## exponentially weighted, alpha 0.3. `ewma.rssBytes`
+                         ## is the average over SPAWNED samples only -- the
+                         ## phase's own footprint.
+    rssInprocBytes*: int64  ## the average over IN-PROCESS samples: the
+                            ## driver's peak while this key's node ran in it.
+                            ## A different measurement of a different thing,
+                            ## so a different field rather than a blend.
     samples*: int
     updated*: int64      ## unix ns
     toolhash*: string
@@ -121,6 +141,135 @@ proc addSubdirs(dir: string; res: var seq[string]) =
     except CatchableError: discard
 
 proc monoNs(): int64 {.inline.} = getMonoTime().ticks
+
+# --- what a process cost the machine --------------------------------------
+#
+# The peak resident size of the running process, read once per tool run. One
+# syscall, no sampling thread, no `/proc` walk: the number is affordable in
+# every tool of every build, which is the only reason it can be a ledger bucket
+# at all.
+#
+# It is a PEAK and therefore monotone -- a process cannot un-touch a page and
+# `ru_maxrss` never falls. Two consequences every reader has to know:
+#
+# * A spawned tool's peak IS that phase's footprint, near enough: the process
+#   did nothing else.
+# * The driver's peak while an in-process node ran is NOT. It is the high-water
+#   mark of an address space that also holds the build graph, the artifact
+#   store and the allocator's leftovers from every earlier node, and it is the
+#   truth about what that node cost the process it ran in rather than about the
+#   phase. `LedgerSample.rssInproc` marks such a sample so `estimate` never
+#   mistakes one for the other.
+#
+# `struct rusage` is laid out here by hand rather than imported, because the
+# two dialects that compile this file disagree about how much of `posix/` they
+# have. The layout is the LP64 one macOS and Linux share -- two `timeval`s of
+# 16 bytes and then `ru_maxrss` -- and the trailing padding is three times the
+# fields the struct actually holds, so a kernel with more of them still writes
+# inside the buffer. `sizeof(clong) == 8` is checked at run time (a `when` on
+# `sizeof` is one more thing to ask of the second dialect for no gain);
+# anything else answers 0, and 0 means "this platform does not say", which
+# every reader has to treat as "do not decide on memory" rather than as "free".
+
+when defined(windows):
+  type
+    ProcessMemoryCounters = object
+      ## PROCESS_MEMORY_COUNTERS. Field for field, so `sizeof` is the `cb` the
+      ## API recognises.
+      cb: uint32
+      pageFaultCount: uint32
+      peakWorkingSetSize: uint
+      workingSetSize: uint
+      quotaPeakPagedPoolUsage: uint
+      quotaPagedPoolUsage: uint
+      quotaPeakNonPagedPoolUsage: uint
+      quotaNonPagedPoolUsage: uint
+      pagefileUsage: uint
+      peakPagefileUsage: uint
+
+  proc currentProcessHandle(): pointer {.importc: "GetCurrentProcess",
+                                         stdcall, dynlib: "kernel32".}
+  proc processMemoryInfo(p, counters: pointer; cb: uint32): int32 {.
+    importc: "K32GetProcessMemoryInfo", stdcall, dynlib: "kernel32".}
+    ## The kernel32 alias rather than the psapi one, so nothing has to link
+    ## psapi.lib for a diagnostic.
+else:
+  type
+    RUsage = object
+      utimeSec, utimeUsec: clong
+      stimeSec, stimeUsec: clong
+      maxrss: clong
+      pad: array[45, clong]
+
+  proc getrusage(who: cint; usage: pointer): cint {.
+    importc: "getrusage", header: "<sys/resource.h>".}
+
+const
+  RusageSelf = 0
+  RusageChildren = -1
+    ## Universal across every Unix that has `getrusage`.
+  MB* = 1024'i64 * 1024'i64
+
+proc rssOf(who: int): int64 =
+  when defined(windows):
+    result = 0
+  else:
+    result = 0
+    if sizeof(clong) == 8:
+      var r = default(RUsage)
+      if getrusage(cint(who), cast[pointer](addr r)) == 0:
+        when defined(macosx):
+          result = int64(r.maxrss)          # macOS reports bytes
+        else:
+          result = int64(r.maxrss) * 1024'i64  # Linux and the BSDs: KiB
+
+proc peakRssBytes*(): int64 =
+  ## Peak resident size of THIS process in bytes, or 0 when the platform does
+  ## not say. Monotone, so two calls around a region give that region's
+  ## contribution to the peak and never a negative number.
+  when defined(windows):
+    var c = default(ProcessMemoryCounters)
+    let cb = uint32(sizeof(ProcessMemoryCounters))
+    c.cb = cb
+    if processMemoryInfo(currentProcessHandle(), cast[pointer](addr c), cb) != 0:
+      result = int64(c.peakWorkingSetSize)
+    else:
+      result = 0
+  else:
+    result = rssOf(RusageSelf)
+
+proc peakChildRssBytes*(): int64 =
+  ## Peak resident size of the LARGEST child this process has waited for, or 0
+  ## when the platform does not say. `ru_maxrss` of `RUSAGE_CHILDREN` is a
+  ## maximum over children rather than a sum, which is exactly the number
+  ## `bench/devloop_ab.sh` reports; it is a running high-water mark, so it can
+  ## never be attributed to one particular child.
+  when defined(windows):
+    result = 0
+  else:
+    result = rssOf(RusageChildren)
+
+proc formatMB*(bytes: int64): string =
+  ## Mebibytes with one decimal, by integer arithmetic, for the same reason
+  ## `formatMs` avoids a float formatter.
+  if bytes <= 0: return "0.0"
+  let tenths = (bytes * 10 + MB div 2) div MB
+  result = $(tenths div 10) & "." & $(tenths mod 10)
+
+# The one piece of ambient state this module owns, and it exists for the reason
+# `phases.gSchedule` gives for its own: `PhaseTimer.finish` runs deep inside a
+# tool's entry point, reached through a `{.nimcall.}` relay with no context
+# parameter, and it has to know whether the process around it is the tool's own
+# or the driver that called the tool as a proc. Nothing else can tell it -- an
+# environment variable would be inherited by the tool's real children and lie
+# to them. It is set once, by `installPhaseRelay`, and never cleared.
+var gInprocDriver = false
+
+proc markInprocDriver*() =
+  ## "Phases that finish in this process are running inside the driver."
+  gInprocDriver = true
+
+proc inprocDriver*(): bool = gInprocDriver
 
 proc moduleSuffixOf*(path: string): string =
   ## The NIF module suffix a tool derives from an artifact path: the basename
@@ -190,7 +339,17 @@ proc `==`*(a, b: LedgerKey): bool =
 proc ewmaStep(old, x: int64): int64 {.inline.} =
   ((AlphaDen - AlphaNum) * old + AlphaNum * x) div AlphaDen
 
+proc seedOrStep(old, x: int64): int64 {.inline.} =
+  ## `ewmaStep`, except that a zero average is seeded rather than blended
+  ## against. The argument is `foldSpawn`'s: zero is not a measurement, it is
+  ## "nothing has been said about this yet", and blending would start the
+  ## average a factor of three low and take a dozen builds to converge --
+  ## which, for a number a build asks a handful of questions of, is never.
+  if old == 0: x else: ewmaStep(old, x)
+
 proc blend(old: LedgerSample; x: LedgerSample): LedgerSample =
+  ## Everything except `rss`: the two kinds of peak are held apart by
+  ## `foldRss` and must not be averaged together.
   result = LedgerSample(
     produceNs: ewmaStep(old.produceNs, x.produceNs),
     serializeNs: ewmaStep(old.serializeNs, x.serializeNs),
@@ -198,19 +357,47 @@ proc blend(old: LedgerSample; x: LedgerSample): LedgerSample =
     loadNs: ewmaStep(old.loadNs, x.loadNs),
     parseNs: ewmaStep(old.parseNs, x.parseNs),
     spawnNs: ewmaStep(old.spawnNs, x.spawnNs),
-    bytes: ewmaStep(old.bytes, x.bytes))
+    bytes: ewmaStep(old.bytes, x.bytes),
+    rssBytes: old.rssBytes, rssInproc: false)
+
+proc foldRss(e: var LedgerEntry; s: LedgerSample) =
+  ## Route one sample's peak into the average it belongs to. A sample with no
+  ## peak (a platform that does not say, an observer folding a spawn cost) says
+  ## nothing about either.
+  if s.rssBytes <= 0: return
+  if s.rssInproc:
+    e.rssInprocBytes = seedOrStep(e.rssInprocBytes, s.rssBytes)
+  else:
+    e.ewma.rssBytes = seedOrStep(e.ewma.rssBytes, s.rssBytes)
 
 proc defaultSample*(phase: string): LedgerSample =
   ## The table of JIT.md 3.3, used when nothing has ever been measured. Every
   ## phase carries the ~3 ms of process start it takes to reach it.
-  result = LedgerSample(spawnNs: 3 * Ms)
+  ##
+  ## The `rss` column is the same kind of table and is read the same way: a
+  ## first-build guess at what one process of this phase peaks at, replaced by
+  ## a measurement as soon as one exists. It is deliberately generous -- an
+  ## under-estimate is the failure that matters, because it lets the driver
+  ## take work in-process that it cannot afford.
+  result = LedgerSample(spawnNs: 3 * Ms, rssBytes: 64 * MB)
   case phase
-  of "nifler": result.produceNs = 3 * Ms
-  of "nimsem": result.produceNs = 7 * Ms
-  of "hexer": result.produceNs = 7 * Ms
-  of "lengc": result.produceNs = 6 * Ms
-  of "cc": result.produceNs = 54 * Ms
-  of "link": result.produceNs = 33 * Ms
+  of "nifler":
+    result.produceNs = 3 * Ms
+    result.rssBytes = 32 * MB
+  of "nimsem":
+    result.produceNs = 7 * Ms
+    result.rssBytes = 96 * MB
+  of "hexer":
+    result.produceNs = 7 * Ms
+  of "lengc":
+    result.produceNs = 6 * Ms
+    result.rssBytes = 48 * MB
+  of "cc":
+    result.produceNs = 54 * Ms
+    result.rssBytes = 96 * MB
+  of "link":
+    result.produceNs = 33 * Ms
+    result.rssBytes = 96 * MB
   else: discard
 
 # --- the table -------------------------------------------------------------
@@ -252,6 +439,15 @@ proc put*(l: var Ledger; e: LedgerEntry) =
     var merged = e
     if merged.ewma.spawnNs == 0 and merged.toolhash == l.entries[pos].toolhash:
       merged.ewma.spawnNs = l.entries[pos].ewma.spawnNs
+    # The two `rss` averages are the fragments' the way `produce` is, so the
+    # fold replaces them -- except that a fragment written by an observer
+    # (`recordSpawn`) or by a platform that does not report a peak carries
+    # none, and dropping a measurement in favour of a silence would lose the
+    # column on every consolidation.
+    if merged.ewma.rssBytes == 0:
+      merged.ewma.rssBytes = l.entries[pos].ewma.rssBytes
+    if merged.rssInprocBytes == 0:
+      merged.rssInprocBytes = l.entries[pos].rssInprocBytes
     l.entries[pos] = merged
   else:
     insertAt(l, pos, e)
@@ -264,11 +460,18 @@ proc record*(l: var Ledger; key: LedgerKey; s: LedgerSample; toolhash: string) =
   var pos = 0
   if find(l, key, pos) and l.entries[pos].toolhash == toolhash:
     l.entries[pos].ewma = blend(l.entries[pos].ewma, s)
+    foldRss(l.entries[pos], s)
     inc l.entries[pos].samples
     l.entries[pos].updated = vfsNow()
   else:
-    let e = LedgerEntry(key: key, ewma: s, samples: 1, updated: vfsNow(),
+    var e = LedgerEntry(key: key, ewma: s, samples: 1, updated: vfsNow(),
                         toolhash: toolhash)
+    # A fresh entry seeds every average from the sample -- except `rss`, which
+    # has to be routed to the field its kind belongs in rather than landing in
+    # the spawned one by construction.
+    e.ewma.rssBytes = 0
+    e.ewma.rssInproc = false
+    foldRss(e, s)
     # `find` succeeded but the toolhash differed: `pos` is the stale entry, not
     # an insertion point, so overwrite rather than insert a duplicate key.
     if pos < l.entries.len and l.entries[pos].key == key:
@@ -287,16 +490,52 @@ proc stampMatches(entryHash, wanted: string): bool {.inline.} =
   ## reset-on-rebuild behaviour.
   wanted.len == 0 or entryHash == wanted
 
+proc entryRss(e: LedgerEntry; rss: var int64; inproc: var bool) =
+  ## The peak to believe about one entry, and which kind it is.
+  ##
+  ## A SPAWNED sample wins whenever there is one: it is the phase's own
+  ## footprint, measured in a process that did nothing else, while the
+  ## in-process average is the whole driver's high-water mark and is inflated
+  ## by everything the driver was already holding. Falling back to it rather
+  ## than to nothing is the conservative direction and is deliberate: a phase
+  ## that has only ever run in-process is then estimated at the driver's own
+  ## peak, so the memory rule keeps it out of the process until there is a real
+  ## measurement to replace the guess.
+  if e.ewma.rssBytes > 0:
+    rss = e.ewma.rssBytes
+    inproc = false
+  else:
+    rss = e.rssInprocBytes
+    inproc = true
+
 proc estimate*(l: Ledger; key: LedgerKey; toolhash: string): LedgerSample =
   ## What `key` is expected to cost: its own average, else the average of the
   ## phase across every module, else the table from JIT.md 3.3. Only entries
   ## stamped with `toolhash` count; an empty `toolhash` counts all of them.
+  ##
+  ## `rss` is the exception to "average": across a phase it is the MAXIMUM of
+  ## what its modules were measured at, not their mean. The other buckets
+  ## answer "how long will this take", where a mean is the honest guess; `rss`
+  ## answers "will this fit", where the module nobody has measured yet is
+  ## assumed to be as big as the biggest one that has been. Under-estimating is
+  ## the failure that matters.
   var pos = 0
   if find(l, key, pos) and l.entries[pos].samples > 0 and
       stampMatches(l.entries[pos].toolhash, toolhash):
-    return l.entries[pos].ewma
+    result = l.entries[pos].ewma
+    var rss = 0'i64
+    var inproc = false
+    entryRss(l.entries[pos], rss, inproc)
+    if rss == 0:
+      rss = defaultSample(key.phase).rssBytes
+      inproc = false
+    result.rssBytes = rss
+    result.rssInproc = inproc
+    return result
   var acc = default(LedgerSample)
   var n = 0
+  var maxRss = 0'i64
+  var maxRssInproc = false
   for i in 0 ..< l.entries.len:
     if l.entries[i].key.phase == key.phase and l.entries[i].samples > 0 and
         stampMatches(l.entries[i].toolhash, toolhash):
@@ -307,13 +546,22 @@ proc estimate*(l: Ledger; key: LedgerKey; toolhash: string): LedgerSample =
       acc.parseNs += l.entries[i].ewma.parseNs
       acc.spawnNs += l.entries[i].ewma.spawnNs
       acc.bytes += l.entries[i].ewma.bytes
+      var rss = 0'i64
+      var inproc = false
+      entryRss(l.entries[i], rss, inproc)
+      if rss > maxRss:
+        maxRss = rss
+        maxRssInproc = inproc
       inc n
   if n > 0:
     result = LedgerSample(
       produceNs: acc.produceNs div n, serializeNs: acc.serializeNs div n,
       writeNs: acc.writeNs div n, loadNs: acc.loadNs div n,
       parseNs: acc.parseNs div n, spawnNs: acc.spawnNs div n,
-      bytes: acc.bytes div n)
+      bytes: acc.bytes div n,
+      rssBytes: maxRss, rssInproc: maxRssInproc)
+    if result.rssBytes == 0:
+      result.rssBytes = defaultSample(key.phase).rssBytes
   else:
     result = defaultSample(key.phase)
 
@@ -328,7 +576,8 @@ proc estimate*(l: Ledger; key: LedgerKey): LedgerSample =
 #     (phase "hexer") (module "sysvq0asl")
 #     (produce ns 13200000) (serialize ns 1800000) (write ns 400000)
 #     (load ns 100000) (parse ns 9700000) (spawn ns 3100000)
-#     (bytes 1140000) (samples 12) (updated 1757164080000000000)
+#     (bytes 1140000) (rss bytes 71303168) (rssinproc bytes 0)
+#     (samples 12) (updated 1757164080000000000)
 #     (toolhash "…")))
 #
 # JIT.md 5.2 sketches the durations as `ms <float>` and `updated` as an ISO
@@ -341,6 +590,14 @@ proc addDuration(b: var Builder; tag: string; ns: int64) =
   b.withTree tag:
     b.addIdent "ns"
     b.addIntLit ns
+
+proc addByteCount(b: var Builder; tag: string; n: int64) =
+  ## `(rss bytes N)`: a unit marker, exactly as `addDuration` writes `ns`, so
+  ## the two memory fields read like the six timing ones and an older reader
+  ## skips them the same way (`parseLedgerText` ignores idents at field depth).
+  b.withTree tag:
+    b.addIdent "bytes"
+    b.addIntLit n
 
 proc writeLedgerFile(l: Ledger; path: string) =
   var b = nifbuilder.open(path)
@@ -357,6 +614,8 @@ proc writeLedgerFile(l: Ledger; path: string) =
         addDuration(b, "parse", l.entries[i].ewma.parseNs)
         addDuration(b, "spawn", l.entries[i].ewma.spawnNs)
         b.withTree "bytes": b.addIntLit l.entries[i].ewma.bytes
+        addByteCount(b, "rss", l.entries[i].ewma.rssBytes)
+        addByteCount(b, "rssinproc", l.entries[i].rssInprocBytes)
         b.withTree "samples": b.addIntLit int64(l.entries[i].samples)
         b.withTree "updated": b.addIntLit l.entries[i].updated
         b.withTree "toolhash": b.addStrLit l.entries[i].toolhash
@@ -371,6 +630,8 @@ proc setIntField(e: var LedgerEntry; field: string; v: int64) =
   of "parse": e.ewma.parseNs = v
   of "spawn": e.ewma.spawnNs = v
   of "bytes": e.ewma.bytes = v
+  of "rss": e.ewma.rssBytes = v
+  of "rssinproc": e.rssInprocBytes = v
   of "samples": e.samples = int(v)
   of "updated": e.updated = v
   else: discard
@@ -630,6 +891,11 @@ type
     produceNs*, serializeNs*, writeNs*, loadNs*, parseNs*, spawnNs*: int64
                     ## means over the keys
     bytes*: int64   ## sum over the keys
+    rssBytes*: int64  ## MAX over the keys, not a mean: the question a peak
+                      ## answers is "how big does this phase get", and the
+                      ## largest module is the answer
+    rssInproc*: bool  ## the row's peak is a driver peak, i.e. this phase has
+                      ## never been measured in a process of its own
 
 proc phaseTotals*(l: Ledger): seq[PhaseTotals] =
   ## `l.entries` is sorted by (phase, module), so one pass groups it.
@@ -647,6 +913,12 @@ proc phaseTotals*(l: Ledger): seq[PhaseTotals] =
       t.parseNs += l.entries[i].ewma.parseNs
       t.spawnNs += l.entries[i].ewma.spawnNs
       t.bytes += l.entries[i].ewma.bytes
+      var rss = 0'i64
+      var inproc = false
+      entryRss(l.entries[i], rss, inproc)
+      if rss > t.rssBytes:
+        t.rssBytes = rss
+        t.rssInproc = inproc
       inc i
     if t.keys > 0:
       t.produceNs = t.produceNs div t.keys
@@ -691,18 +963,41 @@ proc statsTable*(l: Ledger): string =
   ## scheduler wants -- what a process costs *in this build* is what decides
   ## whether the node is worth one -- but it is not process startup in
   ## isolation, and a busy depth reads higher than an idle one.
+  ##
+  ## `peak MB` (M1) is the largest resident size a process of this phase was
+  ## ever measured at, and a `*` after it says the number is a DRIVER peak
+  ## rather than the phase's own -- the phase has only ever run in-process, so
+  ## what is reported is the high-water mark of an address space that held the
+  ## build graph and every earlier node beside it. The two are not comparable,
+  ## and a table that showed them in one column without saying which is which
+  ## would be worse than one that showed neither.
   result = "[stats] " & padTo("phase", 10, false) & padTo("samples", 9, true) &
            padTo("produce ms", 13, true) & padTo("spawn ms", 11, true) &
            padTo("ser+parse ms", 14, true) &
-           padTo("write ms", 10, true) & padTo("bytes", 12, true)
+           padTo("write ms", 10, true) & padTo("bytes", 12, true) &
+           padTo("peak MB", 11, true)
   for i in 0 ..< rows.len:
+    var peak = formatMB(rows[i].rssBytes)
+    if rows[i].rssInproc and rows[i].rssBytes > 0: peak.add "*"
     result.add "\n[stats] " & padTo(rows[i].phase, 10, false) &
       padTo($rows[i].samples, 9, true) &
       padTo(formatMs(rows[i].produceNs), 13, true) &
       padTo(formatMs(rows[i].spawnNs), 11, true) &
       padTo(formatMs(rows[i].serializeNs + rows[i].parseNs), 14, true) &
       padTo(formatMs(rows[i].writeNs), 10, true) &
-      padTo($rows[i].bytes, 12, true)
+      padTo($rows[i].bytes, 12, true) &
+      padTo(peak, 11, true)
+  # The driver's own peak, which no per-phase row can show. It belongs to the
+  # table rather than to the caller because `statsTable` is only ever called by
+  # the process that ran the build (`deps.nim`, under `--stats`), and that
+  # process IS the driver: putting the line here keeps the whole report in one
+  # place instead of splitting the memory half across two modules.
+  let driver = peakRssBytes()
+  if driver > 0:
+    result.add "\n[stats] driver peak " & formatMB(driver) & " MB"
+    let children = peakChildRssBytes()
+    if children > 0:
+      result.add ", largest child " & formatMB(children) & " MB"
 
 # --- instrumentation -------------------------------------------------------
 
@@ -762,4 +1057,10 @@ proc finish*(t: var PhaseTimer) =
   t.active = false
   if t.outFile.len > 0:
     t.sample.bytes += fileSizeOrZero(t.outFile)
+  # The peak of the process this phase ran in, whatever process that is. In a
+  # spawned tool it is the phase's footprint; in the driver it is the driver's
+  # high-water mark, which is the truth about what the node cost the process it
+  # ran in and is tagged as such so nothing averages the two together.
+  t.sample.rssBytes = peakRssBytes()
+  t.sample.rssInproc = inprocDriver()
   writeFragment(t.dir, t.key, t.sample, toolhash())

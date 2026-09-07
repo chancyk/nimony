@@ -146,6 +146,16 @@ let profileNodes = existsEnv("NIMONY_PROFILE_NODES")
   ## `NIMONY_PROFILE_NODES=1` with `--profile`: one stderr line per node,
   ## `[node] inproc|spawn <phase> <module> <seconds>`, for attributing a
   ## scheduler decision to its cost. Diagnostic only.
+  ##
+  ## M1 adds memory to the line, which is what the scheduler now also decides
+  ## on. An in-process node reports `rss=+N.NMB`: the growth of THIS process's
+  ## peak resident size across the node, which is what running it here cost the
+  ## driver. A spawned node reports `childpeak=N.NMB` instead --
+  ## `getrusage(RUSAGE_CHILDREN)`'s running high-water mark, i.e. the largest
+  ## child seen so far and not this one's own peak. It is one syscall, so it is
+  ## free enough to print; it cannot be attributed to a single child, so it is
+  ## named for what it is. A spawned node's own footprint is in the ledger,
+  ## where the tool itself recorded it.
 
 proc initProfileData*(): ProfileData =
   ProfileData(cmdTime: initTable[string, tuple[sec: float, count: int]]())
@@ -683,7 +693,8 @@ proc reapSlot(b: var SpawnBatch; s: int; prog: var Progressor;
     profile[].recordCmdTime(b.cmdNames[idx], sec)
     if profileNodes:
       stderr.writeLine "[node] spawn  " & b.cmdNames[idx] & " " & b.modules[idx] &
-        " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $b.commands.len
+        " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $b.commands.len &
+        " childpeak=" & formatMB(peakChildRssBytes()) & "MB"
   close(p)
   b.slotProc[s] = nil
   inc b.reaped
@@ -861,6 +872,11 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
         let node = addr dag.nodes[inprocNodes[k].nodeId]
         let cmdName = inprocNodes[k].name
         let inprocStart = getMonoTime()
+        # The driver's peak before the node, so the line below can report what
+        # the node added to it. A peak is monotone, so the difference is never
+        # negative and never over-reports: it is the part of the node's own
+        # footprint this process had not already paid for.
+        let inprocRss0 = if profileNodes: peakRssBytes() else: 0'i64
         let status = offerNode(inprocNodes[k].parts, cmdName, inprocNodes[k].command,
                                node[], dag.baseDir, pending.len, depthSeq, peers)
         if status == RunHandledFailed:
@@ -894,8 +910,11 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           profile[].recordCmdTime(cmdName, sec)
           profile[].inprocWallTime += sec
           if profileNodes:
+            let peak = peakRssBytes()
             stderr.writeLine "[node] inproc " & cmdName & " " & ledgerModuleOf(node[]) &
-              " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $pending.len
+              " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $pending.len &
+              " rss=+" & formatMB(peak - inprocRss0) & "MB" &
+              " peak=" & formatMB(peak) & "MB"
         # Give the finished children their slots back before the next node:
         # this thread is the only one that can start a replacement.
         if commands.len > 0:

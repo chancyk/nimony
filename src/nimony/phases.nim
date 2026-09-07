@@ -17,11 +17,16 @@
 ##
 ## ```
 ## if the phase is not registered:              spawn
+## elif driverPeak + max(node rss) > budget:    spawn        (M1, every node)
 ## elif the depth has one registered node:      in-process (the edit-rebuild, the CTFE snippet)
 ## elif sum(costs) <= max(max(cost), sum/cores) + k*spawn:  the whole depth in-process
 ##                                                (n = registered nodes ready at this depth)
 ## else:                                        spill inputs, spawn
 ## ```
+##
+## The memory clause is M1 and is a *gate*, not a trade: it is asked of every
+## node, a depth of one included, because a single 200 MB `nimsem` is exactly
+## the node that has to be allowed to leave. See `memoryAllows`.
 ##
 ## In-process nodes run **sequentially**, each preceded by a full reset of the
 ## globals the frontend shares (`semmain.resetFrontendGlobals`) plus the
@@ -88,6 +93,104 @@ const
     ## zero and the next build would send the phase back to a process — the
     ## scheduler would oscillate on its own measurements. What a spawn costs is
     ## a property of the machine, not of whether we last used one.
+  MinNodeRssBytes* = 32 * MB
+    ## A floor under the ledger's rss estimate, for the same reason
+    ## `MinSpawnCostNs` is a floor under its spawn estimate: an entry with no
+    ## measurement must not read as "this phase is free". 32 MB is below every
+    ## per-tool peak measured so far, so the floor never *raises* a real
+    ## number; it only stops a missing one from being zero.
+  InprocMemBudgetShare* = 8
+    ## The share of physical memory the compiler is willing to occupy: an
+    ## eighth. See `defaultInprocMemBudgetBytes`.
+  MinInprocMemBudgetMB* = 128
+  MaxInprocMemBudgetMB* = 1024
+
+# --- how much memory in-process work may use -------------------------------
+
+when defined(windows):
+  type
+    MemoryStatusEx = object
+      dwLength: uint32
+      dwMemoryLoad: uint32
+      ullTotalPhys: uint64
+      ullAvailPhys: uint64
+      ullTotalPageFile: uint64
+      ullAvailPageFile: uint64
+      ullTotalVirtual: uint64
+      ullAvailVirtual: uint64
+      ullAvailExtendedVirtual: uint64
+  proc globalMemoryStatusEx(buf: pointer): int32 {.
+    importc: "GlobalMemoryStatusEx", stdcall, dynlib: "kernel32".}
+elif defined(macosx):
+  proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: var csize_t;
+                    newp: pointer; newlen: csize_t): cint {.
+    importc: "sysctlbyname", header: "<sys/sysctl.h>".}
+
+proc physicalMemoryBytes*(): int64 =
+  ## Installed RAM, or 0 when the platform does not say. `sysctl hw.memsize` on
+  ## macOS, `/proc/meminfo`'s `MemTotal` on Linux, `GlobalMemoryStatusEx` on
+  ## Windows; everything else answers 0, and a 0 makes the budget the floor
+  ## rather than making it unbounded.
+  when defined(windows):
+    var st = default(MemoryStatusEx)
+    st.dwLength = uint32(sizeof(MemoryStatusEx))
+    if globalMemoryStatusEx(cast[pointer](addr st)) != 0:
+      result = int64(st.ullTotalPhys)
+    else:
+      result = 0
+  elif defined(macosx):
+    var v = 0'i64
+    var len = csize_t(sizeof(v))
+    if sysctlbyname("hw.memsize", cast[pointer](addr v), len, nil, csize_t(0)) == 0:
+      result = v
+    else:
+      result = 0
+  else:
+    result = 0
+    try:
+      for line in lines("/proc/meminfo"):
+        if line.startsWith("MemTotal:"):
+          # `MemTotal:       16316416 kB`
+          var digits = ""
+          for c in line:
+            if c >= '0' and c <= '9': digits.add c
+            elif digits.len > 0: break
+          if digits.len > 0:
+            result = parseBiggestInt(digits) * 1024'i64
+          break
+    except CatchableError:
+      result = 0
+
+proc clampBudget(bytes: int64): int64 =
+  let lo = int64(MinInprocMemBudgetMB) * MB
+  let hi = int64(MaxInprocMemBudgetMB) * MB
+  if bytes < lo: lo elif bytes > hi: hi else: bytes
+
+proc defaultInprocMemBudgetBytes*(cores: int): int64 =
+  ## How much resident memory the driver may reach before it stops taking work
+  ## into its own process.
+  ##
+  ## **The rule.** `clamp(physicalMemory / (8 * cores), 128 MB, 1 GB)`.
+  ##
+  ## A build's steady state is `cores` tool processes at once. The share of the
+  ## machine this compiler is willing to occupy is an eighth of physical
+  ## memory, and the in-process driver stands in for *one* of those processes,
+  ## so its share of that share is `physical / (8 * cores)`. The floor of
+  ## 128 MB is under what one large `nimsem` needs, so the rule can never make
+  ## a build impossible -- the worst it does is send every node to a process,
+  ## which is `--spawn:always`, which works. The ceiling of 1 GB is there so
+  ## that a machine with a terabyte of RAM does not read as "no limit": past a
+  ## point, an address space the allocator never gives back is a cost whatever
+  ## the machine has.
+  ##
+  ## 16 GiB and 10 cores -- the machine M1 was measured on -- gives 204 MB.
+  let phys = physicalMemoryBytes()
+  var c = cores
+  if c < 1: c = 1
+  if phys <= 0:
+    result = int64(MinInprocMemBudgetMB) * MB
+  else:
+    result = clampBudget(phys div int64(InprocMemBudgetShare * c))
 
 type
   PhaseRunProc* = proc (argv: seq[string]): int {.nimcall.}
@@ -131,6 +234,10 @@ type
     mode*: SpawnMode
     k*: int
     cores*: int
+    memBudget*: int64 ## M1: the driver's peak resident size may not pass this
+                      ## with the node it is about to take added on top. 0
+                      ## switches the rule off (`--inproc-mem-budget:0`), which
+                      ## is the behaviour of every release before M1.
     inproc*: int      ## nodes run without a process, this process's lifetime
     spawned*: int     ## nodes handed back to the DAG to spawn
     active*: bool
@@ -217,6 +324,67 @@ proc spawnCostNs(s: PhaseSchedule; name, module: string): int64 =
   result = est.spawnNs
   if result < MinSpawnCostNs: result = MinSpawnCostNs
 
+proc loadCosts(s: var PhaseSchedule) =
+  ## The ledger, on the first question that needs it. See `costsPath`.
+  if s.costsLoaded: return
+  s.costsLoaded = true
+  if s.costsPath.len > 0:
+    s.costs = openLedger(s.costsPath)
+
+proc nodeRssBytes(s: PhaseSchedule; name, module: string): int64 =
+  ## What one node is expected to peak at, in bytes. `estimate` prefers a
+  ## sample taken in the phase's own process and falls back to the driver's
+  ## peak while the phase last ran inside it (`ledger.entryRss`), so a phase
+  ## that has never spawned reads as expensive -- which is the direction a
+  ## safety valve has to fail in.
+  let est = estimate(s.costs, LedgerKey(phase: name, module: module), "")
+  result = est.rssBytes
+  if result < MinNodeRssBytes: result = MinNodeRssBytes
+
+proc memoryAllows(s: var PhaseSchedule; req: RunNodeRequest): bool =
+  ## M1's gate: may this process take on the memory of this depth's work?
+  ##
+  ##   driverPeakNow + max(estimated rss of the depth's registered nodes)
+  ##     <= budget
+  ##
+  ## `driverPeakNow` is `getrusage(RUSAGE_SELF).ru_maxrss`, i.e. the peak so
+  ## far and not the resident size right now. That is deliberate on three
+  ## counts: it is one syscall, it is monotone (so the rule never flickers
+  ## inside a depth), and it is the honest number for the question -- what the
+  ## driver has already touched is what its allocator is still holding when the
+  ## next node starts. The reset between nodes drops the pools; it does not
+  ## give the pages back.
+  ##
+  ## Adding a node's own peak to it double-counts whatever both would have
+  ## touched, so the rule is conservative by construction. It is a valve, so
+  ## that is the right direction, and the escape hatch is a number the user
+  ## sets (`--inproc-mem-budget`), not a heuristic they have to out-guess.
+  ##
+  ## Asked of EVERY node, unlike the wall-time rule, which a depth of one
+  ## short-circuits: a lone `nimsem` for a 7000-line module is precisely the
+  ## node whose memory has to be allowed to leave the driver.
+  if s.memBudget <= 0: return true
+  let driver = peakRssBytes()
+  if driver <= 0:
+    # The platform does not report a peak. "No answer" must not read as "zero
+    # bytes"; the rule simply does not apply here.
+    return true
+  if driver >= s.memBudget:
+    # Already over on its own. Answered before `loadCosts`, so the build that
+    # is up against the budget does not also pay for folding the fragments.
+    return false
+  loadCosts s
+  var largest = 0'i64
+  for peer in req.depthPeers:
+    if findPhase(s.registry, peer.name) < 0: continue
+    let r = nodeRssBytes(s, peer.name, peer.module)
+    if r > largest: largest = r
+  if largest == 0:
+    # The sequential path hands over no peers (`dag.runDag`), and there a depth
+    # is this one node.
+    largest = nodeRssBytes(s, req.name, moduleOfNode(req))
+  result = driver + largest <= s.memBudget
+
 proc depthWantsInproc(s: PhaseSchedule; req: RunNodeRequest): bool =
   ## The decision for a whole depth, from JIT.md 6.2's question asked of the
   ## depth rather than of one node: the registered nodes of this depth either
@@ -259,13 +427,6 @@ proc depthWantsInproc(s: PhaseSchedule; req: RunNodeRequest): bool =
   let fanout = (if largest > spread: largest else: spread) + spawn * s.k
   result = serial <= fanout
 
-proc loadCosts(s: var PhaseSchedule) =
-  ## The ledger, on the first question that needs it. See `costsPath`.
-  if s.costsLoaded: return
-  s.costsLoaded = true
-  if s.costsPath.len > 0:
-    s.costs = openLedger(s.costsPath)
-
 proc wantsInproc*(s: var PhaseSchedule; req: RunNodeRequest): bool =
   ## JIT.md 6.2, decided per depth (`depthWantsInproc`) and remembered for
   ## the depth's remaining nodes. Split out from the relay so it can be
@@ -276,12 +437,26 @@ proc wantsInproc*(s: var PhaseSchedule; req: RunNodeRequest): bool =
   # inserts those verbatim because nifmake never split them into words, so the
   # argv is not faithful and the node has to reach a real shell.
   if req.rawArgs: return false
-  if req.argv.len == 0: return false
-  if req.depthPeers.len <= 1: return true   # the sequential path, or a depth of one
+  # Both rules are decided ONCE per depth and reused, memory included. The DAG
+  # asks twice -- `decideOnly` to plan the depth, then again to run each
+  # accepted node (`dag.SpawnBatch`) -- and it treats a relay that declines a
+  # node it accepted as a hard failure, rightly: the node would otherwise be
+  # silently skipped. `driverPeakNow` grows while the depth's earlier
+  # in-process nodes run, so asking again would do exactly that. The price is
+  # that a depth can overrun the budget by the nodes it had already promised;
+  # it is one depth's worth, it is bounded, and the alternative is a build that
+  # fails on a memory reading.
   if req.depthSeq != s.decidedDepth or s.decidedDepth == 0:
     s.decidedDepth = req.depthSeq
-    loadCosts s
-    s.depthInproc = depthWantsInproc(s, req)
+    # M1's gate first: it is not a wall-time trade the depth rule could
+    # out-vote, it is the answer to "does this still fit".
+    if not memoryAllows(s, req):
+      s.depthInproc = false
+    elif req.depthPeers.len <= 1:
+      s.depthInproc = true    # the sequential path, or a depth of one
+    else:
+      loadCosts s
+      s.depthInproc = depthWantsInproc(s, req)
   result = s.depthInproc
 
 # --- the relay -------------------------------------------------------------
@@ -363,6 +538,20 @@ proc spawnModeFromEnv*(fallback: SpawnMode): SpawnMode =
 
 proc inprocKFromEnv*(fallback: int): int = envInt("NIMONY_INPROC_K", fallback)
 
+proc inprocMemBudgetFromEnv*(cores: int): int64 =
+  ## `NIMONY_INPROC_MEM_BUDGET`, in mebibytes, or the derived default. `0` is a
+  ## value and not an absence: it switches the rule off. Set by
+  ## `--inproc-mem-budget` for this process and for every child, the nested
+  ## `nimony s` of a compile-time evaluation included, for the reason
+  ## `rememberForChildren` gives.
+  let v = getEnv("NIMONY_INPROC_MEM_BUDGET")
+  if v.len == 0: return defaultInprocMemBudgetBytes(cores)
+  try:
+    let mb = parseInt(v)
+    if mb <= 0: result = 0 else: result = int64(mb) * MB
+  except ValueError:
+    result = defaultInprocMemBudgetBytes(cores)
+
 proc installPhaseRelay*(mode: SpawnMode; nimcache: string; k = DefaultInprocK) =
   ## Put the scheduler in front of the DAG. Called once, from `nimony`'s
   ## `main`; `smAlways` installs nothing at all, so the escape hatch is
@@ -370,14 +559,21 @@ proc installPhaseRelay*(mode: SpawnMode; nimcache: string; k = DefaultInprocK) =
   if mode == smAlways:
     gSchedule.active = false
     return
+  var cores = countProcessors()
+  if cores < 1: cores = 1
   gSchedule = PhaseSchedule(
     registry: PhaseRegistry(entries: @[]),
     costsPath: nimcache / "ledger.nif", costsLoaded: false,
-    mode: mode, k: k, cores: countProcessors(),
+    mode: mode, k: k, cores: cores,
+    memBudget: inprocMemBudgetFromEnv(cores),
     inproc: 0, spawned: 0, active: true)
-  if gSchedule.cores < 1: gSchedule.cores = 1
   registerBuiltinPhases(gSchedule.registry)
+  # From here on, a `PhaseTimer` that finishes in THIS process is a phase that
+  # ran inside the driver, and its peak is the driver's rather than the
+  # phase's. `ledger.finish` needs to know which; nothing else can tell it.
+  markInprocDriver()
   runNodeRelay = inprocRelay
 
 proc phaseRelayActive*(): bool = gSchedule.active
 proc inprocCount*(): int = gSchedule.inproc
+proc inprocMemBudget*(): int64 = gSchedule.memBudget
