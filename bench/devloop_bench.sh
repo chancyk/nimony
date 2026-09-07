@@ -24,7 +24,9 @@
 #   self.cold        the compiler compiling itself (src/nimony/nimony.nim, 127 modules,
 #                    debug), fresh nimcache -- the fork point's sources for BOTH toolchains
 #   self.nochange    same, nothing changed
-#   self.edit        same, one proc appended to src/nimony/sem.nim, rebuild
+#   self.editbody    same, a PRIVATE proc appended to src/nimony/sem.nim: the module's
+#                    interface is unchanged, so importers need not re-sem
+#   self.edit        same, an EXPORTED proc appended: every importer re-sems
 #   self.forced      same, `-f`
 #
 # Usage: bench/devloop_bench.sh <toolchain-root> [label] [runs]
@@ -148,6 +150,7 @@ if [ -d "$selfsrc" ]; then
   selfcmd="$nimony c $extra --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim"
   measure self.cold     "$runs" "rm -rf $selfc" sh -c "cd $selfdir && $selfcmd"
   measure self.nochange "$runs" ":"              sh -c "cd $selfdir && $selfcmd"
+  measure self.editbody "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
   measure self.edit     "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
   measure self.forced   "$runs" ":"              sh -c "cd $selfdir && $selfcmd -f"
 else

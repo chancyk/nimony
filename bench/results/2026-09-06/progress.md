@@ -233,3 +233,38 @@ one-line-edit case stays fully in-process except `cc`/`link` under every
 variant above. What remains of the +6 % is the in-process nimsem nodes at
 single-node depths (8 × 14 ms) running before, not alongside, their depth's
 fan-out -- the overlap is the next scheduler item (JIT_IMPL.md A2b follow-up).
+
+## Run 4: the compiler compiling itself (one run each, loaded: A2c building)
+
+`bench/devloop_bench.sh` gained `self.*`: `nimony c src/nimony/nimony.nim`
+(127 modules, debug) over a copy of the fork point's sources for both
+toolchains. head = 34959a52.
+
+| scenario | base wall / cpu | head wall / cpu |
+|---|---|---|
+| self.cold | 7.336 / 26.675 | 7.009 / 24.412 |
+| self.nochange | 0.100 / 0.097 | 0.104 / 0.102 |
+| self.edit (exported proc appended to sem.nim) | 2.715 / 4.077 | 2.727 / 4.095 |
+| self.forced | 7.219 / 26.446 | 6.478 / 25.304 |
+
+The edit loop of the largest program in the repository is UNCHANGED by
+everything merged so far. `--profile` of that edit on head:
+
+```
+frontend   nimsem x3 in-process               0.410 s serial
+backend    dceEmit x127 (spawned)             1.626 s cpu, ~0.4 s wall
+           cc x1 (sem.nim's C file)           1.276 s
+           dceLive x1                         0.336 s
+           hexer x3                           0.332 s
+           lengc x3, link                     0.117 s
+```
+
+A body-only edit (a PRIVATE proc appended, the live set unchanged) costs the
+same: the whole-program `.live.nif` is rewritten, so all 127 `dceEmit` nodes
+re-run and re-emit identical `.c.nif` files. Two consequences:
+
+1. P0c (launched now): per-module live files written only when changed, so
+   an edit re-emits only the modules whose live set moved.
+2. B3's target is the 1.28 s `cc` of one large module (arkham lowers a file
+   that size in ~0.2 s, B0); that is the half of the loop no scheduler can
+   remove.

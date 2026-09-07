@@ -208,6 +208,34 @@ Tests:
 Gate: second sub-program of a run compiles with one `cc`; `hastur test
 tests/nimony tests/hexer tests/incremental` green.
 
+## Phase P0c — an edit re-emits only the modules whose live set changed
+
+Goal (found by the self-compilation benchmark, `bench/results/2026-09-06/progress.md`
+run 4): a one-line edit to `sem.nim` re-runs `dceEmit` for all 127 modules
+(1.6 s CPU, ~0.4 s wall) because `dceLive` rewrites the whole-program
+`<main>.live.nif` on every build, even when the live set is unchanged (a
+body-only edit). Owner files: `src/hexer/dce2.nim`, `src/hexer/hexer.nim`
+(`dl` output), the `dceLive`/`dceEmit` node emission in
+`src/nimony/deps.nim` (`generateFinalBuildFile`, minimal hunks),
+`tests/incremental/**`, `src/hastur/incrementaltests.nim` (a new scenario
+proc).
+
+Steps: (1) `dceLive` writes one `<mod>.live.nif` per module (its resolve
+entries and live set) with `OnlyIfChanged` semantics, plus the whole-program
+file if anything still reads it; (2) each `dceEmit` node's input is its own
+module's live file, so nifmake re-runs it only when that file moved;
+(3) `dceEmit` output is written `OnlyIfChanged` too, so `lengc`/`cc` of an
+unchanged module stay put.
+
+Tests: an incremental scenario on a 3-module fixture: a body-only edit of
+a leaf module re-runs `dceEmit` for that module only and `cc` for it only;
+an edit that changes what is live in an importer re-runs exactly the
+affected modules; `tests/incremental`, `tests/inproc`, `tests/ctfe_diff`,
+`tests/nifcache` green; `hastur boot` byte-identical.
+
+Gate: `self.editbody` on the self-compilation benchmark drops by the
+dceEmit fan-out (~0.3–0.4 s wall) with `cc` count 1; `self.cold` within 3 %.
+
 ## Phase B0 — nativenif on this machine and the M0 measurement
 
 Goal (JIT.md 9, phase 0 track B; B1 "M0 measurement first"): know where
@@ -678,6 +706,7 @@ machine, with one script. The rule, from 2026-09-06 on:
 |---|---|---|
 | P0a | merged (`-f` no longer forwarded; `runEval` memo with `.out.nif.reads` sidecar from `std/writenif`; `-d:vfsProfile` builds; `bench/ctfe_bench.nim` + `bench/ctfe_latency.sh`; tmyops forced 3.63 s -> 0.91 s, edit-rebuild 0.194 s -> 0.092 s; 793/793 tests, boot byte-identical) | merged from jit/p0a |
 | P0b | merged (ocache under `nimcache/ocache/`; main module never owns a shared instantiation; second sub-program compiles 1 object instead of 8; `tmyops` user CPU 2.61 s -> 1.91 s) | merged from jit/p0b |
+| P0c | running | |
 | B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | merged (`src/lib/ledger.nim`, `toolhash.nim`; fragments under `<dir>/.ledger/`, snapshot `<nimcache>/ledger.nif`; `--stats` per-phase table; overhead +0.78 %; nifmake spawn recording deferred to A1d) | merged from jit/a1a |
 | A1b | merged (`src/lib/artifactstore.nim`; `--vfs:disk\|memory\|memory+spill\|verify`, `--vfs-budget`, policy handed to children via `NIMONY_VFS` env; 36 direct call sites converted; `nifmake.runNodeRelay` tri-state seam; whole tree green under `--vfs:memory+spill`; verify mode 0 mismatches) | merged from jit/a1b |
