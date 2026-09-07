@@ -976,6 +976,14 @@ proc evalMemoIsFresh(c: var SemContext; m: EvalMemo): bool =
   result = not memoIsStale(m.outFile, deps)
 
 when defined(nimonyEngine):
+  proc engineSelected(config: NifConfig): bool =
+    ## `--ctfe:engine`, or `--ctfe:auto` (the default) on a host where the
+    ## engine is the default (`engine.engineByDefault`).
+    case config.ctfeMode
+    of ctfeEngine: true
+    of ctfeAuto: engineByDefault()
+    of ctfeSubprocess: false
+
   var theEngine = initEngine()
     ## One engine per nimsem process, and it has to be process-wide rather than
     ## per-`SemContext`: a guest that ran past its budget is STILL RUNNING on a
@@ -1025,8 +1033,10 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
     writeEvalImports(c, m.progDepsFile)
     if not evalMemoIsFresh(c, m):
       var done = false
+      var triedEngine = false
       when defined(nimonyEngine):
-        if c.g.config.ctfeMode == ctfeEngine:
+        if engineSelected(c.g.config):
+          triedEngine = true
           let (engineOut, engineCode, fellBack) = evalThroughEngine(c, m)
           if not fellBack:
             done = true
@@ -1037,7 +1047,7 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
         # rebuilt with `--ctfe:subprocess` because the run that fell back left
         # it stopped after the analysis graph, with no binary to run.
         let args =
-          if c.g.config.ctfeMode == ctfeEngine: subprocessCtfeArgs(c.commandLineArgs)
+          if triedEngine: subprocessCtfeArgs(c.commandLineArgs)
           else: c.commandLineArgs
         let (output, exitCode) = runProgram(m.progFile, c.g.config.nifcachePath, usedModules,
                                             args, sourceDir)

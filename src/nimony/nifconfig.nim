@@ -91,6 +91,10 @@ type
 
   CtfeMode* = enum
     ## `--ctfe:` — how a `const` too complex for `expreval` is evaluated.
+    ctfeAuto = "auto"
+      ## The default: the engine where it has been qualified (macOS/arm64
+      ## with `-d:nimonyEngine`, see `engine.engineByDefault`), the
+      ## subprocess everywhere else.
     ctfeSubprocess = "subprocess"
       ## Compile the synthesized sub-program to an executable and run it.
       ## Correct everywhere, and the fallback whenever the engine refuses.

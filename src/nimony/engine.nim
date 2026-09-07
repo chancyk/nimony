@@ -147,6 +147,15 @@ proc hostTarget(): AsmTarget =
   elif defined(windows) and defined(amd64): atWinX64
   else: atA64
 
+proc engineByDefault*(): bool =
+  ## Whether `--ctfe:auto` means the engine on this host. Only where it has
+  ## been exercised end to end: macOS/arm64 (B0 tiers 27/27, B2 corpus 47/47,
+  ## the whole test tree under `--ctfe:engine`). linux/x64 waits for arkham's
+  ## `&threadvar` lowering under `--dev-single-thread` (B1 notes) and a run of
+  ## the same suites there; until then `auto` is the subprocess on it.
+  when defined(macosx) and defined(arm64): true
+  else: false
+
 proc hostIsSupported*(): bool =
   ## Whether the engine can run a guest on this host at all. `runImage` is
   ## POSIX-only on `jit/b1` and the arena needs a 64-bit address space.

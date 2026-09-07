@@ -188,9 +188,10 @@ proc parseCommonOption*(key, val: string; config: var NifConfig;
     # after the analysis graph (`deps.buildGraph`). Riding `commandLineArgs`
     # also means a nested evaluation inherits the mode with no extra plumbing.
     case normalize(val)
+    of "auto": config.ctfeMode = ctfeAuto
     of "subprocess": config.ctfeMode = ctfeSubprocess
     of "engine": config.ctfeMode = ctfeEngine
-    else: quit "invalid value for --ctfe; expected subprocess or engine"
+    else: quit "invalid value for --ctfe; expected auto, subprocess or engine"
   of "ctfe-analysis-only", "ctfeanalysisonly":
     # Undocumented by design: not a user's choice but one compiler telling the
     # child it spawned that it will run the result itself. NOT forwarded — the

@@ -500,7 +500,10 @@ proc incrementalOCacheTests*(mode = "") =
   proc run(src, label: string): string =
     # `-r` so the program also runs: a wrongly reused object would either fail
     # to link or produce the wrong number.
-    let cmd = nimony.quoteShell & " c -r --silentMake" & modeFlag & " --nimcache:" &
+    # `--ctfe:subprocess`: this scenario counts the C objects of the
+    # sub-programs, i.e. it tests the C-backend object cache (P0b). Under the
+    # engine default (B2) a sub-program is never compiled to objects at all.
+    let cmd = nimony.quoteShell & " c -r --silentMake --ctfe:subprocess" & modeFlag & " --nimcache:" &
               cache.quoteShell & " " & src.quoteShell
     let (output, ec) = execCmdEx(cmd)
     if ec != 0:
