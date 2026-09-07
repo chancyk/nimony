@@ -198,6 +198,12 @@ proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
   if req.rawArgs: return false
   if req.argv.len == 0: return false
 
+  # A depth too thin to fill the cores has nothing to fan out to, so a process
+  # buys only its own cost. This is JIT.md 6.2's second clause and it is the
+  # one that carries an edit-rebuild and a compile-time evaluation, where a
+  # depth is one or two nodes.
+  if req.readyAtDepth < s.cores: return true
+
   let key = LedgerKey(phase: req.name, module: moduleOfNode(req))
   # An empty toolhash asks about the phase regardless of which binary measured
   # it: the scheduler is weighing somebody else's tool, and stamping the query
@@ -205,10 +211,21 @@ proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
   let est = estimate(s.costs, key, "")
   var spawnCost = est.spawnNs
   if spawnCost < MinSpawnCostNs: spawnCost = MinSpawnCostNs
-  if est.produceNs < spawnCost * s.k: return true
-  # Cheap enough is settled; what is left is whether the fan-out would have
-  # anything to fan out to.
-  result = req.readyAtDepth < s.cores
+
+  # JIT.md 6.2's first clause, "is this node worth a process", scaled to the
+  # depth. In-process nodes run SEQUENTIALLY, so at a depth of `n` nodes the
+  # real comparison is `n` calls against one fan-out, not one call against one
+  # spawn -- and the literal per-node form answers "not worth it" for every
+  # one of 99 cheap `hexer` nodes and then runs them one after another. That
+  # is 0.6 s of wall on a cold stdlib build that the fan-out does in a tenth
+  # of it, and it contradicts JIT.md 6.3's own expectation that "a cold
+  # 100-module build still fans out".
+  #
+  # The two agree exactly where they meet: at `readyAtDepth == cores` this is
+  # `est * cores < spawn * k * cores`, i.e. `est < spawn * k`, the rule as
+  # written. It only tightens as a depth grows past the core count, which is
+  # the only region where the per-node form and the fan-out disagree.
+  result = est.produceNs * req.readyAtDepth < spawnCost * s.k * s.cores
 
 # --- the relay -------------------------------------------------------------
 
