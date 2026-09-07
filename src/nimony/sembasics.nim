@@ -389,14 +389,10 @@ proc makeFieldSym*(c: var SemContext; result: var string) =
   result.addInt n
 
 proc localNamespaceOf*(sym: SymId): string =
-  ## The namespace segment for the locals of the routine `sym`: its module-less
-  ## name with the dots written as `` ` `` so that a local built from it keeps
-  ## exactly ONE dot and stays a local name (`symparser.isLocalName`).
-  ## `semExpr.0.mymod` -> `` semExpr`0 ``, `foo.1.Iabcdef.mymod` ->
-  ## `` foo`1`Iabcdef ``.
-  result = removeModule(pool.syms[sym])
-  for i in 0 ..< result.len:
-    if result[i] == '.': result[i] = LocalNsSep
+  ## The namespace segment for the locals of the routine `sym` — see
+  ## `symparser.localNamespace`, which the exception lowering and the
+  ## control-flow graph key their own temporaries on too.
+  localNamespace(pool.syms[sym])
 
 proc makeLocalSym*(c: var SemContext; result: var string) =
   ## `x` -> `` x.3`semExpr`0 ``: the disambiguator counts this NAME inside this
