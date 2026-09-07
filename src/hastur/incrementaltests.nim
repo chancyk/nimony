@@ -1393,10 +1393,20 @@ proc incrementalDeclStabilityTests*() =
   # what comes AFTER the new declaration, and in the compiler's own modules
   # what comes after is the generic instantiations spliced in from imports,
   # which is why `sem.nim` sees 465 of 1227 for an appended proc.
+  #
+  # The insertion is TWO procs, because there are two kinds of counter to
+  # disturb. `b3bInserted` declares `result`, `acc` and `s` and so consumes one
+  # of each from `sembasics.makeLocalSym`; `b3bInsertedGuard` catches a ref
+  # exception and so consumes one `` `err `` from `derefs.nim`. Both used to be
+  # module-wide, and both would renumber the fixture's `guardOne`/`guardTwo` and
+  # every `step` below the insertion point.
   inc phases
   writeFile(lib, editOnce(originalLib, "proc step6*(x: int): int =",
     "proc b3bInserted*(x: int): int =\n  var acc = x + 11\n" &
     "  let s = \"b3b inserted\"\n  result = acc + s.len\n\n" &
+    "proc b3bInsertedGuard*(x: int) =\n  try:\n    mayFail(x - 13)\n" &
+    "    guardSink = x + 13\n  except B3bError as e:\n" &
+    "    guardSink = e.code\n\n" &
     "proc step6*(x: int): int =", "insert"))
   build("insert")
   let sInsertNow = splitNifDecls(sNif)
@@ -1416,13 +1426,15 @@ proc incrementalDeclStabilityTests*() =
   # to 0 and the bound below stays satisfied.
   # F1 landed prerequisite 1: a local is numbered inside its own routine and
   # carries that routine's name, so a proc inserted in the middle renames
-  # nothing below it. What is left is the declaration the edit actually
-  # touches. Raising this bound means the numbering regressed.
-  expect sInsertBlind.changed <= 2,
+  # nothing below it. Its follow-up did the same for the two counters that
+  # bypassed `SemContext.locals` -- `derefs.nim`'s `` `err `` and
+  # `controlflow.nim`'s `` `cf `` -- which is why the insertion above also
+  # raises. Raising this bound means the numbering regressed.
+  expect sInsertBlind.changed <= 1,
          "insert: " & $sInsertBlind.changed & " of " & $sBase.len &
-         " declarations changed with line info ignored (expected at most 2); " &
+         " declarations changed with line info ignored (expected at most 1); " &
          "a proc inserted in the middle must not rename another " &
-         "declaration's locals"
+         "declaration's locals or temporaries"
   let dInsert = digestChanges(dBase, readDeclDigests(dNif), true)
   expect dInsert <= 2,
          "insert: " & $dInsert & " declarations changed by the .decls.nif " &

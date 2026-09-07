@@ -14,7 +14,18 @@
 ## - each proc owns a distinct string literal, so an in-place edit of one
 ##   literal is a change to exactly one declaration and nothing else;
 ## - `step5` sits in the middle, which is where the line-shifting edit goes,
-##   and the inserted proc goes in just after it, before `step6`.
+##   and the inserted procs go in just after it, before `step6`;
+## - `guardOne`/`guardTwo` catch a ref exception, which is what makes
+##   `derefs.nim` mint its `` `err `` temporary, and `loopOne` has the `while`
+##   and `case` that drive `controlflow.nim`'s `` `cf `` temporaries. Both
+##   counters used to number from MODULE-wide state, so a raising proc inserted
+##   above them renumbered them; they sit AFTER the insertion point on purpose,
+##   which is the only position where that would show.
+##
+## They are `proc ... =` rather than `proc ...: int =` because a value-returning
+## proc whose body catches a ref exception does not survive the C backend today
+## (`error: non-void function ... should return a value`, reproducible at the F1
+## fork point and unrelated to anything measured here).
 ##
 ## Do not renumber or reorder these procs casually: the scenario finds its
 ## three edit sites by plain string replacement over this file -- step5's
@@ -23,6 +34,18 @@
 ## reason nothing here, comments included, may repeat one of those three
 ## strings: the first match wins, and a comment that quotes an edit site
 ## would be edited instead of the code.
+
+type
+  B3bError* = ref object of Exception
+    code*: int
+
+var guardSink* = 0
+  ## Where `guardOne`/`guardTwo` put their answer; a `var` because they cannot
+  ## return one (see the header).
+
+proc mayFail*(x: int) {.raises: B3bError.} =
+  if x < 0:
+    raise B3bError(msg: "b3b below zero", code: x)
 
 proc step1*(x: int): int =
   var acc = x + 1
@@ -74,8 +97,39 @@ proc step10*(x: int): int =
   let s = "b3b step ten"
   result = acc + s.len
 
+proc guardOne*(x: int) =
+  ## `derefs.nim` mints one `` `err `` here.
+  try:
+    mayFail(x - 11)
+    guardSink = x + 11
+  except B3bError as e:
+    guardSink = e.code
+
+proc guardTwo*(x: int) =
+  ## ...and a second one here, which is the one an inserted raising proc used to
+  ## renumber.
+  try:
+    mayFail(x - 12)
+    guardSink = x + 12
+  except B3bError as e:
+    guardSink = e.code
+
+proc loopOne*(x: int): int =
+  var acc = 0
+  var i = 0
+  while i < x:
+    case i mod 3
+    of 0: acc = acc + 1
+    of 1: acc = acc + 2
+    else: acc = acc + 3
+    inc i
+  result = acc
+
 proc total*(x: int): int =
   var acc = 0
   acc = acc + step1(x) + step2(x) + step3(x) + step4(x) + step5(x)
   acc = acc + step6(x) + step7(x) + step8(x) + step9(x) + step10(x)
+  guardOne(x)
+  guardTwo(x)
+  acc = acc + guardSink + loopOne(x)
   result = acc
