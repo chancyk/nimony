@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 15996            )
+(.indexat 15994            )
 (stmts
  (arch arm64)
  (type :`cchar.0.
@@ -763,9 +763,9 @@
    (cmp
     (x0)
     (x1))
-   (ble `L23.0)
+   (ble `L1.0)
    (mov result.0`isLe`0 0)
-   (lab :`L23.0)
+   (lab :`L1.0)
    (mov
     (x0)result.0`isLe`0)
    (kill result.0`isLe`0)
