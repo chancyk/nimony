@@ -643,6 +643,32 @@ ledger.
 Gate: cold `nimony r` of the stdlib-wide test loads cached modules in ≤ 20
 ms; a one-line edit runs in ≤ 40 ms end to end.
 
+## Phase B3b — symbol-granularity lowering for the edited module
+
+Goal: after B3, a body edit in the compiler's largest module still re-lowers
+the whole module: hexer 0.36 s, arkham 0.41 s (run 6). JIT.md 7.3 already
+says "compile at symbol granularity for the edited module"; this phase does
+it before hot reload needs it.
+
+Steps: (1) hexer's `expand` keeps the previous `.x.nif` and re-lowers only
+the top-level declarations whose sem output changed (declaration-level diff
+of the `.s.nif`, keyed by symbol; the inliner's cross-proc effects are the
+hard part -- a changed inline body invalidates its callers); (2) arkham per
+symbol with B3's fragment cache keyed on the symbol's Leng (already the
+cache unit in nifasm; arkham needs the same split: emit only the changed
+procs' asm-NIF and splice the rest from the previous `.asm.nif`); (3) the
+same per-declaration diff feeds the `.dce.nif` analysis so `dceLive` stays
+cheap.
+
+Gate: `self.editbody` hexer + arkham time for a body edit in `sem.nim` ≤ 0.1 s;
+`.x.nif`/`.asm.nif` byte-identical to a full re-lowering (the differential
+harness idea applied to lowering); boot byte-identical.
+
+Open decision (project owner): the remaining 0.45 s of `nimsem` on that
+module is the per-module re-check. Declaration-level incremental sem is
+outside JIT.md's "no new compiler technology" scope and is the only lever
+left for it.
+
 ## Phase B4 — hot reload and `nimony dev`
 
 Layout sidecar and classifier, slot swap with generation counter,
@@ -722,4 +748,7 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B1 (nativenif half) | done on `../nativenif` branch `jit/b1` (10 commits from pin d0781a48): `generateAsmBuf`, `AsmSession`/`emitRoots`, `AsmError`, `image/memory.nim` + `hostfixup.nim`, `core/hostsyms.nim`, `hostrun.nim` + `tools/nifrun`, `--dev-single-thread`; refactor gate byte-identical; 234/234 memory-vs-file code hash checks; CTFE sub-program runs from memory in ~8 ms with byte-identical `.out.nif` (reproduced by the integrator). Not yet: x64 `&threadvar` lowering (arkham side), Windows `runImage`, the nimony-side `nimony r`, re-pin of `src/nativenif.commit` | nativenif e368478 |
 | B2 | merged (`src/nimony/engine.nim` behind `-d:nimonyEngine`, `--ctfe:subprocess\|engine` (default subprocess), `--ctfe-budget`, `NIMONY_CTFE_ENGINE=off`; `--ctfe-analysis-only` stops the sub-compile after `.c.nif`; `<nimcache>/asmcache/`; median 12 ms per new evaluation; 47/47 corpus evaluations through the engine, 0 fallbacks, 0 differences; pin `src/nativenif.commit` -> 3d20d5c (jit/b1 + path fix + `runImage` budget). The `bitabs` assertion was an out-of-bounds token read in nifasm's foreign-decl parser (fixed in nativenif 736b491, regression test, gate byte-identical; pin re-pointed). `--ctfe:auto` is now the default: the engine on macOS/arm64, the subprocess elsewhere until linux/x64 is exercised. Not done: per-proc code cache, `emitRoots` closure) | merged from jit/b2, jit/b2-fix |
 | B1 (nimony half) | merged (`nimony r`: whole native graph minus the link node, `engine.runWholeProgram` assembles in-process and calls `main` from the arena; hello edit-to-run 0.320 -> 0.033 s; the compiler runs itself from memory; found nativenif's `_exit` intercept mis-keyed (`hostsyms.cName` strips on registration) -- worked around by registering `__exit`, fix belongs upstream; `bench/devloop_bench.sh` gained `hello.nrun/run`, `self.nrun/run` and an absolutised root) | merged from jit/b1-nimony |
-| B3–B5 | planned; B3 running in ../nativenif (`jit/b3`) | |
+| B3 (nativenif half) | done on `../nativenif` branch `jit/b3` (head 713c819): per-SYMBOL code cache in `src/nifasm/blobcache.nim`, `--blobcache:<dir>` / `AsmSession.useBlobCache`, validity = module stamp + read-from modules + per-reference type-layout stamps; 127-module link 0.84 s -> 0.25 s warm (0.43 s when `sem.nim` changed), byte-identical sections, cold +9.5 %; the 0.07 s above the 0.2 s target is foreign-symbol lookup (a symbol-table cache is the next item); gate byte-identical (verified by the integrator) | nativenif 713c819 |
+| B3 (nimony half) | running (`jit/b3-nimony`: re-pin, `--blobcache` on the link node and in `runWholeProgram`, upstream fix for the `_exit` intercept) | |
+| B3b | planned: symbol-granularity lowering — hexer and arkham re-lower only the procs whose Leng changed, so a body edit in a 7k-line module costs one proc; pulled forward from B4 because the compiler's edit loop after B3 is ~0.45 s nimsem + 0.36 s hexer + 0.41 s arkham on ONE module (progress.md run 6) | |
+| B4, B5 | planned | |
