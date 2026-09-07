@@ -711,6 +711,23 @@ machine, with one script. The rule, from 2026-09-06 on:
    `std/rawthreads` has a nimNoLibc arm) are attribution. `hastur boot
    --boot-backend:native` is the correctness headline.
 
+## Small items found by measuring (not phases)
+
+- `findTool("nimony")` resolves to a file named `nimony` in the current
+  directory when one exists (a freshly built program called `nimony`), and
+  the CTFE sub-compile then fails with `/bin/sh: nimony: command not found`.
+  Pre-existing at the fork point. Fix: resolve tools next to the running
+  executable only.
+- The scheduler runs a depth's in-process nodes before its fan-out instead
+  of alongside it (progress.md run 3b); worth ~0.1 s on a forced stdlib
+  rebuild.
+- The no-change floor of a 127-module build is 0.11 s of dependency scan and
+  graph emission (run 6).
+- `std/rawthreads` has no `nimNoLibc` arm outside linux/x64 (B0); it keeps
+  the stdlib-wide corpus off the native backend on macOS.
+- nifasm's foreign-symbol lookup is the 0.07 s left in B3's incremental
+  link (notes/b3.md): a symbol-table cache beside the fragments.
+
 ## Execution rules for agents
 
 1. Work in a git worktree on a branch named `jit/<phase>`; commit there;

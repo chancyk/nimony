@@ -7,6 +7,7 @@
 #
 # Usage: bench/devloop_ab.sh <toolchain-A> <toolchain-B> [scenario] [rounds]
 #   scenario: stdlib.forced (default) | stdlib.cold | hello.forced | ctfe.forced
+#             | self.editbody | self.cold | self.run   (native backend; BACKEND=c for the C path)
 # Prints per-round wall/cpu for both, then median and min of each.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,13 +30,39 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
+  self.editbody|self.cold|self.run)
+    # The compiler compiling itself (fork-point sources, copied per side) with
+    # the native backend; `self.run` is `nimony r ... --version`.
+    selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
+    for side in A B; do mkdir -p "$work/self_$side" "$work/out_$side"; cp -R "$selfsrc" "$work/self_$side/src"; done
+    src="src/nimony/nimony.nim" ;;
   *) echo "unknown scenario $scen" >&2; exit 1 ;;
+esac
+backend=${BACKEND:-n}
+
+# One command per side and scenario. The self.* scenarios run under `cd` into
+# that side's source copy, so the toolchain path must be absolute (it is:
+# `A`/`B` are resolved below).
+A=$(cd "$A" && pwd); B=$(cd "$B" && pwd)
+cmdfor() {  # cmdfor <side> <nc> -> prints the command line
+  eval "t=\$$1"
+  case $scen in
+    self.editbody) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.cold)     echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
+    *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
+  esac
+}
+case $scen in
+  self.editbody) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
+  self.run)      prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
+  self.cold)     prep='rm -rf $nc' ;;
 esac
 
 # warm both caches once so a forced/edit scenario starts from the same state
 for side in A B; do
-  eval "t=\$$side"; nc="$work/nc_$side"
-  "$t/bin/nimony" c --silentMake --nimcache:"$nc" "$src" >/dev/null 2>&1
+  nc="$work/nc_$side"
+  sh -c "$(cmdfor $side $nc)" >/dev/null 2>&1
 done
 
 wa=""; ca=""; wb=""; cb=""
@@ -44,7 +71,7 @@ while [ $i -lt "$rounds" ]; do
   for side in A B; do
     eval "t=\$$side"; nc="$work/nc_$side"
     eval "$prep"
-    out=$(runone "$t/bin/nimony" c --silentMake $flags --nimcache:"$nc" "$src")
+    out=$(runone sh -c "$(cmdfor $side $nc)")
     printf 'round %d  %s  wall %s  cpu %s\n' "$i" "$side" "${out%% *}" "${out##* }"
     if [ $side = A ]; then wa="$wa ${out%% *}"; ca="$ca ${out##* }"; else wb="$wb ${out%% *}"; cb="$cb ${out##* }"; fi
   done

@@ -415,3 +415,34 @@ nifasm re-assembling the entire image (1.38 of 2.17 s), which is exactly JIT.md 
 code cache (B3): assemble the changed module, relink the rest from cached blobs. The cold build is
 hexer + nimsem + arkham, i.e. the frontend chain and lowering, which only threads or a faster
 nimsem/hexer shorten. The 0.11 s no-change floor (127 modules) is a P0-style item.
+
+## Run 7: the headline, interleaved, on a quiet machine (load ~2.6), native backend
+
+`bench/devloop_ab.sh /tmp/devloop_base . self.editbody 5` and `self.cold 3`
+(the A/B script gained the `self.*` scenarios). head = 5c64cd89 (everything
+through B1's `nimony r`; B3's blob cache NOT yet wired into nimony).
+
+| scenario | fork point wall / cpu | head wall / cpu | wall | cpu |
+|---|---|---|---|---|
+| sem.nim body edit, rebuild (`nimony n`) | 2.660 / 3.944 | 1.950 / 1.993 | 1.36x | 1.98x |
+| cold self-compilation (`nimony n`) | 5.288 / 13.652 | 5.158 / 12.186 | 1.03x | 1.12x |
+
+raw:
+```
+self.editbody  A wall 2.660 2.627 2.641 2.683 2.698  cpu 3.944 3.885 3.916 3.963 3.969
+               B wall 1.954 1.951 1.950 1.930 1.949  cpu 1.996 1.992 1.994 1.976 1.993
+self.cold      A wall 5.272 5.288 5.327  cpu 13.595 13.652 13.748
+               B wall 5.137 5.158 5.179  cpu 12.096 12.186 12.304
+```
+
+Of head's 1.95 s edit loop, 1.07 s is the whole-image assemble that B3
+replaces (0.25-0.43 s warm in nativenif's own measurement); the rest is
+nimsem + hexer + arkham on the edited 7k-line module (JIT_IMPL.md B3b and
+the open sem decision).
+
+Found while measuring: a cold build whose `--out` binary sits in the
+current directory fails at the fork point and on head alike --
+`src/lib/nimversion.nim(43, 28) Error: cannot evaluate expression at compile
+time: firstField(VersionFile)` then `/bin/sh: nimony: command not found` --
+the CTFE sub-compile resolves the tool name `nimony` to the file in the cwd.
+Pre-existing; noted in JIT_IMPL.md.
