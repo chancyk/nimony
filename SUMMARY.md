@@ -79,9 +79,25 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 Hot reload / `nimony dev` (B4), the engine on linux/x64 and Windows (B5,
 arkham lacks x64 `&threadvar` lowering under `--dev-single-thread`), an
 out-of-process guest (a guest fault kills nimsem today; `--ctfe:subprocess`
-is the answer), a `nimNoLibc` arm of `std/rawthreads` on macOS, symbol-
-granularity lowering (blocked on F1), declaration-level incremental sem
-(the last 0.33 s of the edit loop; not planned).
+is the answer), a `nimNoLibc` arm of `std/rawthreads` on macOS, hexer's
+declaration-level incremental `expand` (B3b's last half: F1/F2 made the
+inputs and outputs declaration-stable and arkham/nifasm already work per
+proc; hexer itself still lowers the whole module, 0.27 s on `sem.nim`, floor
+~0.11 s), and declaration-level incremental sem (the 0.34 s re-check of the
+edited module; not planned). Streaming `dceLive`'s per-module live sets out
+(the 147 MB cold peak) and `--threads:off` for the non-threading tools
+(-6 % on hexer) are small items on the list.
+
+## Where this branch sits against upstream
+
+`nim-lang/nimony` master moved six commits past the fork point while this
+was built (`nifsyms refactor`, `no globals in nifcore`, `thread the tag
+space`, a nativenif re-pin, two sem fixes). A trial merge conflicts in 30
+files, mostly the hexer passes F2 renamed and the sem files F1 touched;
+`no globals in nifcore` overlaps the intent of A2a's global resets. Local
+`master` is fast-forwarded to it; `fast-devloop` is not. `notes/handoff.md`
+records the phase-by-phase rebase path and the two gates for it
+(`decl-stability`, nativenif's refactor gate).
 
 ## Verify in five commands
 
