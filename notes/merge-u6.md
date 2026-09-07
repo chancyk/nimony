@@ -285,3 +285,64 @@ Of 82 hunks, ~68 were one shape and fell to two mechanical rules:
 
 The remainder are items 4-7 above plus `intramodinliner` (the design
 collision the respell resolves).
+
+## E. Two silent sites that produce WRONG OUTPUT, not ugly names
+
+A parallel call-site audit was disrupted by the same reset and is only
+partial, but two of the sites it reached are verified here directly against
+`git show e1da48e9:<file>`, which is stable. **Both are in the clean-merge
+set — they arrive with no conflict marker.**
+
+**1. `sembasics.newSymId` (`e1da48e9:src/nimony/sembasics.nim:419`) — F1's own
+machinery.**
+
+```nim
+proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
+  let isGlobal = not pool.symIsLocal(s)
+  var name = pool.symBasename(s)          # "" for every F1-spelled local
+  if isGlobal or forceGlobal: c.makeGlobalSym(name)
+  else:                       c.makeLocalSym(name)
+  result = pool.symId(name)
+```
+
+This copies a symbol *keeping its layout* and is the template-expansion path.
+With `name == ""`, the local branch mints `localSymName("", n, ns)` =
+`` .3`foo`0 `` — a spelling whose FIRST CHARACTER IS A DOT. Every local copied
+in the same routine also collapses onto one counter key `("", ns)`. They stay
+distinct by number, so nothing crashes; the names are simply malformed and
+carry no identity. `sembasics.nim` has 3 clean-merge sites.
+
+**2. `sempragmas` importc/exportc default name
+(`e1da48e9:src/nimony/sempragmas.nim:341`).**
+
+```nim
+elif crucial.sym != SymId(0):
+  var name = pool.symBasename(crucial.sym)
+  dest.addStrLit(name, info)
+```
+
+This is the branch taken when `{.importc.}` / `{.exportc.}` / `{.dynlib.}` is
+given WITHOUT an explicit string, so the symbol's own identifier is the
+external C name. `crucial.sym` comes from `semLocal`'s `delayed.s.name`, so a
+`var x {.importc: ...}` written inside a routine is an F1-spelled local and
+the emitted external name is the empty string. That is a miscompile, not a
+rendering problem. `sempragmas.nim` has 2 clean-merge sites.
+
+Also named by the audit, unverified here: `semdecls.buildInnerObjDecl` (the
+`.Obj` split name for a `ref object` declared inside a routine),
+`validator/semfacts.baseName` (empty variable names in borrow diagnostics),
+`lengc/llvmcodegen.nifSymBaseName` (DWARF local/parameter names; it has an
+`if result.len == 0` fallback to the full spelling, so cosmetic only).
+
+**The structural correction the audit got right and is worth keeping:** the
+reachability question is NOT "is this symbol local". `TempNamer.freshGlobalSym`
+appends a module suffix to the same backtick-tailed string, so an F2 global
+(`` `setlit.0`semStmt`0.mymod ``) fails `parseDisamb` exactly like a local while
+`symIsLocal` answers `false`. The right question is **"did this name ever pass
+through `sembasics.makeLocalSym` or through `TempNamer`"**, and neither
+`symIsLocal` nor `symModule` distinguishes those from safe globals — which is
+precisely what a call site's own `isGlobal` check assumes when it branches, as
+`newSymId` and `buildInnerObjDecl` both do.
+
+After the respelling, every one of these becomes correct on its own, with no
+call-site edits: that is the argument for doing the respell first.
