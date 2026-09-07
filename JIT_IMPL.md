@@ -678,10 +678,12 @@ machine, with one script. The rule, from 2026-09-06 on:
    worse than `base` and is not explained by the phase that was just merged
    blocks the next launch until it is understood (profile with
    `nimony c -f --profile`, then bisect by phase branch).
-4. Scenarios: hello (forced / no change / edit), CTFE `tmyops` (cold / warm /
-   edit / forced), `bench/ctfe_bench.nim` (cold / edit), stdlib `tall.nim`
-   (cold / forced / `strutils` edit). B-track phases add `nimony r` and the
-   engine's per-evaluation time when those exist.
+4. Scenarios, all through the NATIVE backend (`nimony n`; `BACKEND=c` for the
+   C path): the compiler compiling itself (`self.cold` / `nochange` /
+   `editbody` / `edit` / `forced`) is the verdict; hello, CTFE `tmyops`,
+   `bench/ctfe_bench.nim` and stdlib `tall.nim` (C backend until
+   `std/rawthreads` has a nimNoLibc arm) are attribution. `hastur boot
+   --boot-backend:native` is the correctness headline.
 
 ## Execution rules for agents
 

@@ -371,3 +371,47 @@ regression this phase introduced and then removed -- see
 `bench/results/2026-09-06/a2c.txt` §8. It is also what settled `hello.forced`,
 which the block runs of the same afternoon reported at +12.6 % cpu and the
 interleaved script at -4.3 %.
+
+## Run 6: NATIVE backend (`nimony n`, arkham + nifasm), fork point vs head, median of 3
+
+head = 62b998b1 (A2c, P0c merged; native bootstrap byte-identical again). Base got arkham/nifasm
+binaries built from the current nativenif checkout (the refactor gate proves their CLI output
+identical to the fork-point pin). The machine is never quiet (a media app at 60 % cpu, Spotlight);
+read ratios and the interleaved A/B, not absolutes. `stdlib.*` still on the C backend (rawthreads).
+
+| scenario | base wall / cpu | head wall / cpu | wall ratio |
+|---|---|---|---|
+| hello.forced | 0.346 / 0.487 | 0.376 / 0.522 | 0.92x |
+| hello.nochange | 0.015 / 0.012 | 0.007 / 0.006 | 2.14x |
+| hello.edit | 0.051 / 0.043 | 0.041 / 0.036 | 1.24x |
+| ctfe.cold | 2.599 / 3.939 | 0.954 / 1.470 | 2.72x |
+| ctfe.warm | 0.012 / 0.010 | 0.009 / 0.008 | 1.33x |
+| ctfe.edit | 0.171 / 0.146 | 0.048 / 0.043 | 3.56x |
+| ctfe.forced | 5.359 / 7.693 | 0.937 / 1.416 | 5.72x |
+| bench.cold | 10.650 / 16.043 | 1.401 / 1.947 | 7.60x |
+| bench.edit | 0.432 / 0.392 | 0.066 / 0.060 | 6.55x |
+| stdlib.cold | 8.836 / 47.557 | 9.031 / 46.181 | 0.98x |
+| stdlib.forced | 3.055 / 13.801 | 3.242 / 14.347 | 0.94x |
+| stdlib.edit | 0.587 / 1.572 | 0.459 / 0.834 | 1.28x |
+| self.cold | 7.674 / 19.489 | 7.330 / 16.977 | 1.05x |
+| self.nochange | 0.107 / 0.103 | 0.114 / 0.112 | 0.94x |
+| self.editbody | 2.987 / 4.559 | 2.169 / 2.195 | 1.38x |
+| self.edit | 3.108 / 4.814 | 2.277 / 2.419 | 1.36x |
+| self.forced | 7.740 / 19.469 | 7.289 / 18.536 | 1.06x |
+
+### Where a native self-compilation spends its time (head, `--profile`)
+
+```
+cold:  frontend  nimsem 4.84 s cpu (129)  nifler 1.13 s (165)      graph wall 1.71 s + 0.82 s in-process
+       backend   hexer 5.44 s cpu (121)  arkham 3.41 s (127)  link(nifasm) 1.06 s  dceLive 0.58 s  dceEmit 0.36 s
+                                                                graph wall 2.56 s + 0.94 s in-process
+sem.nim body edit:  nimsem 0.45 s (in-process)  hexer 0.36 s  arkham 0.41 s (3 modules)  dceEmit 0.06 s
+                    link (nifasm, the WHOLE 127-module image) 1.38 s          total 2.17 s
+no change:          both graphs 0 ms; the 0.11 s is nimony's own dependency scan and graph emission
+```
+
+Reading: with the C compiler out of the picture the edit loop of the compiler is dominated by
+nifasm re-assembling the entire image (1.38 of 2.17 s), which is exactly JIT.md 7.3's per-module
+code cache (B3): assemble the changed module, relink the rest from cached blobs. The cold build is
+hexer + nimsem + arkham, i.e. the frontend chain and lowering, which only threads or a faster
+nimsem/hexer shorten. The 0.11 s no-change floor (127 modules) is a P0-style item.
