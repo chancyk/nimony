@@ -214,3 +214,22 @@ and cheaper in cpu; stdlib-wide cold is +4 % wall / -3 % cpu and forced +10 %
 wall / -6 % cpu. The forced wall cost is the next thing to profile (see the
 A2b review commit: the in-process node of a depth runs BEFORE the depth's
 fan-out instead of overlapping it).
+
+## Run 3b: the scheduler's depth decision, measured node by node
+
+`NIMONY_PROFILE_NODES=1 nimony c -f --profile` (new: one `[node] inproc|spawn
+<phase> <module> <s> ready=<n>` line per node) on the forced stdlib build
+showed where run 3's +10 % wall went and what the rule had to become:
+
+| rule | in-process on a forced stdlib build | stdlib.forced A/B vs base (wall, cpu) |
+|---|---|---|
+| A2b as merged: `ready < cores -> in-process`, per node | 27 nimsem + 96 dceEmit (0.38 s serial) | +15 % / -20 % |
+| per node, `n*est <= ceil(n/cores)*est + k*spawn`, `produce` only | 12 nimsem + 96 dceEmit (dceEmit's `produce` is 0.1 ms, its node 2 ms) | +7 % / +3 % |
+| per DEPTH, whole-node cost, fan-out = `largest*rounds + k*spawn` | 99 hexer at one depth (one 203 ms module made ten "rounds") | +24 % / -5 % |
+| per depth, fan-out = `max(largest, serial/cores) + k*spawn`, k = 1 | 8 nimsem + dceLive (0.14 s serial) | **+6 % / +4 %** |
+
+Same final rule on stdlib.cold: +2.5 % wall / -3.5 % cpu (3 rounds). The
+one-line-edit case stays fully in-process except `cc`/`link` under every
+variant above. What remains of the +6 % is the in-process nimsem nodes at
+single-node depths (8 × 14 ms) running before, not alongside, their depth's
+fan-out -- the overlap is the next scheduler item (JIT_IMPL.md A2b follow-up).

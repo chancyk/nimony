@@ -17,8 +17,9 @@
 ##
 ## ```
 ## if the phase is not registered:              spawn
-## elif the depth is one node:                  in-process (the edit-rebuild, the CTFE snippet)
-## elif n*est <= ceil(n/cores)*est + k*spawn:  in-process (n = ready nodes at this depth)
+## elif the depth has one registered node:      in-process (the edit-rebuild, the CTFE snippet)
+## elif sum(costs) <= max(max(cost), sum/cores) + k*spawn:  the whole depth in-process
+##                                                (n = registered nodes ready at this depth)
 ## else:                                        spill inputs, spawn
 ## ```
 ##
@@ -72,7 +73,7 @@ import ".." / lengc / lengc
 # is a change to files this phase does not own.
 
 const
-  DefaultInprocK* = 3
+  DefaultInprocK* = 1
     ## JIT.md 6.2's `k`: how many spawn costs a phase may be worth before the
     ## fan-out is preferred to a call.
   MinSpawnCostNs* = 3_000_000'i64
@@ -122,6 +123,8 @@ type
     inproc*: int      ## nodes run without a process, this process's lifetime
     spawned*: int     ## nodes handed back to the DAG to spawn
     active*: bool
+    decidedDepth*: int    ## `depthSeq` of the depth `depthInproc` was decided for
+    depthInproc*: bool    ## the decision for that depth
 
 # --- the registry ----------------------------------------------------------
 
@@ -187,9 +190,68 @@ proc moduleOfNode*(req: RunNodeRequest): string =
   ## `nifmake`'s own `ledgerModuleOf` does (A1d).
   if req.outputs.len == 0: "" else: moduleSuffixOf(req.outputs[0])
 
-proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
-  ## JIT.md 6.2, with nothing else in it. Split out from the relay so it can
-  ## be reasoned about (and tested) without a build graph around it.
+proc nodeCostNs(s: PhaseSchedule; name, module: string): int64 =
+  ## What one node costs in this process: every bucket the tools record, not
+  ## `produce` alone. Since A2a the tools split their time into
+  ## load/parse/produce/serialize/write, and a `dceEmit` whose `produce` is
+  ## 0.1 ms still costs 2 ms of load, parse and write.
+  # An empty toolhash asks about the phase regardless of which binary measured
+  # it: the scheduler is weighing somebody else's tool, and stamping the query
+  # with nimony's own hash would filter every entry out (`ledger.stampMatches`).
+  let est = estimate(s.costs, LedgerKey(phase: name, module: module), "")
+  result = est.produceNs + est.loadNs + est.parseNs + est.serializeNs + est.writeNs
+
+proc spawnCostNs(s: PhaseSchedule; name, module: string): int64 =
+  let est = estimate(s.costs, LedgerKey(phase: name, module: module), "")
+  result = est.spawnNs
+  if result < MinSpawnCostNs: result = MinSpawnCostNs
+
+proc depthWantsInproc(s: PhaseSchedule; req: RunNodeRequest): bool =
+  ## The decision for a whole depth, from JIT.md 6.2's question asked of the
+  ## depth rather than of one node: the registered nodes of this depth either
+  ## all run in this process, one after another, or all fan out.
+  ##
+  ##   serial   = sum of the registered nodes' costs
+  ##   fan-out  = max(largest cost, serial / cores) + k * spawn
+  ##
+  ## `k` weights the spawn. 1 (the default) makes the comparison wall-time
+  ## neutral, which is what an edit-run loop feels; `--inproc-k:3` trades
+  ## wall for fewer processes (three 5 ms hexer nodes then stay in-process:
+  ## 15 <= 5 + 9), which is the cpu-oriented reading of JIT.md 6.2.
+  ##   in-process iff serial <= fan-out
+  ##
+  ## One node is always in-process (`c <= c + k*spawn`): the edit-rebuild and
+  ## the compile-time-evaluation snippet. Five 20 ms nimsem nodes on ten cores
+  ## fan out (100 > 20 + 3). Five dceEmit nodes of 0.4, 1.4, 0.3, 0.3 and
+  ## 9.7 ms stay in (12.1 <= 9.7 + 3): a per-node test would have sent the
+  ## 9.7 ms one out alone and paid a spawn to save nothing. Ninety-six
+  ## dceEmit nodes at 2 ms fan out (192 > 20 + 3), as JIT.md 6.3 expects of a
+  ## cold stdlib build.
+  var serial = 0'i64
+  var largest = 0'i64
+  var spawn = 0'i64
+  var n = 0
+  for peer in req.depthPeers:
+    if findPhase(s.registry, peer.name) < 0: continue
+    let c = nodeCostNs(s, peer.name, peer.module)
+    serial += c
+    if c > largest: largest = c
+    let sp = spawnCostNs(s, peer.name, peer.module)
+    if sp > spawn: spawn = sp
+    inc n
+  if n <= 1: return true
+  # The fan-out's wall is bounded below by its largest node and by the work
+  # spread over the cores; `largest * ceil(n / cores)` is not it -- one
+  # 200 ms module among 98 small ones would make ten rounds of 200 ms out of
+  # a depth the fan-out finishes in 200.
+  let spread = serial div int64(s.cores)
+  let fanout = (if largest > spread: largest else: spread) + spawn * s.k
+  result = serial <= fanout
+
+proc wantsInproc*(s: var PhaseSchedule; req: RunNodeRequest): bool =
+  ## JIT.md 6.2, decided per depth (`depthWantsInproc`) and remembered for
+  ## the depth's remaining nodes. Split out from the relay so it can be
+  ## reasoned about (and tested) without a build graph around it.
   if s.mode == smAlways: return false
   if findPhase(s.registry, req.name) < 0: return false
   # An `.args` file contributed tokens to this command. `expandCommandArgs`
@@ -197,34 +259,11 @@ proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
   # argv is not faithful and the node has to reach a real shell.
   if req.rawArgs: return false
   if req.argv.len == 0: return false
-
-  let key = LedgerKey(phase: req.name, module: moduleOfNode(req))
-  # An empty toolhash asks about the phase regardless of which binary measured
-  # it: the scheduler is weighing somebody else's tool, and stamping the query
-  # with nimony's own hash would filter every entry out (`ledger.stampMatches`).
-  let est = estimate(s.costs, key, "")
-  var spawnCost = est.spawnNs
-  if spawnCost < MinSpawnCostNs: spawnCost = MinSpawnCostNs
-
-  # JIT.md 6.2 asks "is a process worth it for this node"; at a depth of `n`
-  # ready nodes the honest form of that question compares the two ways the
-  # depth can be run. In-process nodes run SEQUENTIALLY, so that costs
-  # `n * est`. Fanning out costs one spawn (weighted by `k`, the plan's
-  # allowance for what a process costs beyond its wall time) plus
-  # `ceil(n / cores)` rounds of the phase. Go in-process when the sequential
-  # run is no slower:
-  #
-  #   n * est  <=  ceil(n / cores) * est + k * spawn
-  #
-  # A single node is always in-process (`est <= est + k*spawn`), which is the
-  # edit-rebuild and the compile-time evaluation. Five 20 ms nimsem nodes on
-  # ten cores fan out (100 > 20 + 9); five 1 ms lengc nodes do not (5 < 10);
-  # 99 hexer nodes fan out, as JIT.md 6.3 expects of a cold stdlib build. The
-  # earlier clause "fewer ready nodes than cores -> in-process" answered the
-  # first case wrong and cost a forced stdlib rebuild 15 % of wall.
-  let n = max(req.readyAtDepth, 1)
-  let rounds = (n + s.cores - 1) div s.cores
-  result = est.produceNs * n <= est.produceNs * rounds + spawnCost * s.k
+  if req.depthPeers.len <= 1: return true   # the sequential path, or a depth of one
+  if req.depthSeq != s.decidedDepth or s.decidedDepth == 0:
+    s.decidedDepth = req.depthSeq
+    s.depthInproc = depthWantsInproc(s, req)
+  result = s.depthInproc
 
 # --- the relay -------------------------------------------------------------
 

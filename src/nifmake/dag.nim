@@ -134,6 +134,14 @@ type
     cmdTime*: Table[string, tuple[sec: float, count: int]]
     execWallTime*: float
     inproc*: int
+    inprocWallTime*: float  ## wall spent inside in-process nodes; they run one
+                            ## at a time, before their depth's fan-out, so this
+                            ## is time no other node overlaps (A2b)
+
+let profileNodes = existsEnv("NIMONY_PROFILE_NODES")
+  ## `NIMONY_PROFILE_NODES=1` with `--profile`: one stderr line per node,
+  ## `[node] inproc|spawn <phase> <module> <seconds>`, for attributing a
+  ## scheduler decision to its cost. Diagnostic only.
 
 proc initProfileData*(): ProfileData =
   ProfileData(cmdTime: initTable[string, tuple[sec: float, count: int]]())
@@ -400,6 +408,18 @@ type
                          ## this one included. The scheduler of JIT.md 6.2
                          ## weighs it against the core count; a sequential run
                          ## reports 1, which is the truth there.
+    depthSeq*: int       ## a counter that changes once per depth, so a relay
+                         ## deciding per DEPTH can reuse its answer for every
+                         ## node of that depth without a table
+    depthPeers*: seq[DepthPeer]  ## every node about to run at this depth
+                         ## (this one included), as the ledger keys them; what
+                         ## a per-depth decision is made from. Empty on the
+                         ## sequential path, where a depth is one node.
+
+  DepthPeer* = object
+    name*: string    ## the `cmd` name
+    module*: string  ## `ledgerModuleOf` the node: the module suffix of its
+                     ## first output, "" for a whole-program node
 
 proc spawnEverything(req: RunNodeRequest): RunNodeStatus {.nimcall.} = RunSpawn
 
@@ -414,17 +434,18 @@ proc relayInstalled*(): bool =
   runNodeRelay != spawnEverything
 
 proc offerNode(parts: seq[CmdArg]; name, command: string; node: Node;
-               baseDir: string; readyAtDepth: int): RunNodeStatus =
+               baseDir: string; readyAtDepth: int; depthSeq: int;
+               peers: seq[DepthPeer]): RunNodeStatus =
   ## Ask the relay. Named so the two paths in `runDag` agree, and guarded so
-  ## the default relay costs nothing: assembling the request copies four
-  ## `seq[string]`s per node, and the make loop runs it for every node of
-  ## every depth.
+  ## the default relay costs nothing: assembling the request copies five
+  ## `seq`s per node, and the make loop runs it for every node of every depth.
   if runNodeRelay == spawnEverything: return RunSpawn
   runNodeRelay(RunNodeRequest(
     name: name, command: command,
     argv: argvOf(parts), rawArgs: hasRawArgs(parts),
     inputs: node.inputs, outputs: node.outputs, args: node.args,
-    baseDir: baseDir, readyAtDepth: readyAtDepth))
+    baseDir: baseDir, readyAtDepth: readyAtDepth, depthSeq: depthSeq,
+    depthPeers: peers))
 
 # --- the cost ledger ------------------------------------------------------
 #
@@ -553,6 +574,7 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
     prog.draw("")  # paint the starting reading (lo%) right away
 
   if Parallel in opt:
+    var depthSeq = 0   # bumps once per depth; see `RunNodeRequest.depthSeq`
     var i = 0
     while i < sortedNodes.len:
       let currentDepth = dag.nodes[sortedNodes[i]].depth
@@ -577,6 +599,16 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           pending.add sortedNodes[i]
         inc i
 
+      # The depth as the relay sees it, built once: a per-depth decision
+      # (JIT.md 6.2's "ready nodes at this depth") needs every node's ledger
+      # key, and it needs them before the first node is offered.
+      inc depthSeq
+      var peers: seq[DepthPeer] = @[]
+      if relayInstalled():
+        for nodeId in pending:
+          peers.add DepthPeer(name: dag.commands[dag.nodes[nodeId].cmdIdx].name,
+                              module: ledgerModuleOf(dag.nodes[nodeId]))
+
       # Pass 2: offer each one to the relay, and collect what it declines.
       for nodeId in pending:
         let node = addr dag.nodes[nodeId]
@@ -590,7 +622,8 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           echo "Command: ", expandedCmd
         let cmdName = dag.commands[node.cmdIdx].name
         let inprocStart = getMonoTime()
-        case offerNode(parts, cmdName, expandedCmd, node[], dag.baseDir, pending.len)
+        case offerNode(parts, cmdName, expandedCmd, node[], dag.baseDir, pending.len,
+                       depthSeq, peers)
         of RunSpawn:
           commands.add(expandedCmd)
           nodeIds.add(nodeId)
@@ -607,7 +640,12 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           inc profileInproc
           prog.draw(nodeLabel(dag, node[]))
           if profile != nil:
-            profile[].recordCmdTime(cmdName, toSeconds(getMonoTime() - inprocStart))
+            let sec = toSeconds(getMonoTime() - inprocStart)
+            profile[].recordCmdTime(cmdName, sec)
+            profile[].inprocWallTime += sec
+            if profileNodes:
+              stderr.writeLine "[node] inproc " & cmdName & " " & ledgerModuleOf(node[]) &
+                " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $pending.len
         of RunHandledFailed:
           if prog.active:
             stdout.write "\n"
@@ -640,6 +678,9 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           if profile != nil:
             let sec = toSeconds(getMonoTime() - startTimes[idx])
             profile[].recordCmdTime(cmdNames[idx], sec)
+            if profileNodes:
+              stderr.writeLine "[node] spawn  " & cmdNames[idx] & " " & modules[idx] &
+                " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $commands.len
 
         let maxExitCode =
           if maxJobs > 0:
@@ -675,7 +716,7 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
         let start = getMonoTime()
         # Nothing fans out on this path, so one ready node is the whole truth
         # the scheduler could learn from a count here.
-        let status = offerNode(parts, cmdName, expandedCmd, node[], dag.baseDir, 1)
+        let status = offerNode(parts, cmdName, expandedCmd, node[], dag.baseDir, 1, 0, @[])
         let ok =
           case status
           of RunSpawn: executeCommand(expandedCmd)
@@ -965,5 +1006,6 @@ proc profileText*(profile: ProfileData): string =
   result.add "  exec total:     " & execTotal.formatFloat(ffDecimal, 3) & "s\n"
   result.add "  in-process:     " & $profile.inproc & " of " &
              $(profile.cmdTime.values.toSeq.foldl(a + b.count, 0)) & " commands\n"
-  result.add "  wall time:      " & profile.execWallTime.formatFloat(ffDecimal, 3) & "s\n"
+  result.add "  wall time:      " & profile.execWallTime.formatFloat(ffDecimal, 3) &
+             "s  (+ " & profile.inprocWallTime.formatFloat(ffDecimal, 3) & "s in-process, serial)\n"
   result.add "---\n"
