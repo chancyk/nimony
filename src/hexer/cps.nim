@@ -118,8 +118,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
     # fallback to init wrapper call for methods, closures, proctype
     # calls because we cant restore its coroTypeForProc
     if typ.typeKind == MethodT or procHasPragma(typ, ClosureP) or typ.childCursor.kind == DotToken or n.childCursor.symKind notin RoutineKinds:
-      let contVar = pool.syms.getOrIncl("`contVar." & $c.currentProc.counter)
-      inc c.currentProc.counter
+      let contVar = c.namer.freshSym("`contVar")
       copyIntoKind dest, VarS, info:
         dest.addSymDef contVar, info
         dest.addDotToken() # exported
@@ -155,8 +154,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
       # Stack-allocate the callee's frame (statically known callee).
       # Null callee.callee (see emitStackFrameTag) so deallocFrame is a
       # nop — `callee == nil` marks the frame as stack-allocated.
-      let coroVar = pool.syms.getOrIncl("`coroVar." & $c.currentProc.counter)
-      inc c.currentProc.counter
+      let coroVar = c.namer.freshSym("`coroVar")
       var sym = n.childCursor.symId
       copyIntoKind dest, VarS, info:
         dest.addSymDef coroVar, info
@@ -164,8 +162,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
         dest.addDotToken() # pragmas
         dest.addSymUse coroTypeForProc(c, sym), info
         dest.addDotToken() # default value
-      let contVar = pool.syms.getOrIncl("`contVar." & $c.currentProc.counter)
-      inc c.currentProc.counter
+      let contVar = c.namer.freshSym("`contVar")
       copyIntoKind dest, VarS, info:
         dest.addSymDef contVar, info
         dest.addDotToken() # exported
@@ -211,8 +208,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
     # because the rest of the pipeline already assumes code like
     # `let tmp = fnConstruct(args); return tmp` so that is what we
     # generate here:
-    let contVar = pool.syms.getOrIncl("`contVar." & $c.currentProc.counter)
-    inc c.currentProc.counter
+    let contVar = c.namer.freshSym("`contVar")
     dest.addParLe VarS, info
     dest.addSymDef contVar, info
     dest.addDotToken() # exported
@@ -414,8 +410,9 @@ proc transformToCps*(pass: var Pass) =
   var c = Context(thisModuleSuffix: pass.moduleSuffix,
     typeCache: createTypeCache(pass.bits), coroTypes: createTokenBuf(10),
     continuationProcImpl: generateContinuationProcImpl(),
-    hooks: passiveHooks(), nextTemp: pass.nextTemp,
+    hooks: passiveHooks(),
     ptrSize: pass.bits div 8)
+  swap(c.namer, pass.namer)
   c.typeCache.openScope()
   assert n.stmtKind == StmtsS
   c.coroTypes.addParLe(n.cursorTagId, n.info) # the `(stmts` open tag
@@ -429,7 +426,7 @@ proc transformToCps*(pass: var Pass) =
     c.coroTypes.add pass.dest # concat coroTypes and other statements
     c.coroTypes.addParRi() # close the root; its source ParRi may be elided
   swap c.coroTypes, pass.dest
-  pass.nextTemp = c.nextTemp
+  swap(c.namer, pass.namer)
   c.typeCache.closeScope()
 
 when isMainModule:

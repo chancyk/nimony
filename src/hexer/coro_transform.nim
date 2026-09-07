@@ -113,7 +113,6 @@ type
       ## keeps the constructor total.
     cf*: TokenBuf
     resultSym*: SymId
-    counter*: int
     labelCounter*: int = 1
     loopHeads*: seq[int]
       ## One entry per enclosing loop, innermost last: the state label of a
@@ -181,14 +180,15 @@ type
                                ## and emits the state machine if so.
 
   Context* = object
-    counter*: int
     ptrSize*: int
       ## Target pointer size in bytes. Needed to give `int`/`uint`/`float`
       ## a concrete width when a default value for one is synthesized.
-    nextTemp*: int
-      ## Continues the outer pipeline's xelim temp counter through the
-      ## nested per-coroutine Final-IR runs (treIteratorBody) — restarting at
-      ## 0 re-mints `x.N SymIds that collide with still-live outer temps.
+    namer*: TempNamer
+      ## Declaration-scoped names for the symbols this pass synthesizes, and
+      ## the counters the nested per-coroutine Final-IR runs (treIteratorBody)
+      ## continue: restarting at 0 re-mints `x.N SymIds that collide with
+      ## still-live outer temps. `ns` names the routine currently being
+      ## lowered, so nothing here depends on the rest of the module.
     typeCache*: TypeCache
     sizeofCache*: SizeofCache
       ## Memoizes the type sizes `nextArgRole` asks about while `trGoto`
@@ -265,12 +265,8 @@ proc stateToProcName*(c: Context; sym: SymId; state: int): SymId =
 proc localToFieldname*(c: var Context; local: SymId): SymId =
   var name = pool.syms[local]
   extractBasename name
-  name.add "`f."
-  name.add $c.counter
-  inc c.counter
-  name.add "."
-  name.add c.thisModuleSuffix
-  result = pool.syms.getOrIncl(name)
+  name.add "`f"
+  result = c.namer.freshGlobalSym(name, c.thisModuleSuffix)
 
 proc coroWrapperForExternIter*(iterSym: SymId): SymId =
   ## Context-free spelling of `coroWrapperProc` for lambdalifting, which
@@ -687,8 +683,7 @@ proc emitFinalReturn*(c: var Context; dest: var TokenBuf; info: NifLineInfo) =
     dest.copyIntoKind RetS, info:
       emitStopContinuation(dest, info)
     return
-  let tmpVar = pool.syms.getOrIncl("`tmpCaller." & $c.currentProc.counter)
-  inc c.currentProc.counter
+  let tmpVar = c.namer.freshSym("`tmpCaller")
   dest.copyIntoKind VarS, info:
     dest.addSymDef tmpVar, info
     dest.addDotToken() # exported
@@ -855,8 +850,7 @@ proc trCoroFor*(c: var Context; dest: var TokenBuf; n: var Cursor) =
     assert argCount >= trailingCount, "corofor: iter call missing args"
     let realArgCount = argCount - trailingCount
 
-    let itSym = pool.syms.getOrIncl("`coroIt." & $c.currentProc.counter)
-    inc c.currentProc.counter
+    let itSym = c.namer.freshSym("`coroIt")
     c.typeCache.registerLocal(itSym, VarY, default(Cursor))
     dest.copyIntoKind VarS, info:
       dest.addSymDef itSym, info
@@ -872,8 +866,7 @@ proc trCoroFor*(c: var Context; dest: var TokenBuf; n: var Cursor) =
         dest.takeTree addrW
         emitStopContinuation(dest, info)
 
-    let myEnvSym = pool.syms.getOrIncl("`coroEnv." & $c.currentProc.counter)
-    inc c.currentProc.counter
+    let myEnvSym = c.namer.freshSym("`coroEnv")
     c.typeCache.registerLocal(myEnvSym, LetY, default(Cursor))
 
     emitWhileBegin(dest, info, itSym, myEnvSym)
@@ -902,8 +895,7 @@ proc trCall*(c: var Context; dest: var TokenBuf; n: var Cursor) =
     if hasResult:
       let info = n.info
       dest.copyIntoKind ExprX, info:
-        let tmpVar = pool.syms.getOrIncl("`tmpCpsResult." & $c.currentProc.counter)
-        inc c.currentProc.counter
+        let tmpVar = c.namer.freshSym("`tmpCpsResult")
         var target = createTokenBuf(1)
         target.addSymUse tmpVar, info
         dest.copyIntoKind VarS, info:
@@ -1133,8 +1125,7 @@ proc trReturn*(c: var Context; dest: var TokenBuf; n: var Cursor) =
     # target. Emit the same shape as emitFinalReturn.
     emitFinalReturn(c, dest, info)
     return
-  let tmpVar = pool.syms.getOrIncl("`tmpCaller." & $c.currentProc.counter)
-  inc c.currentProc.counter
+  let tmpVar = c.namer.freshSym("`tmpCaller")
   dest.copyIntoKind VarS, info:
     dest.addSymDef tmpVar, info
     dest.addDotToken() # exported
@@ -1346,8 +1337,7 @@ proc extendLifetime(c: var Context; dest: var TokenBuf; n: var Cursor) =
     return
   let info = n.info
   let argType = getType(c.typeCache, n)
-  let symId = pool.syms.getOrIncl("`coroTemp." & $c.currentProc.counter)
-  inc c.currentProc.counter
+  let symId = c.namer.freshSym("`coroTemp")
   # The `(expr (stmts ...) v)` shape rather than a statement hoisted in front
   # of the enclosing one: it keeps the value's evaluation exactly where it was,
   # which matters as soon as a second argument of the same call has side
@@ -1867,9 +1857,10 @@ proc treIteratorBody*(c: var Context; dest: var TokenBuf; init: var TokenBuf; it
   # `c.ptrSize` IS the target width; the 0 that stood here was invisible only
   # while the type cache ignored what it was handed.
   var pass = initPass(ensureMove wrapper, c.thisModuleSuffix, "finalir",
-                      c.ptrSize * 8, nextTemp = c.nextTemp)
+                      c.ptrSize * 8)
+  swap(pass.namer, c.namer)
   toFinalIr(pass)
-  c.nextTemp = pass.nextTemp
+  swap(pass.namer, c.namer)
   block extractBody:
     var wholeResult = ensureMove(pass.dest)
     var nExt = beginRead(wholeResult)
@@ -2089,8 +2080,7 @@ proc generateCoroutineHelpers*(c: var Context; dest: var TokenBuf; sym: SymId; i
             emitFreshFrameCall(c, dest, sym, params, hasResult, info)
         dest.copyIntoKind ElseU, info:
           dest.copyIntoKind StmtsS, info:
-            let thisLocal = pool.syms.getOrIncl("`thisReuse." & $c.currentProc.counter & "." & c.thisModuleSuffix)
-            inc c.currentProc.counter
+            let thisLocal = c.namer.freshGlobalSym("`thisReuse", c.thisModuleSuffix)
             dest.copyIntoKind LetS, info:
               dest.addSymDef thisLocal, info
               dest.addDotToken() # exported
@@ -2363,6 +2353,10 @@ proc transformCoroutineDecl*(c: var Context; dest: var TokenBuf; n: var Cursor) 
   var isConcrete = true # assume it is concrete
   let sym = n.symId
   c.procStack.add(sym)
+  # Everything this decl synthesizes — frame fields, temps, the nested
+  # Final-IR run's \`x.N — is numbered inside this coroutine.
+  let outerNs = c.namer.ns
+  c.namer.ns = localNamespaceOf(sym)
   var isCoroutine = false
   for i in 0..<BodyPos:
     if i == ParamsPos:
@@ -2422,6 +2416,7 @@ proc transformCoroutineDecl*(c: var Context; dest: var TokenBuf; n: var Cursor) 
     generateCoroutineType(c, coroTypes, sym)
     c.coroTypes = move coroTypes
     generateCoroutineHelpers(c, dest, sym, iter)
+  c.namer.ns = outerNs
   swap(c.currentProc, currentProc)
 
 # ---------------------------------------------------------------------
@@ -2564,9 +2559,7 @@ proc coroTr*(c: var Context; dest: var TokenBuf; n: var Cursor) =
           # exactly the construct that expresses it.
           var bodyBuf = createTokenBuf(64)
           var info = n.info
-          let contLab = pool.syms.getOrIncl("´cont." & $c.currentProc.counter &
-                                            "." & c.thisModuleSuffix)
-          inc c.currentProc.counter
+          let contLab = c.namer.freshGlobalSym("´cont", c.thisModuleSuffix)
           var lastJmp = -1
           var jumps = 0
           n.into:                                 # (loop ...)

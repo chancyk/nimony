@@ -9,7 +9,101 @@
 
 when not defined(nimony):
   import std/[monotimes, times, syncio, os, strutils]
-import ../lib/[nifpools]
+import std/tables
+import ../lib/[nifpools, symparser]
+
+# ── Declaration-scoped names for synthesized symbols ───────────────────────
+#
+# Every counter hexer used to mint a temporary from was module-wide, so the
+# name a declaration's temps got depended on how many temps the declarations
+# BEFORE it needed -- and, because `lowerExprs` runs over the whole buffer more
+# than once sharing one counter, on how many the declarations AFTER it needed
+# too.
+# An edit to the last proc of a module renamed the first proc's `\`x.0` to
+# `\`x.1` (`notes/b3b.md` section 11). That makes a declaration-level diff of
+# the lowering output meaningless, which is what B3b's splice is built on.
+#
+# `TempNamer` is F1's fix one level down (`notes/f1.md` section 4): the counter
+# is keyed by (identifier, owning declaration) and the owner's name rides in
+# the disambiguator, so the string is unique in the module without the number
+# being a function of the module.
+#
+#     `x.3`semStmt`0            a local  (one dot, `symparser.isLocalName`)
+#     `setlit.0`semStmt`0.mymod a global (two dots, module suffix last)
+#
+# The table is PERSISTENT per owner rather than pushed and popped: `lowerExprs`
+# visits the same routine more than once (xelim1, xelim_final, and one nested
+# Final-IR run per coroutine) and a counter that restarted at 0 would hand the
+# second visit names the first one already minted -- `pool.syms` is
+# identity-by-name, so that is one SymId for two distinct temps.
+
+type
+  TempNamer* = object
+    ns*: string
+      ## Namespace segment of the declaration currently being lowered, empty
+      ## at module level (top-level statements, which all land in one
+      ## `initBody` anyway and have no declaration identity to be stable for).
+    counters*: Table[string, int]
+      ## (identifier + namespace) -> last number handed out.
+
+proc localNamespaceOf*(sym: SymId): string =
+  ## The namespace segment for the temporaries of the declaration `sym`: its
+  ## module-less name with the dots written as `` ` `` so a local built from it
+  ## keeps exactly ONE dot. `semStmt.0.mymod` -> `` semStmt`0 ``.
+  ## A missing symbol yields the empty namespace, i.e. today's module-wide
+  ## numbering — a declaration that has no name has no identity to be stable
+  ## for either.
+  if sym == SymId(0): return ""
+  result = removeModule(pool.syms[sym])
+  for i in 0 ..< result.len:
+    if result[i] == '.': result[i] = LocalNsSep
+
+proc toplevelNamespace*(n: Cursor): string =
+  ## The namespace for the symbols synthesized while lowering the top-level
+  ## statement `n`. Every declaration node spells its own name as its first
+  ## child; a bare statement (module init code) has none and keeps the
+  ## module-wide numbering it always had.
+  if n.isTagLit and n.childCursor.isSymbolDef:
+    result = localNamespaceOf(n.childCursor.symId)
+  else:
+    result = ""
+
+proc nextNumber*(t: var TempNamer; base: string): int =
+  var key = base
+  if t.ns.len > 0:
+    key.add LocalNsSep
+    key.add t.ns
+  var counter = addr t.counters.mgetOrPut(key, -1)
+  counter[] += 1
+  result = counter[]
+
+proc freshName*(t: var TempNamer; base: string): string =
+  ## A local-layout name: `` \`x `` -> `` \`x.3`semStmt`0 ``.
+  localSymName(base, nextNumber(t, base), t.ns)
+
+proc freshSym*(t: var TempNamer; base: string): SymId =
+  pool.syms.getOrIncl(freshName(t, base))
+
+proc freshGlobalName*(t: var TempNamer; base, moduleSuffix: string): string =
+  ## A global-layout name: the module suffix stays the LAST dotted segment, so
+  ## `extractModule` and `isInstantiation` still read it the way they always did.
+  result = freshName(t, base)
+  result.add '.'
+  result.add moduleSuffix
+
+proc freshGlobalSym*(t: var TempNamer; base, moduleSuffix: string): SymId =
+  pool.syms.getOrIncl(freshGlobalName(t, base, moduleSuffix))
+
+proc namespacedName*(base, disamb, ns: string): string =
+  ## For the callers that keep a counter of their own but still need the
+  ## namespace: `base`, `.`, an already-formatted disambiguator, then the
+  ## namespace. Keeps the one-dot shape of a local.
+  result = base
+  result.add '.'
+  result.add disamb
+  if ns.len > 0:
+    result.add LocalNsSep
+    result.add ns
 
 type
   Pass* = object
@@ -18,7 +112,7 @@ type
     dest*: TokenBuf    ## Output buffer being written to
     moduleSuffix*: string  ## Module suffix for symbol generation
     bits*: int         ## number of bits in the target architecture
-    nextTemp*: int     ## Counter for temporary variable generation
+    namer*: TempNamer  ## Declaration-scoped names for synthesized symbols
     passName*: string  ## Current pass name (for debugging/logging)
     when not defined(nimony):
       passStart*: MonoTime  ## start time of current pass (only set when timing on)
@@ -56,17 +150,19 @@ when not defined(nimony):
     passTimingLog.flushFile()
 
 proc initPass*(initialBuf: sink TokenBuf; moduleSuffix: string;
-               firstPassName: string; bits: int; nextTemp = 0): Pass =
+               firstPassName: string; bits: int): Pass =
   ## Initialize a new Pass pipeline with the given input buffer.
   ## The buffer is moved into the Pass and a cursor is created.
-  ## `nextTemp` seeds the xelim temp counter: a NESTED pipeline (e.g. the
+  ## The new pipeline starts with an EMPTY `namer`. A NESTED pipeline (e.g. the
   ## per-coroutine Final-IR run in `treIteratorBody`) must continue the outer
-  ## pipeline's counter, or its `lowerExprs` re-mints \`x.N SymIds that
+  ## pipeline's counters instead, or its `lowerExprs` re-mints \`x.N SymIds that
   ## collide with still-live outer temps in the same proc (one frame slot,
-  ## two types — see tests/nimony/cps/tifexpr_arg_temp_collision.nim).
+  ## two types — see tests/nimony/cps/tifexpr_arg_temp_collision.nim); it does
+  ## that by `swap`ping its owner's `TempNamer` in around the nested run, which
+  ## is O(1) and keeps the counters in exactly one place.
   when not defined(nimony):
     ensurePassTimingInit()
-  result = Pass(buf: initialBuf, moduleSuffix: moduleSuffix, bits: bits, nextTemp: nextTemp, passName: firstPassName)
+  result = Pass(buf: initialBuf, moduleSuffix: moduleSuffix, bits: bits, passName: firstPassName)
   result.n = beginRead(result.buf)
   result.dest = createTokenBuf(300)
   when not defined(nimony):

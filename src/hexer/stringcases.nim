@@ -28,7 +28,7 @@ proc decodeSolution(c: var EContext; dest: var TokenBuf; s: seq[SearchNode]; i: 
     # var-init position — a call buried in the `elif` condition is opaque to it
     # (the same pipeline-ordering issue the array bound checks had). The bound
     # form below is exactly what the inliner's `trySpliceVarInit` recognises.
-    let condTmp = pool.syms.getOrIncl("`tc." & $c.getTmpId)
+    let condTmp = c.namer.freshSym("`tc")
     dest.copyIntoUnchecked "var", info:
       dest.addSymDef(condTmp, info)
       dest.addDotToken() # pragmas
@@ -101,7 +101,7 @@ proc transformStringCase*(c: var EContext; dest: var TokenBuf; n: var Cursor) =
   let selectorType = getType(c.typeCache, selectorNode)
   if selectorType.typeKind == CstringT:
     # the other overload of `borrowCStringUnsafe`
-    selector = pool.syms.getOrIncl("`tc." & $c.getTmpId)
+    selector = c.namer.freshSym("`tc")
     dest.copyIntoUnchecked "var", sinfo:
       dest.addSymDef(selector, sinfo)
       dest.addDotToken() # pragmas
@@ -112,7 +112,7 @@ proc transformStringCase*(c: var EContext; dest: var TokenBuf; n: var Cursor) =
   elif selectorNode.isSymbol:
     selector = selectorNode.symId
   else:
-    selector = pool.syms.getOrIncl("`tc." & $c.getTmpId)
+    selector = c.namer.freshSym("`tc")
     dest.copyIntoUnchecked "var", sinfo:
       dest.addSymDef(selector, sinfo)
       dest.addDotToken() # pragmas
@@ -122,7 +122,7 @@ proc transformStringCase*(c: var EContext; dest: var TokenBuf; n: var Cursor) =
 
   while nb.hasMore:
     if nb.substructureKind == OfU:
-      let labl = "`sc." & $getTmpId(c)
+      let labl = c.namer.freshName("`sc")
       nb.into:                                # (of ...)
         assert nb.substructureKind == RangesU
         nb.into:                              # (ranges ...)
@@ -141,9 +141,9 @@ proc transformStringCase*(c: var EContext; dest: var TokenBuf; n: var Cursor) =
   nb = sub(nb)
 
   skip nb # selector
-  let afterwards = pool.syms.getOrIncl("`sc." & $getTmpId(c))
+  let afterwards = c.namer.freshSym("`sc")
 
-  let elseLabel = pool.syms.getOrIncl("`sc." & $getTmpId(c))
+  let elseLabel = c.namer.freshSym("`sc")
   dest.copyIntoUnchecked "jmp", selectorNode.info:
     dest.addSymUse(elseLabel, selectorNode.info)
   var hasElse = false

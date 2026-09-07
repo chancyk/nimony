@@ -50,6 +50,7 @@ import std / [tables, assertions, os, sets, hashes]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / lib / [symparser, vfs]
+import passes
 import ".." / lengc / [leng_model]
 
 type
@@ -260,8 +261,17 @@ type
 
   InlinerCtx* = object
     moduleSuffix*: string
-    counter: int                            # fresh-name suffix
+    counter: int                            # fresh-name suffix, per `ns`
     counterPrefix: string                   # disambiguates passes (hexer vs dce2)
+    ns: string
+      ## Namespace segment of the top-level declaration being rewritten
+      ## (`passes.localNamespaceOf`). It rides in the disambiguator of every
+      ## name `freshSym`/`inlineBody` mints, so the SPLICES INTO ONE PROC do
+      ## not depend on how many splices happened in the procs before it —
+      ## which is what let an edit at the end of a module rename the temps at
+      ## the start (`notes/b3b.md` section 11, `notes/f2.md`). `counter`
+      ## restarts with each new `ns`; the namespace is what keeps the names
+      ## unique across the module.
     bodies: Table[SymId, int]               # same-module callee → offset in `src`
     ownInfo: Table[SymId, InlineInfo]       # same-module `(inline …)` annotations
     src: ptr TokenBuf                       # the module's parsed buffer
@@ -294,11 +304,11 @@ type
 proc initInlinerCtx*(moduleSuffix: string; src: ptr TokenBuf;
                      xnifDir = ""; maxDepth = 0;
                      counterPrefix = "i"): InlinerCtx =
-  ## `counterPrefix` is woven into fresh local sym names (`base.0i<n>`,
-  ## `returnLabel.0i<n>`). The hexer same-module pass uses `"h"` and
-  ## dce2's cross-module pass uses `"d"` so freshly-minted dce2 syms
-  ## can never collide with hexer-minted syms that survive in the
-  ## `.x.nif` body dce2 is rewriting.
+  ## `counterPrefix` is woven into fresh local sym names
+  ## (`` base.0i<n>`caller`0 ``, `` returnLabel.0i<n>`caller`0 ``). The hexer
+  ## same-module pass uses `"h"` and dce2's cross-module pass uses `"d"` so
+  ## freshly-minted dce2 syms can never collide with hexer-minted syms that
+  ## survive in the `.x.nif` body dce2 is rewriting.
   InlinerCtx(moduleSuffix: moduleSuffix, src: src,
              bodies: initTable[SymId, int](),
              ownInfo: initTable[SymId, InlineInfo](),
@@ -397,6 +407,16 @@ proc lookupBody(c: var InlinerCtx; calleeSym: SymId; outCur: var Cursor): bool =
   outCur = cursorAt(fm.buf, fm.bodies.getOrQuit(calleeSym))
   result = true
 
+proc freshDisamb(c: var InlinerCtx): string =
+  ## The disambiguator every name this pass mints carries: `0<prefix><n>`,
+  ## then the enclosing declaration's namespace. The leading `0` keeps the
+  ## byte after the dot a digit, which is what every `symparser` scanner
+  ## splits on.
+  inc c.counter
+  result = "0"
+  result.add c.counterPrefix
+  result.addInt c.counter
+
 proc freshSym(c: var InlinerCtx; orig: SymId): SymId =
   ## Mint a fresh local sym for an inlined body's local. Local names must
   ## have ≤ 1 dot (per `isLocalName`) so dce2's per-module rewrite emits
@@ -407,15 +427,12 @@ proc freshSym(c: var InlinerCtx; orig: SymId): SymId =
   ## disambiguates between the hexer-stage same-module pass and the
   ## dce2-stage cross-module pass so the latter's fresh syms can't
   ## collide with hexer-minted ones already baked into the `.x.nif`.
-  inc c.counter
+  let disamb = freshDisamb(c)
   let original = pool.syms[orig]
   var base = original
   let dotPos = base.find('.')
   if dotPos >= 0: base.setLen dotPos
-  base.add ".0"
-  base.add c.counterPrefix
-  base.addInt c.counter
-  result = pool.syms.getOrIncl(base)
+  result = pool.syms.getOrIncl(namespacedName(base, disamb, c.ns))
 
 proc scoreArg(a: Cursor): int =
   ## Argument score for the inline heuristic (planned in dce1: 0-100).
@@ -1092,9 +1109,8 @@ proc emitBody(c: var InlinerCtx; dest: var TokenBuf; body: var Cursor;
     emitRenamed(dest, body, bnd)
     return
   let info = body.info
-  inc c.counter
   let returnLabel = pool.syms.getOrIncl(
-    "returnLabel.0" & c.counterPrefix & $c.counter)
+    namespacedName("returnLabel", freshDisamb(c), c.ns))
   # Emit the inlined body as a real variable SCOPE, not a bare `(stmts)`: the
   # callee's fresh locals then belong to *this* scope frame, so the backend frees
   # their registers at the inlined body's end instead of leaking their live range
@@ -2129,6 +2145,10 @@ proc intraModuleInline*(moduleSuffix: string; buf: var TokenBuf) =
         dest.addSubtree d.pragmas
         var body = d.body
         ctx.growthLeft = growthBudget(tokenCount(body))
+        # The names of the locals a splice brings into this proc are numbered
+        # inside THIS proc, so a splice into some other proc cannot rename them.
+        ctx.ns = localNamespaceOf(d.name.symId)
+        ctx.counter = 0
         trIntra(ctx, dest, body)
         dest.addParRi()
       else:

@@ -89,7 +89,7 @@ type
     jumpIfTrue: bool  ## …exactly when the expression evaluates to this…
     conditional: bool ## …and: is this subtree one the short-circuit can skip?
   Context = object
-    counter: int
+    namer: TempNamer
     typeCache: TypeCache
     thisModuleSuffix: string
     goal: Goal
@@ -99,8 +99,7 @@ proc trStmt(c: var Context; dest: var TokenBuf; n: var Cursor)
   {.ensuresNif: addedAny(dest).}
 
 proc tempSymName(c: var Context): string {.inline.} =
-  result = "`x." & $c.counter
-  inc c.counter
+  result = c.namer.freshName("`x")
 
 proc getType(c: var Context; n: Cursor): Cursor =
   result = getType(c.typeCache, n)
@@ -632,8 +631,7 @@ proc mayBindToTemp(n: Cursor): bool =
 # ---------------------------------------------------------------------------
 
 proc freshLabel(c: var Context): SymId =
-  result = pool.syms.getOrIncl("`L." & $c.counter)
-  inc c.counter
+  result = c.namer.freshSym("`L")
 
 proc addJmp(dest: var TokenBuf; lab: SymId; info: NifLineInfo) =
   copyIntoKind dest, JmpS, info:
@@ -1154,7 +1152,12 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
       if isLocalDecl(symId):
         c.typeCache.registerLocal(symId, kind, decl)
       c.typeCache.openScope()
+      # Every temp this body needs is numbered inside this routine, so it does
+      # not matter what the rest of the module lowered before or after it.
+      let outerNs = c.namer.ns
+      c.namer.ns = localNamespaceOf(symId)
       trStmt c, dest, n
+      c.namer.ns = outerNs
       c.typeCache.closeScope()
     else:
       takeTree dest, n
@@ -1220,8 +1223,7 @@ proc trStmt(c: var Context; dest: var TokenBuf; n: var Cursor) =
           var tar = Target(m: IsBound)
           trExpr c, dest, n, tar
           # we must bind the result to a temporary variable!
-          let tmp = pool.syms.getOrIncl("`x." & $c.counter)
-          inc c.counter
+          let tmp = c.namer.freshSym("`x")
           let info = n.endInfo # the discard operand is consumed: `n` is at
                                # the (possibly elided) close
           dest.addParLe LetS, info
@@ -1512,13 +1514,16 @@ proc preRegisterRoutines(c: var Context; n: Cursor) =
 
 proc lowerExprs*(pass: var Pass; goal = ElimExprs) =
   var n = pass.n  # Extract cursor locally
-  # Inherit the temp counter across passes via `pass.nextTemp` — `lowerExprs`
-  # runs three times in `pipeline.transform` (xelim1, xelim2, xelim_final);
+  # Inherit the temp counters across passes via `pass.namer` — `lowerExprs`
+  # runs twice in `pipeline.transform` (xelim1, xelim_final) plus once per
+  # coroutine in `coro_transform.treIteratorBody`;
   # restarting from 0 each time produces colliding `\`x.<n>` SymIds whose
   # Lengc-emitted C names clash within a single function. `pool.syms.getOrIncl`
   # is identity-by-name, so two semantically distinct temps would otherwise
-  # share an identifier.
-  var c = Context(counter: pass.nextTemp, typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix, goal: goal)
+  # share an identifier. The counters are per (name, owning routine), so the
+  # names a routine gets do not depend on the rest of the module.
+  var c = Context(typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix, goal: goal)
+  swap(c.namer, pass.namer)
   c.typeCache.openScope()
   assert n.stmtKind == StmtsS, $n.kind
   preRegisterRoutines(c, n)
@@ -1528,7 +1533,7 @@ proc lowerExprs*(pass: var Pass; goal = ElimExprs) =
       trStmt c, pass.dest, n
   pass.dest.addParRi()
   c.typeCache.closeScope()
-  pass.nextTemp = c.counter
+  swap(c.namer, pass.namer)
   #echo "PRODUCED: ", pass.dest.toString(false)
 
 when isMainModule:

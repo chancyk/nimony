@@ -988,14 +988,15 @@ template moveToTopLevel(c: var EContext; dest: var TokenBuf; mode: TraverseMode;
     body
 
 proc makeLocalDeclName(c: var EContext; s: SymId): string =
-  # for proc and type decls
-  result = pool.syms[s]
-  extractBasename(result)
-  result.add "."
-  result.addInt c.localDeclCounters
-  inc c.localDeclCounters
-  result.add "."
-  result.add c.main
+  # for proc and type decls hoisted out of a routine body to module scope.
+  # The number counts this basename inside the OWNING declaration and the
+  # owner's namespace rides in the disambiguator, so the name cannot move
+  # when an unrelated declaration is edited — and two routines that each
+  # hoist a `const c` still get two distinct module-level symbols, which
+  # `c.hoistedConsts` (keyed by the proc-local SymId) depends on.
+  var base = pool.syms[s]
+  extractBasename(base)
+  result = c.namer.freshGlobalName(base, c.main)
 
 proc makeLocalSymId(c: var EContext; s: SymId): SymId =
   let newName = makeLocalDeclName(c, s)
@@ -1615,8 +1616,7 @@ proc trAddrAconstrUarray(c: var EContext; dest: var TokenBuf; n: var Cursor) =
   arrTypeBuf.addIntLit(elemCount, info)
   arrTypeBuf.addParRi()
 
-  let anonName = pool.syms.getOrIncl("anonArr." & $c.strLitCounter & "." & c.main)
-  inc c.strLitCounter
+  let anonName = c.namer.freshGlobalSym("anonArr", c.main)
 
   var constBuf = createTokenBuf(30)
   constBuf.addParLe("const", info)
@@ -2338,7 +2338,7 @@ proc initDynlib(c: var EContext; dest: var TokenBuf; initDest: var TokenBuf;
   ## that an `asgn` to a dead global is dead would restore that.)
   for key, vals in c.dynlibs:
     let dynlib = pool.strings[key]
-    var tmp = pool.syms.getOrIncl "Dl." & dynlib & "." & $getTmpId(c) & "." & c.main
+    var tmp = c.namer.freshGlobalSym("Dl." & dynlib, c.main)
 
     # Expand the dynlib name pattern at compile time (e.g. "libX11.so(|.6)"
     # -> ["libX11.so", "libX11.so.6"]) and load the library handle from the
@@ -2755,8 +2755,12 @@ proc initIsStatic(c: var EContext; n: Cursor): bool =
 
 proc trToplevel(c: var EContext; dest: var TokenBuf; n: var Cursor) =
   ## Consumes the whole `(stmts …)` node at `n`, including its close.
+  let outerNs = c.namer.ns
   n.into:
     while n.hasMore:
+      # Everything this statement synthesizes -- hoisted consts, anonymous
+      # array constants, string-case selectors -- is numbered inside it.
+      c.namer.ns = toplevelNamespace(n)
       let sk = n.stmtKind
       if sk in {GvarS, GletS, TvarS, TletS}:
         let tag = if sk in {TvarS, TletS}: TvarY else: GvarY
@@ -2794,6 +2798,7 @@ proc trToplevel(c: var EContext; dest: var TokenBuf; n: var Cursor) =
         swap dest, c.initBody
         trStmt c, dest, n, TraverseAll
         swap dest, c.initBody
+  c.namer.ns = outerNs
 
 type
   ExpandInput* = object
@@ -2898,7 +2903,6 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
     bigEndian: bigEndian,
     nativeBackend: native,
     isWindows: isWindows,
-    localDeclCounters: 1000,
     activeChecks: flags,
     liftingCtx: liftingCtx
   )

@@ -15,7 +15,7 @@ include ".." / nimony / nif_annotations
 
 type
   Context = object
-    counter: int
+    namer: TempNamer
     typeCache: TypeCache
     thisModuleSuffix: string
     tempUseBufStack: seq[TokenBuf]
@@ -27,9 +27,7 @@ type
     bits: int  ## target `int` width, handed to the const evaluator
 
 proc declareTemp(c: var Context; dest: var TokenBuf; typ: Cursor; info: NifLineInfo): SymId =
-  let s = "`desugar." & $c.counter
-  inc c.counter
-  result = pool.syms.getOrIncl(s)
+  result = c.namer.freshSym("`desugar")
   dest.addParLe("var", info)
   dest.addSymDef result, info
   dest.addDotToken() # export, pragmas
@@ -199,12 +197,17 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
   c.typeCache.openScope()
   let decl = n
   copyInto dest, n:
+    let symId = n.symId
     var pragmas = default(Cursor)
     let isConcrete = c.trRoutineHeader(dest, decl, n, pragmas)
     if isConcrete and n.stmtKind == StmtsS:
       dest.addParLe(n.cursorTagId, n.info) # (stmts)
       trRequires(c, dest, pragmas)
+      # Temps and hoisted set literals are numbered inside this routine.
+      let outerNs = c.namer.ns
+      c.namer.ns = localNamespaceOf(symId)
       trProcBody(c, dest, n)
+      c.namer.ns = outerNs
       dest.addParRi()
     else:
       takeTree dest, n
@@ -339,9 +342,7 @@ proc hoistConstSet(c: var Context; n: Cursor; info: NifLineInfo): SymId =
   # serialization of a name that was complete in the pool. Interning the elided
   # form instead would collide with any other module's `setlit.0.` that a later
   # `tryLoadSym` pulls into the same pool.
-  let s = "`setlit." & $c.counter & "." & c.thisModuleSuffix
-  inc c.counter
-  result = pool.syms.getOrIncl(s)
+  result = c.namer.freshGlobalSym("`setlit", c.thisModuleSuffix)
   var typ = n
   typ = sub(typ)  # throwaway copy; bounds the peek under vpr
   c.hoisted.addParLe("const", info)
@@ -1377,7 +1378,8 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor; isTopScope = false) =
 
 proc desugar*(pass: var Pass; activeChecks: set[CheckMode]) =
   var n = pass.n  # Extract cursor locally
-  var c = Context(counter: 0, typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix, activeChecks: activeChecks, pending: createTokenBuf(), hoisted: createTokenBuf(), bits: pass.bits)
+  var c = Context(typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix, activeChecks: activeChecks, pending: createTokenBuf(), hoisted: createTokenBuf(), bits: pass.bits)
+  swap(c.namer, pass.namer)
   c.typeCache.openScope()
   # Process the root `(stmts` manually (mirroring trSons' copyInto) but
   # keep it OPEN until `pending` has been appended: an emitted close
@@ -1401,4 +1403,5 @@ proc desugar*(pass: var Pass; activeChecks: set[CheckMode]) =
   pass.dest.add c.pending
   pass.dest.addParRi()
 
+  swap(c.namer, pass.namer)
   c.typeCache.closeScope()

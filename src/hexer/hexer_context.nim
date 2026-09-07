@@ -15,7 +15,7 @@ when defined(nimony):
 
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import lifter
+import lifter, passes
 import ".." / nimony / [nimony_model, typenav, langmodes, sizeof]
 
 export RcField, DataField
@@ -29,7 +29,7 @@ type
     newTypes*: Table[string, SymId]
     pending*: TokenBuf
     strLitBuf*: TokenBuf   ## static LongString const decls for SSO long literals
-    strLitCounter*: int    ## unique suffix for strLitBuf symbols
+
     typeCache*: TypeCache
     sizeofCache*: SizeofCache  ## shared size-by-symbol memoization
     bits*: int
@@ -43,11 +43,16 @@ type
 
     breaks*: seq[SymId] # how to translate `break`
     continues*: seq[SymId] # how to translate `continue`
-    instId*: int # per forStmt
-    tmpId*: int # per proc
+    namer*: TempNamer
+      ## Declaration-scoped names for everything this stage synthesizes:
+      ## `elimForLoops`'s inlined-iterator locals and labels, `stringcases`'s
+      ## selectors, the anonymous array constants and the consts hoisted out of
+      ## proc bodies. `ns` is the top-level declaration currently being walked,
+      ## so none of these names depend on the rest of the module
+      ## (`notes/f2.md`). It lives on `EContext` rather than on `Pass` because
+      ## the two stages that use it run BEFORE and AFTER the pass pipeline.
     resultSym*: SymId
 
-    localDeclCounters*: int
     hoistedConsts*: Table[SymId, SymId]  ## proc-level const -> its hoisted,
                                          ## module-suffixed top-level name
     activeChecks*: set[CheckMode]
@@ -86,10 +91,6 @@ proc usesRuntimeDynlibLoader*(e: EContext): bool {.inline.} =
   ## `dynlibIsStaticImport` for the C/LLVM backends; the native backend never
   ## emits loader stubs.
   not e.nativeBackend and not e.dynlibIsStaticImport
-
-proc getTmpId*(e: var EContext): int {.inline.} =
-  result = e.tmpId
-  inc e.tmpId
 
 proc error*(e: var EContext; msg: string; c: Cursor) {.noreturn.} =
   write stdout, "[Error] "
