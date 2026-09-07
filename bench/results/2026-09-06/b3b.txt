@@ -1,0 +1,324 @@
+Phase B3b -- symbol-granularity lowering for the edited module
+=============================================================
+
+Machine: macOS 26 / M5, Nim 2.2.10.  Toolchain: worktree `jit/b3b` (forked
+from `fast-devloop` at bad14fbf, i.e. everything through B3), nativenif pin
+f8d2676 built from a private clone (/tmp/b3b/nativenif, branch
+jit/b3b-arkham, UNMODIFIED).  Sources under measurement: a copy of
+/tmp/devloop_base/src (the fork-point compiler, 127 modules), built with
+`nimony n --nimcache:<tmp> --out:<outside the source tree>`.
+NIMONY_NATIVENIF=/tmp/b3b/nativenif, XDG_CACHE_HOME=/tmp/b3b_cache_agent.
+
+The edited module is `src/nimony/sem.nim`: 5610 lines of Nim, whose
+`.s.nif` is 3.9 MB / 1227 top-level declarations, `.x.nif` 7.1 MB / 1758,
+`.c.nif` 4.3 MB / 974, `.asm.nif` 10.0 MB / 975.
+
+
+1. Per-stage cost of a `self.editbody` rebuild (`nimony n --profile`)
+--------------------------------------------------------------------
+
+Four consecutive body edits, one run each; stable to +-3 ms.
+
+  nimsem      0.325 s  (1 invocation, in-process)
+  hexer       0.251 s  (1 invocation  -- sem only)
+  arkham      0.250 s  (3 invocations -- sem + two importers)
+  dceEmit     0.042 s  (1 invocation)
+  link        0.443 s  (nifasm, whole image, blob cache warm)
+  -------------------------------------------------------------
+  wall        1.377 s  (backend graph wall 0.647 s + 0.294 s in-process)
+
+hexer + arkham = 0.501 s.  The phase's gate is <= 0.2 s.
+
+progress.md run 6 read 0.36 s hexer and 0.41 s arkham for the same two
+stages.  That run was taken on a loaded machine at an earlier head; the
+RATIO is what carries over -- hexer and arkham on the edited module are
+about a third of the edit loop either way -- and every number below is from
+this measurement, not from run 6.
+
+arkham per module, standalone, median of 3:
+
+  semygjvq21.c.nif  (4.3 MB)   0.210 s
+  semqtmhr61.c.nif             0.019 s
+  sem2gie3m1.c.nif             0.021 s
+
+So the gate's 0.5 s is 0.25 s of hexer plus 0.21 s of arkham on ONE module.
+
+
+2. Inside `hexer c` on sem (cost ledger, `<outdir>/.ledger/hexer_<M>.nif`)
+--------------------------------------------------------------------------
+
+  load        0 ms      (setupProgram rolls open+index+parse into one call)
+  parse      14.1 ms    the 3.9 MB `.s.nif`
+  produce   207.2 ms    the buffer-level `expand`
+  serialize  19.5 ms    rendering the 7.1 MB `.x.nif`
+  write       3.6 ms    both publishes (OnlyIfChanged)
+  ---------------------------------
+  total     244.4 ms
+
+`produce` broken down -- temporary `getMonoTime` probes around
+`pipeline.optimizeLengOutput`'s three calls and inside `lengcgen.expand`,
+median of 3.  The probe build's `.x.nif` was byte-identical to the shipped
+binary's, and the probes are reverted (they are not in the commit):
+
+  transform          154.4 ms   elimForLoops + the 11-pass `Pass` pipeline
+  trToplevel + initDynlib + genInitProc + makeOutput
+                      14.8 ms
+  optimizeLengOutput  47.8 ms   arcopt 12.2 | funcsummary 11.5 | inliner 24.1
+  analyzeModule        5.8 ms   the `.dce.nif`
+  residual            ~5   ms
+  ---------------------------------
+                    ~222   ms
+
+Per-pass (`NIMONY_PASS_TIMING`, semygjvq21 only; sums to 148.6 ms):
+
+  lambdalift 35.6 | duplifier 35.0 | cps 13.8 | constparams 13.4
+  arcopt 10.0 (1263 per-proc calls) | xelim_final 8.5 | desugar 8.5
+  eraiser 6.8 | xelim1 6.3 | destroyer 5.9 | vtables 4.8
+
+Decomposable per declaration IN PRINCIPLE: transform 154 + trToplevel 15 +
+arcopt 12 + analyzeModule 6 = 187 ms, 84 % of produce.
+Whole-module BY CONSTRUCTION: `funcsummary`'s least fixpoint over the
+in-module call graph 11.5 ms + `intraModuleInline` 24.1 ms = 35.6 ms.
+Unavoidable I/O: parse 14 + serialize 20 + write 4 = 38 ms.
+
+  => a PERFECT declaration-level hexer has a floor of 38 + 36 = 74 ms,
+     plus (fraction of declarations changed) x 187 ms.
+
+
+3. The premise: how many top-level declarations actually change
+---------------------------------------------------------------
+
+Every artifact of the sem module split into the children of its root
+`(stmts ...)` -- the trailing embedded `(.index ...)` cut off at the byte
+offset the header's `.indexat` names -- keyed by SymbolDef, compared by
+content.  Three edit kinds, each measured from a warm tree:
+
+  (a) in-place  one string literal in `checkExhaustiveness` made one
+                character longer.  No line shift, no new declaration.
+  (b) append    `proc devloopBenchBodyN(): int = 1` appended at EOF.  THIS
+                IS `bench/devloop_bench.sh`'s `self.editbody`, i.e. the edit
+                the phase's gate is stated on.
+  (c) stmtadd   two statements inserted into an existing proc body at line
+                2418 of 5610.  The typical real edit.
+
+  artifact  decls |  (a) in-place |  (b) append  |  (c) stmtadd
+  ----------------+--------------+--------------+--------------
+  .s.nif    1228  |   1 changed  |  465 changed |  277 changed
+  .x.nif    1759  |   1 (+1 -1)  |  464 (+1)    |  346 changed
+  .c.nif     974  |   1 (+1 -1)  |  140 changed |  290 changed
+  .asm.nif   975  |   1 (+1 -1)  |  140 changed |  248 changed
+
+and the same comparison with NIF line-info tokens stripped before hashing:
+
+  artifact  decls |  (a) in-place |  (b) append  |  (c) stmtadd
+  ----------------+--------------+--------------+--------------
+  .s.nif    1228  |   1          |  465         |   49
+  .x.nif    1759  |   1          |  464         |   15
+  .c.nif     974  |   1          |  140         |   15
+  .asm.nif   975  |   1          |  140         |  248
+
+Two upstream causes, BOTH outside `src/hexer/**`:
+
+  * NIF LINE INFO.  Each top-level declaration anchors its own line info, so
+    an edit that shifts line numbers rewrites the `@...` token of every
+    declaration below it IN THE SAME FILE.  For (c) that is 277 of sem's
+    1228 declarations; blind to line info it is 49.  Hexer can only work
+    around this by rebasing the info tokens of every spliced fragment.
+
+  * `sembasics.makeLocalSym` (src/nimony/sembasics.nim:450-456) numbers every
+    LOCAL symbol from a module-wide per-name counter,
+    `SemContext.locals: Table[string, int]` (src/nimony/semdata.nim:174).
+    Insert or remove one local named `result` -- which every non-void proc
+    has -- and every later `result.N` in the module is renumbered:
+    `result.126` -> `result.127`, 465 of 1227 declarations for edit (b).
+    Same for every other name shared across procs (`i`, `s`, `it`, `tmp`).
+    Stripping line info does not help: these are genuine symbol renames that
+    travel into `.dce.nif`'s `uses` sets and across modules.  Only
+    `src/nimony/**` can fix it.
+
+The `.dce.nif` was BYTE-IDENTICAL across edit (b), so step (3) of the phase
+-- feeding the per-declaration diff into the `.dce.nif` analysis -- has
+nothing to save on this workload.  `analyzeModule` is 5.8 ms of 244 anyway.
+
+
+4. What that means for the gate
+-------------------------------
+
+Best case for the phase's OWN scenario (b), assuming a perfect,
+byte-identical declaration-level hexer AND a perfect arkham splice:
+
+  hexer   38 (I/O) + 36 (funcsummary + inliner) + 0.38 x 187   = 145 ms
+          plus re-parsing the previous 7.1 MB `.x.nif`         = ~+25 ms
+  arkham  ~45 (I/O) + 0.14 x 165                               =  ~68 ms
+  ----------------------------------------------------------------------
+  total                                                        ~238 ms
+
+against 501 ms today: a real 2.1x, and still ABOVE the <= 0.2 s gate.
+For the typical edit (c): ~120 ms hexer + ~90 ms arkham.
+For edit (a): ~80 + ~50 ms -- but (a) is not a realistic edit.
+
+
+5. arkham: does an unchanged proc's asm-NIF already match?
+-----------------------------------------------------------
+
+Cross-check per declaration: how many `.asm.nif` declarations changed whose
+`.c.nif` INPUT declaration is byte-identical?  That is pure positional drift
+inside arkham's own naming.
+
+  edit (a) in-place : .c   3 changed -> .asm   3 changed -> drift   0
+  edit (b) append   : .c 140 changed -> .asm 140 changed -> drift   0
+  edit (c) stmtadd  : .c 290 changed -> .asm 248 changed -> drift 135
+
+135 of 974 declarations get a different asm-NIF from an identical input.
+The causes, all module-scoped in arkham at nativenif f8d2676:
+
+  * `CodeGen.labelCount` (src/arkham/core/context.nim:146), consumed by
+    `freshLabel` (x64/emit.nim:320, risc/emit.nim:1057) -> `L<N>.0`.  Reset
+    per proc ONLY on AVR (avr/gen.nim:1358).
+  * `CodeGen.rodata` (core/context.nim:130): a string literal is named
+    `msg.<rodata.len>.<mod>` (x64/value.nim:815, risc/value.nim:1734), so the
+    pool index of every later literal shifts.
+  * temps named from the absolute token position in the INPUT module --
+    `aggtmp<pos>`, `nctmp<pos>`, `botmp<pos>`, `rettmp<pos>`,
+    `pairaddr<pos>`, `lvaltmp<pos>` -- shift when a preceding declaration
+    changes token count.
+
+So per-proc splicing of the previous `.asm.nif` is NOT byte-identical to a
+full arkham run today, and what it would produce -- two procs both emitting
+`L4856.0`, a stale `msg.7` pointing at a different string -- is a
+correctness bug, not a cosmetic one.  Making `labelCount` and the rodata
+index proc-scoped is the prerequisite, and it rewrites every `.asm.nif`
+golden in nativenif.  No arkham change was made: the measurement says the
+arkham half cannot be byte-identical without that prerequisite, and the
+hexer half it is gated on does not land.
+
+
+6. nifasm's fragment cache on the same edit
+--------------------------------------------
+
+`NIFASM_PROFILE=1` under `nimony n --profile`, after edit (a) -- which
+changes exactly ONE of sem's 975 `.asm.nif` declarations:
+
+  blobHits      3415
+  blobStale       18
+  blobRecorded   627
+  blobResolve  137.16 ms
+  blobRefs     143.32 ms
+  TOTAL        446.98 ms
+
+627 fragments re-recorded for a one-declaration change.  The blob cache's
+UNIT is the symbol but its VALIDITY check is per module (`sameSource` on the
+module's `.asm.nif` stamp, src/nifasm/blobcache.nim:449 and :752), so any
+change to sem's `.asm.nif` drops all ~627 of sem's live fragments.  Making
+arkham's output per-declaration stable therefore buys nothing in nifasm
+until that per-module check becomes per-symbol -- which is nifasm, B3c's
+file, not this phase's.
+
+
+7. Interleaved A/B, `self.editbody`, 5 rounds
+----------------------------------------------
+
+`bench/devloop_ab.sh /tmp/devloop_base <worktree> self.editbody 5`
+
+  23:59  up 17 days, 23:55, 2 users, load averages: 1.37 1.69 3.02
+  round 0  A  wall 2.471  cpu 3.707
+  round 0  B  wall 1.441  cpu 1.482
+  round 1  A  wall 2.477  cpu 3.722
+  round 1  B  wall 1.433  cpu 1.476
+  round 2  A  wall 2.599  cpu 3.861
+  round 2  B  wall 1.599  cpu 1.563
+  round 3  A  wall 2.635  cpu 3.866
+  round 3  B  wall 1.532  cpu 1.563
+  round 4  A  wall 2.658  cpu 3.907
+  round 4  B  wall 1.493  cpu 1.522
+  self.editbody: A wall median 2.599  min 2.471 | cpu median 3.861  min 3.707
+  self.editbody: B wall median 1.493  min 1.433 | cpu median 1.522  min 1.476
+  B/A cpu (median): 0.394   B/A cpu (min): 0.398
+   0:00  up 17 days, 23:56, 2 users, load averages: 1.84 1.77 3.00
+
+A = fork point (f69b8afc), B = this worktree.  B3b changes nothing on the
+compiled path, so this row re-confirms B3's number and is what the next
+attempt has to beat.
+
+
+8. Suite
+--------
+
+  hastur all                        843 / 844 tests successful in 554.04s
+                                    FAILED (1): tests/ledger  -- see below
+  hastur test tests/incremental     16+16+16 incremental phases, 2+2+2
+                                    ctfe-ocache, 4 inproc, 5+5 live, and
+                                    3 / 3 decl-stability, SUCCESS
+  hastur test tests/inproc/hexer    all checks passed
+  hastur boot (C, inside `all`)     stages 2 and 3 byte-identical
+  hastur boot --boot-backend:native stages 1, 2 and 3 byte-identical
+                                    (48.91 s, SUCCESS)
+
+decl-stability's own line, on the 13-declaration fixture:
+
+  decl-stability: .s.nif 13 decls | in-place changed 1 | insert changed 7
+    (blind 7, added 1) | stmtadd changed 8 (blind 2) | .x.nif in-place changed 1
+
+`insert 7 -> blind 7` is `makeLocalSym`'s rename; `stmtadd 8 -> blind 2` is
+line info.  Both reproduce sem's ratios on a fixture that costs 0.8 s.
+
+
+8b. Found while running the suite (not B3b's)
+---------------------------------------------
+
+`hastur test tests/ledger` fails on this machine with
+
+  [ledger] FAIL: nifmake must record a spawn cost for nimsem
+
+(`tests/ledger/setup.nim:378`).  Reproduced with `src/hastur/
+incrementaltests.nim` and `tests/incremental/setup.nim` checked out at the
+fork point `bad14fbf`, so it predates this branch.  The assertion wants at
+least one nimsem sample with `ewma.spawnNs > 0`, and since A2b the scheduler
+runs a single-node depth IN PROCESS -- so whether nimsem is ever spawned in
+that build is a scheduler decision, i.e. a function of the ledger's own cost
+estimates on the machine at hand.  The test asserts a spawn that the
+scheduler is free not to make.
+
+
+9. Verdict
+----------
+
+Neither half of B3b is implemented, and the measurement is the reason.
+
+  * The hexer half's premise -- "a body edit changes one top-level
+    declaration" -- is false on this codebase: 38 % of sem's declarations
+    change on the gate's own edit and 23 % on a typical two-line insertion,
+    for two reasons that both live upstream of `src/hexer/**` (section 3).
+  * Even with those fixed and a perfect implementation, section 4 puts
+    hexer + arkham at ~238 ms on edit (b) -- above the <= 0.2 s gate.  The
+    floor is set by 38 ms of unavoidable I/O on a 3.9 MB in / 7.1 MB out
+    module plus 36 ms of whole-module analysis (funcsummary's fixpoint and
+    the intra-module inliner) that no declaration-level diff can skip.
+  * The arkham half cannot be byte-identical before `labelCount` and the
+    rodata index are made proc-scoped (section 5), and would not reach
+    nifasm's cache before its per-module validity check becomes per-symbol
+    (section 6, B3c's file).
+
+Ordered prerequisites, cheapest first:
+
+  1. nimsem: `makeLocalSym` must number a local from its enclosing routine
+     rather than from `SemContext.locals`, the module-wide per-name counter.
+     Turns edit (b) from 465 changed declarations into ~1 and makes every
+     `.s.nif` diff readable.  Small and self-contained; `src/nimony/**`.
+  2. hexer: a line-info-blind declaration digest, plus an info REBASE for
+     every spliced fragment.  Turns edit (c) from 277 into 49.
+  3. hexer: per-declaration checkpoints for `EContext.tmpId`, `instId`,
+     `localDeclCounters`, `strLitCounter`, `Pass.nextTemp`,
+     `LiftingCtx.hookNames` and `InlinerCtx.counter`; per-declaration
+     fragments for `c.initBody`, `c.pending`, `c.strLits`, `c.newTypes` and
+     the lifted hooks; and an incremental `funcsummary` (its per-proc
+     `ProcAnalysis` is cacheable -- only `resolveSummaries` +
+     `annotateSummaries` must re-run).  This is the bulk of the work and
+     where byte-identity is won or lost.
+  4. arkham: proc-scoped `labelCount` and rodata index (rewrites every
+     nativenif `.asm.nif` golden), then per-proc splicing.
+  5. nifasm: per-symbol blob validity instead of per-module (B3c).
+
+`tests/incremental` gained `incrementalDeclStabilityTests`, which pins the
+declaration-stability numbers of section 3 on a small fixture so the premise
+is a tracked regression rather than folklore, and fails if the churn grows.
