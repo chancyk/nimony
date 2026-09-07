@@ -4,7 +4,8 @@ Branch `fast-devloop` off `master` f69b8afc. Goal: the edit-build-run loop of
 the compiler itself, on the native backend, without changing what the
 compiler produces. This file is the decision aid; `JIT.md` is the design,
 `JIT_IMPL.md` the phase log, `notes/<phase>.md` the details,
-`bench/results/*/progress.md` every number with its raw runs.
+`bench/results/*/progress.md` every number with its raw runs, `BENCHMARK.md`
+how to take them again.
 
 ## Numbers (native backend, interleaved A/B, fork point vs branch)
 

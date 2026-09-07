@@ -2,6 +2,7 @@
 
 Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 (the phases; the Status table at the end is the truth), this file,
+`BENCHMARK.md` (every command and trap for measuring), and
 `bench/results/2026-09-07/progress.md` (the numbers, latest run last).
 
 ## State
