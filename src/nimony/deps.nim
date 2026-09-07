@@ -298,6 +298,19 @@ type
                                   ## disk, so this build wrote the module's
                                   ## `.c.nif` from the cache instead of running
                                   ## `dceEmit` for it.
+    pairs: Table[string, FilePair]
+                                  ## memo for `toPair`. `moduleSuffix` is a pure
+                                  ## function of the path, `config.paths` and the
+                                  ## current directory -- all three fixed for the
+                                  ## life of a `DepContext` -- and the dep scan
+                                  ## asks for the same path once per module that
+                                  ## imports it: 1596 calls for 127 modules on a
+                                  ## no-change self-compilation, 21 ms of
+                                  ## `getCurrentDir` and `relativePath` per search
+                                  ## path. Keyed on the path alone for that
+                                  ## reason; a build that moved the working
+                                  ## directory mid-scan would already be writing
+                                  ## its artifacts under two different names.
 
 const
   BackendCommands* = {DoCompile, DoRun, DoRunMem}
@@ -305,13 +318,17 @@ const
     ## other two only below the per-module codegen node: it wants every
     ## module's `.asm.nif` and nothing after it.
 
-proc toPair(c: DepContext; f: string): FilePair =
+proc toPair(c: var DepContext; f: string): FilePair =
+  ## The module identity of a source path, memoized in `c.pairs`; see there.
+  result = c.pairs.getOrDefault(f)
+  if result.modname.len > 0: return
   if f.endsWith(".nif"):
     # For .p.nif files (e.g. from compile-time eval snippets), extract the
     # module suffix directly from the filename rather than recomputing it:
-    FilePair(nimFile: f, modname: extractModuleSuffix(f))
+    result = FilePair(nimFile: f, modname: extractModuleSuffix(f))
   else:
-    FilePair(nimFile: f, modname: moduleSuffix(f, c.config.paths))
+    result = FilePair(nimFile: f, modname: moduleSuffix(f, c.config.paths))
+  c.pairs[f] = result
 
 proc processDep(c: var DepContext; n: var Cursor; current: Node)
 proc traverseDeps(c: var DepContext; p: FilePair; current: Node)
@@ -1472,7 +1489,11 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
     # The ARTIFACTS are shared -- `.c.nif` and `.asm.nif` are at the same paths
     # -- so `nimony n` after a `nimony r` runs the link node and nothing else.
   result = c.config.nifcachePath / c.rootNode.files[0].modname & stem
-  var b = nifbuilder.open(result)
+  # `OnlyIfChanged`: a run that changes nothing re-emits this file byte for
+  # byte, and 260 KB of write plus an mtime bump per build is the whole cost
+  # of saying so. Keeping the old mtime is also the safe direction for anyone
+  # who ever compares against it: an unchanged graph looks older, never newer.
+  var b = nifbuilder.open(result, writeMode = OnlyIfChanged)
   defer: b.close()
 
   b.addHeader()
@@ -2192,7 +2213,8 @@ proc generatePluginSemInstructions(c: DepContext; v: Node; b: var Builder) =
 
 proc generateFrontendBuildFile(c: DepContext; commandLineArgs: string; cmd: Command): string =
   result = c.config.nifcachePath / c.rootNode.files[0].modname & ".build.nif"
-  var b = nifbuilder.open(result)
+  # See `generateFinalBuildFile` for why this is `OnlyIfChanged`.
+  var b = nifbuilder.open(result, writeMode = OnlyIfChanged)
   defer: b.close()
 
   b.addHeader()

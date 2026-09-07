@@ -117,6 +117,17 @@ type
     ## has to reach.
     registry*: PhaseRegistry
     costs*: Ledger
+    costsPath*: string    ## where `costs` comes from, and the reason it is a
+                          ## path rather than an already-open ledger: opening
+                          ## one folds every fragment under the nimcache --
+                          ## ~700 of them across 100 directories for a
+                          ## 127-module build, 9.6 ms -- and the only reader is
+                          ## `depthWantsInproc`, which a depth of one node
+                          ## never reaches and a build with nothing to rebuild
+                          ## never reaches at all. So it is opened on first
+                          ## question asked of it, and a no-change build asks
+                          ## none.
+    costsLoaded*: bool
     mode*: SpawnMode
     k*: int
     cores*: int
@@ -248,6 +259,13 @@ proc depthWantsInproc(s: PhaseSchedule; req: RunNodeRequest): bool =
   let fanout = (if largest > spread: largest else: spread) + spawn * s.k
   result = serial <= fanout
 
+proc loadCosts(s: var PhaseSchedule) =
+  ## The ledger, on the first question that needs it. See `costsPath`.
+  if s.costsLoaded: return
+  s.costsLoaded = true
+  if s.costsPath.len > 0:
+    s.costs = openLedger(s.costsPath)
+
 proc wantsInproc*(s: var PhaseSchedule; req: RunNodeRequest): bool =
   ## JIT.md 6.2, decided per depth (`depthWantsInproc`) and remembered for
   ## the depth's remaining nodes. Split out from the relay so it can be
@@ -262,6 +280,7 @@ proc wantsInproc*(s: var PhaseSchedule; req: RunNodeRequest): bool =
   if req.depthPeers.len <= 1: return true   # the sequential path, or a depth of one
   if req.depthSeq != s.decidedDepth or s.decidedDepth == 0:
     s.decidedDepth = req.depthSeq
+    loadCosts s
     s.depthInproc = depthWantsInproc(s, req)
   result = s.depthInproc
 
@@ -353,7 +372,7 @@ proc installPhaseRelay*(mode: SpawnMode; nimcache: string; k = DefaultInprocK) =
     return
   gSchedule = PhaseSchedule(
     registry: PhaseRegistry(entries: @[]),
-    costs: openLedger(nimcache / "ledger.nif"),
+    costsPath: nimcache / "ledger.nif", costsLoaded: false,
     mode: mode, k: k, cores: countProcessors(),
     inproc: 0, spawned: 0, active: true)
   if gSchedule.cores < 1: gSchedule.cores = 1
