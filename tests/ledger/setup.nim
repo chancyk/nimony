@@ -364,9 +364,13 @@ else:
             phase & " must be stamped with a toolhash"
       expect found, "the build must leave a " & phase & " sample behind"
 
-    # Every command nifmake ran cost a process, and it measured what that was
-    # worth (A1d). `cc` is in the list because it is the case with no fragment
-    # of its own: the whole wall time is its spawn cost.
+    # Every command nifmake ran as a process cost one, and it measured what
+    # that was worth (A1d). Since A2b the registered phases (nimsem, hexer,
+    # lengc) may run in-process at a single-node depth and then legitimately
+    # carry no spawn cost, so the spawn expectation is on the two that always
+    # reach a process: `nifler` (not registered) and `cc` (the case with no
+    # fragment of its own: the whole wall time is its spawn cost). Every phase
+    # still has to leave a sample behind.
     for phase in ["nifler", "nimsem", "hexer", "lengc", "cc"]:
       var found = false
       var spawned = false
@@ -375,7 +379,8 @@ else:
           found = true
           if l.entries[i].ewma.spawnNs > 0: spawned = true
       expect found, "the build must leave a " & phase & " sample behind"
-      expect spawned, "nifmake must record a spawn cost for " & phase
+      if phase in ["nifler", "cc"]:
+        expect spawned, "nifmake must record a spawn cost for " & phase
 
     # The frontend phases write into the nimcache itself.
     for phase in ["nifler", "nimsem", "hexer"]:
