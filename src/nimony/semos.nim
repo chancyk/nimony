@@ -90,7 +90,10 @@ type
     ##   so taking and putting back is a handful of pointer moves, not a copy.
     ## * `nifcore.TokenBuf` captures the `Pool`/`TagPool` it was built with, so
     ##   the caller's buffers keep decoding against the moved-aside pool
-    ##   throughout and are correct again the instant it is put back.
+    ##   throughout and are correct again the instant it is put back. Since
+    ##   nim-lang/nimony#2482 that capture is the ONLY way a buffer reaches a
+    ##   pool — `nifcore` has no fallback globals outside `-d:nimonyPlugin` —
+    ##   so the two fields below are the complete pool state to move.
     ## * moving `prog` moves the table headers, not the heap its entries live
     ##   on, so a `ptr ToplevelEntry` from `programs.getEntry` survives; the
     ##   nested build allocates its own.
@@ -112,10 +115,15 @@ proc takeFrontendState(): FrontendSnapshot =
   resetStyleTables()
 
 proc restoreFrontendState(s: var FrontendSnapshot) =
+  ## Restoring `pool` and `globalTags` is the whole of it: a `TokenBuf` binds
+  ## its pools at construction, so the caller's buffers never stopped pointing
+  ## at the pool world being put back here. Before nim-lang/nimony#2482 this
+  ## also re-pointed `nifcore.fallbackPool`/`fallbackTags`, the second,
+  ## implicit route to that world for a buffer that carried no pools of its
+  ## own; those globals now exist only under `-d:nimonyPlugin`, so there is
+  ## exactly one route left and it needs no restoring.
   pool = s.pool
   globalTags = s.tags
-  nifcore.fallbackPool = s.pool
-  nifcore.fallbackTags = s.tags
   programs.prog = move(s.prog)
   resetStyleTables()
 

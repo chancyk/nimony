@@ -74,17 +74,29 @@ const NoLineInfo* = NoNifLineInfo
 # separate `TagPool`, and int/float have no pool, so `pool.tags` / `.files` /
 # `.integers` / `.man` are accessors (below, after the proxy types).
 var pool*: Pool = newPool()
-nifcore.fallbackPool = pool
-nifcore.fallbackTags = globalTags
 
 proc resetPools*() =
   ## Put the process back into the state it had at module init: a fresh `pool`
   ## (empty `strings`/`syms`/`filenames`) and a fresh `globalTags` re-seeded in
-  ## `TagEnum` order, with `nifcore.fallbackPool`/`fallbackTags` re-pointed at
-  ## them. The frontend is architected around one global pool per compiled
-  ## module (`JIT.md` 3.1); a process that runs two phases back to back calls
-  ## this between them so the second module's interned ids start at 1 again and
-  ## its output cannot depend on what the first module happened to intern.
+  ## `TagEnum` order. The frontend is architected around one global pool per
+  ## compiled module (`JIT.md` 3.1); a process that runs two phases back to
+  ## back calls this between them so the second module's interned ids start at
+  ## 1 again and its output cannot depend on what the first module happened to
+  ## intern.
+  ##
+  ## These two assignments are the whole reset. Until nim-lang/nimony#2482
+  ## ("no globals in nifcore") this proc also re-pointed
+  ## `nifcore.fallbackPool`/`fallbackTags` at the new pools, because a buffer
+  ## built with none of its own read the interned payload of its tokens
+  ## through them. Those two globals now exist only under `-d:nimonyPlugin`
+  ## (a plugin is a separately spawned executable and installs its own from
+  ## `lib/plugins.nim`); in the compiler every buffer is bound to `pool` and
+  ## `globalTags` at CONSTRUCTION, by `createTokenBuf` / `initTokenBuf` below,
+  ## which read these two variables at the moment they are called. So a buffer
+  ## minted after this proc runs is bound to the fresh pools with nothing
+  ## further to re-point, and one minted before it stays bound to the old
+  ## ones — which is the same guarantee, arrived at eagerly instead of through
+  ## an indirection.
   ##
   ## `Pool`/`TagPool` are refs and every `TokenBuf` holds the one it was
   ## created with, so buffers made BEFORE the reset keep decoding against the
@@ -95,8 +107,6 @@ proc resetPools*() =
   ## two in this repo, and `semmain.resetFrontendGlobals` calls all three.
   pool = newPool()
   globalTags = createMasterTagPool()
-  nifcore.fallbackPool = pool
-  nifcore.fallbackTags = globalTags
 
 # ── Type aliases ─────────────────────────────────────────────────────────
 
@@ -106,6 +116,13 @@ proc createTokenBuf*(cap = 16): TokenBuf =
   ## Every shim buffer shares the one global literals + tag namespace, so ids
   ## are comparable across buffers (the nifstreams global-`pool` invariant).
   nifcore.createTokenBuf(cap, sharedPool = pool, sharedTags = globalTags)
+
+proc initTokenBuf*(): TokenBuf {.inline.} =
+  ## `createTokenBuf` without the eager storage allocation: the buffer is bound
+  ## to the global pools, the first `add` allocates. Use it wherever a buffer
+  ## used to be left as `default(TokenBuf)` — an object field, a `seq` slot —
+  ## and would otherwise reach the builders with no tag pool at all.
+  nifcore.initTokenBuf(pool, globalTags)
 
 proc registerTag*(tag: string): TagId = registerTag(globalTags, tag)
 

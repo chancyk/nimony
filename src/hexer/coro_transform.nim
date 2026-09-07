@@ -2333,7 +2333,8 @@ proc transformCoroutineDecl*(c: var Context; dest: var TokenBuf; n: var Cursor) 
   let kind =
     if n.stmtKind == IteratorS: IteratorY
     else: NoSym
-  var currentProc = ProcContext(kind: IsNormal)
+  var currentProc = ProcContext(kind: IsNormal, cf: initTokenBuf(),
+                                resultSlotType: initTokenBuf())
   swap(c.currentProc, currentProc)
   # Take delivery of the capture slot our consumer announced for exactly
   # this decl and clear the inbox — a following non-capturing coroutine

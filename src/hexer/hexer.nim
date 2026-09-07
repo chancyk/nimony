@@ -115,8 +115,7 @@ proc resetHexerGlobals*() =
   ##   A2a-hexer may not edit that file; A2a-front's `resetFrontendGlobals`
   ##   owns the same variable and this call becomes a call to it once it
   ##   exists.
-  ## - `nifpools.pool` and, in lockstep, `nifcore.fallbackPool`
-  ##   (`src/lib/nifpools.nim:76`, `src/lib/nifcore.nim:445`). Interning the
+  ## - `nifpools.pool` (`src/lib/nifpools.nim:76`). Interning the
   ##   same name twice gives the same `SymId`, so the pool looks harmless to
   ##   share -- but the id a name gets depends on how many names were interned
   ##   BEFORE it, and `.dce.nif` and `.live.nif` serialize `HashSet[SymId]` /
@@ -151,12 +150,16 @@ proc resetHexerGlobals*() =
   ##   share one file -- and closing and reopening it per run would cost a
   ##   syscall pair and buy nothing. A caller that wants a different log per
   ##   run has to use a different process.
-  ## - `nifpools.globalTags` / `nifcore.fallbackTags`: the tag pool is seeded
+  ## - `nifpools.globalTags`: the tag pool is seeded
   ##   from the master `TagEnum` so a tag's id is its ordinal, the handful of
   ##   tags hexer registers by name on top (`imp`, `uses`, `roots`, `offers`,
   ##   `live`, `resolved`, `mod`) always get the same ids in the same order,
   ##   and no `TagId` is ever hashed into a serialized set. Nothing to fix, and
-  ##   `createMasterTagPool` is private to `nifpools` anyway.
+  ##   `createMasterTagPool` is private to `nifpools` anyway. (Both bullets
+  ##   used to name `nifcore.fallbackPool`/`fallbackTags` alongside them.
+  ##   nim-lang/nimony#2482 removed those from every build but the plugin one:
+  ##   a buffer now binds `pool`/`globalTags` at construction, so resetting
+  ##   these two variables is the complete change of pool world.)
   ## - `artifactstore.store` and the seven `vfs` relays: the store is the
   ##   CALLER's policy (`--vfs`), installed once per process. Tearing it down
   ##   between two in-process phases would drop the caller's cache; A2b calls

@@ -2899,6 +2899,7 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
     typeCache: ensureMove typeCache,
     pending: createTokenBuf(),
     strLitBuf: createTokenBuf(),
+    initBody: initTokenBuf(),
     bits: bits,
     bigEndian: bigEndian,
     nativeBackend: native,

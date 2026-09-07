@@ -45,7 +45,7 @@ type
 
 proc buildIndexExports(c: var SemContext): TokenBuf =
   if c.exports.len == 0:
-    return default(TokenBuf)
+    return initTokenBuf()
   result = createTokenBuf(32)
   for m, ex in c.exports:
     let path = toAbsolutePath(c.importedModules.getOrQuit(m).path)
@@ -610,7 +610,12 @@ proc initSemContext(suffix: string; config: ProgramContext; moduleFlags: set[Mod
     routine: SemRoutine(kind: NoSym),
     commandLineArgs: commandLineArgs,
     canSelfExec: canSelfExec,
+    pendingSumtypes: initTokenBuf(),
+    toBuild: initTokenBuf(),
+    toBundle: initTokenBuf(),
     pending: createTokenBuf(),
+    importSnippets: initTokenBuf(),
+    expanded: initTokenBuf(),
     executeExpr: exprexec.executeExpr,
     semStmtCallback: semStmtCallback,
     semGetSize: semGetSize,
@@ -696,7 +701,7 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
 
   var modules = newSeqOfCap[ModuleState](infiles.len)
   for i in 0..<infiles.len:
-    var ms = ModuleState(outfile: outfiles[i])
+    var ms = ModuleState(outfile: outfiles[i], buf1: initTokenBuf())
     ms.owningBuf = createTokenBuf(300)
     if i == 0:
       ms.n0 = setupProgram(infiles[i], outfiles[i], ms.owningBuf)
@@ -766,11 +771,13 @@ proc resetFrontendGlobals*() =
   ##
   ## Every process-global `var` the frontend owns is reset here:
   ##
-  ## * `nifpools.pool` and `nifpools.globalTags`, plus the
-  ##   `nifcore.fallbackPool`/`fallbackTags` pointers into them
-  ##   (`nifpools.resetPools`). Interned ids are what end up in the `.s.nif`,
-  ##   so this is what keeps a module's output independent of what was
-  ##   compiled before it.
+  ## * `nifpools.pool` and `nifpools.globalTags` (`nifpools.resetPools`).
+  ##   Interned ids are what end up in the `.s.nif`, so this is what keeps a
+  ##   module's output independent of what was compiled before it. Those two
+  ##   are now the WHOLE pool state: nim-lang/nimony#2482 took
+  ##   `nifcore.fallbackPool`/`fallbackTags` out of every build but the plugin
+  ##   one, so a buffer is bound to these variables when it is constructed and
+  ##   there is no second, process-wide pointer left to re-aim.
   ## * `programs.prog` — the module cache, the main module and every published
   ##   toplevel entry (`programs.resetProgram`). Its keys are ids of the pool
   ##   above, so it must go with it.
@@ -833,7 +840,12 @@ proc semcheckToBuf*(input: var TokenBuf; infile, outfile: string; config: sink N
     timer.noteSerialize()
   else:
     timer.noteProduce()
-    result = SemOutputs(ok: false)
+    # `code`/`deps` are bound to the global pools even though sem failed and
+    # nothing will be written through them: since nim-lang/nimony#2482 a
+    # `default(TokenBuf)` is not a usable buffer — the interning builders
+    # assert on it instead of inventing a pool — so no `SemOutputs` leaves
+    # this module in that shape.
+    result = SemOutputs(ok: false, code: initTokenBuf(), deps: initTokenBuf())
 
 proc semcheckToFiles*(infiles, outfiles: seq[string]; config: sink NifConfig;
                       moduleFlags: set[ModuleFlag]; commandLineArgs: sink string;

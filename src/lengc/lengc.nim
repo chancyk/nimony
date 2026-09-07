@@ -96,9 +96,11 @@ proc resetLengcGlobals*() =
   ##
   ## What lengc does depend on, and does NOT reset:
   ##
-  ## - `nifpools.pool`, `nifpools.globalTags`, `nifcore.fallbackPool` /
-  ##   `fallbackTags` — A2a-front's `resetFrontendGlobals()`. A process that
-  ##   runs the front end and lengc calls both.
+  ## - `nifpools.pool` and `nifpools.globalTags` — A2a-front's
+  ##   `resetFrontendGlobals()`. A process that runs the front end and lengc
+  ##   calls both. (This bullet named `nifcore.fallbackPool`/`fallbackTags`
+  ##   too until nim-lang/nimony#2482 removed them from every build but the
+  ##   plugin one.)
   ## - `artifactstore.store` and the `vfs` relays — process-wide policy and the
   ##   cross-phase cache the in-process scheduler exists to exploit. Their
   ##   teardown is `uninstallArtifactStore()`, at the end of the process, not

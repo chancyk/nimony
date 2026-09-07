@@ -17,7 +17,7 @@ this file supersedes as it is filled in).
 | 1 | `4aa797d5` | sem: `import` is not a shadowing boundary (#2479) | `merge/u1` | merged |
 | 2 | `c6db98b6` | sem: sum type constructor over a `ref object` produces the `ref` (#2481) | `merge/u2` | merged |
 | 3 | `b7c7daa6` | newest nativenif (#2478) — pin `d0781a48` -> `e201a816` | `merge/u3` | merged, pin taken is **`3ec73fef`**, not upstream's `e201a816` (see §3) |
-| 4 | `c6be04e1` | no globals in nifcore (#2482) | `merge/u4` | pending |
+| 4 | `c6be04e1` | no globals in nifcore (#2482) | `merge/u4` | merged; A2a's two `nifcore.fallback*` re-points are now **redundant and deleted** (see §4) |
 | 5 | `38f67463` | std/http: thread the tag space instead of keeping one per process (#2484) | `merge/u5` | pending |
 | 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending; `f9af5b24` does not exist in `nim-lang/nativenif` (it is `2c30a9ef` rebased away), so step 6 pins **`83ced299`** (`jit/upstream-master`) |
 
@@ -504,6 +504,247 @@ settles the caveat in §1: that run's inflated absolutes (A cpu 5.18, B 1.23)
 were machine load, exactly as recorded there, and the headline **0.92 s wall /
 0.94 s cpu stands and needs no re-taking**.
 
+
+## 4. `c6be04e1` — no globals in nifcore
+
+**What upstream changed.** `nifcore` stops having mutable module-level state.
+Its two globals, `fallbackPool`/`fallbackTags` — the pool world a `TokenBuf`
+built with no pools of its own fell back to — now exist only under
+`-d:nimonyPlugin`, the define `semos.pluginCompileCmd` puts on a plugin
+sub-compile and on nothing else; `src/nimony/lib/plugins.nim` installs them
+there, from its own `pluginPool`/`pluginTags`, and a plugin is a separately
+spawned executable. In every other build a buffer's pools are **threaded in at
+construction**: `ensurePools` (which invented a private pool for a buffer that
+had none) becomes `requirePools` (which asserts), `default(TokenBuf)` stops
+being a usable buffer and the new `initTokenBuf` — bound to the pools, no
+storage — replaces it at ~40 construction sites, and `readonlyCursorAt` mints
+a `CursorOwner` on demand so a cursor is never ownerless. Note what it does
+NOT touch: `nifpools.pool` and `nifpools.globalTags` keep their declarations
+and their process lifetimes byte for byte. The title is "no globals in
+**nifcore**", not "no globals".
+
+**How it collided with us.** Two textual conflicts, both in hexer, both F2
+(`705addc8`, `passes.TempNamer`) sitting on the same object-constructor line
+upstream was inserting a pool-bound field into:
+
+| file | upstream | fast-devloop | our phase |
+|---|---|---|---|
+| `src/hexer/duplifier.nim` | `MoverContext(bits:)` → `MoverContext(cf: initTokenBuf(), bits:)` in `injectDups` | `swap(c.namer, pass.namer)` on the line immediately after that constructor | F2 |
+| `src/hexer/lambdalifting.nim` | `Context(counter: 0, …)` → `Context(counter: 0, dest: initTokenBuf(), …)` in `elimLambdas` | F2 **deleted** `Context.counter`, so our version of that literal has no `counter` field | F2 |
+
+The other 16 shared files auto-merged, in the pattern of steps 1-3: upstream's
+edits are mechanical (`default(TokenBuf)` → `initTokenBuf()`, `Target(m: …)` →
+a new `initTarget(m)`) and ours are elsewhere in the same files — F1's
+`c.localNs`, F1 follow-ups' `asNimSym` diagnostics and per-declaration `err`/
+`cf` counters, F2's `TempNamer`, A2a-front's `SemOutputs`/`resetFrontendGlobals`,
+A2a-hexer's `ExpandInput`/`ExpandResult`, A2c's `baseDir`, A1b's VFS relays.
+The closest near-miss is `sem.semExprSym`'s `NoSym` arm, where upstream's
+`readonlyCursorAt` → `cursorAt` sits one line above our `asNimSym(s.name)`;
+checked by hand after the merge, both are present.
+
+**And one collision that is not in the 22 files at all.** `resetPools`
+(`nifpools.nim`, A2a-front `8b593d26`) and `restoreFrontendState`
+(`semos.nim`, A2c `eb896a80`) both assign `nifcore.fallbackPool`/`fallbackTags`.
+`semos.nim` is not in upstream's commit and would never appear in a
+file-by-file review of it, yet after the merge both procs name symbols that do
+not exist in the build they are compiled into. That is a hard compile error,
+which is the good case: the branch could not have shipped this silently.
+
+**What we did.**
+
+* `duplifier.nim` — upstream's `MoverContext(cf: initTokenBuf(), bits: pass.bits)`
+  won the constructor; our `swap(c.namer, pass.namer)` was re-applied after it.
+  The two edits are independent (`MoverContext.cf` vs `Context.namer`).
+* `lambdalifting.nim` — upstream's `dest: initTokenBuf()` won; upstream's
+  `counter: 0` was dropped, because the field it names no longer exists on our
+  side. Nothing of ours was given up: F2 replaced that counter with `namer`.
+* `nifpools.resetPools` — the two `nifcore.fallback* =` lines **deleted**, with
+  the doc comment rewritten to say why the remaining two assignments are the
+  whole reset (below).
+* `semos.restoreFrontendState` — the same two lines deleted; `FrontendSnapshot`'s
+  doc comment now states that the buffer's own captured `Pool`/`TagPool` is the
+  ONLY route to a pool world, so its three fields are the complete state to move.
+* `semmain.resetFrontendGlobals`, `hexer.resetHexerGlobals`,
+  `lengc.resetLengcGlobals` — doc-comment inventories corrected; they each
+  listed the two fallbacks as part of the state they reset.
+* `semmain`'s `SemOutputs(ok: false)` — its two `TokenBuf` fields are now
+  `initTokenBuf()`. Nothing writes through them (callers check `ok`), but it is
+  exactly the shape upstream just outlawed and no `SemOutputs` should leave
+  that module in it.
+
+Then the check of steps 1-3, `diff -u <(git show c6be04e1:<path>) <path>` for
+all 22 files. `nifcore.nim`, `lifter.nim`, `indexgen.nim` and
+`semvalidator.nim` come back **empty** — we do not touch them and upstream's
+version stands whole. The other 18 differ by exactly our hunks and nothing
+else, each traceable to a named phase: F1 `73f605d3` (`c.localNs` in `sem`,
+`semdecls`, `plugins`), F1 follow-ups `45180a3d` (`asNimSym` in `sem`,
+`semcall`, `sigmatch`, `contracts`, `contracts_fir`, `renderer`) and `8328879a`
+(`freshCfSym`/`freshErrSym` in `controlflow`, `derefs`), F2 `705addc8`
+(`TempNamer` in `xelim`, `coro_transform`, `duplifier`, `lambdalifting`,
+`lengcgen`), A2a-front `8b593d26`/`1fa5f4e9` (`nifpools`, `programs`,
+`semmain`), A2a-hexer `30a363df`/`4370cb8f` and B3 `117c9cd6`/`a9d0b7e4`
+(`lengcgen`), A2c `eb896a80` (`semdecls`), A1b `f2e7189b` (`programs`).
+
+**Was anything of ours made redundant?** **Yes — this is the entry's real
+content, and `notes/handoff.md`'s hypothesis is now settled.** It guessed that
+this commit "may make parts of `resetPools`/`resetFrontendGlobals` redundant".
+It does, and precisely: **two of `resetPools`'s four assignments, and two of
+`restoreFrontendState`'s five.** Nothing else. Per moved global:
+
+| global | did our reset depend on it? | does the state's new owner span two in-process runs? | verdict |
+|---|---|---|---|
+| `nifcore.fallbackPool` | yes, at `nifpools.nim:98` (`resetPools`) and `semos.nim:117` (`restoreFrontendState`) | **no.** The state did not move to a new owner — in the compiler build it was compiled out. Under `-d:nimonyPlugin` its owner is `plugins.pluginPool`, a `let` in an executable `semos.execPlugin` **spawns**; no nimony process ever holds it | **redundant**, and deleted here — not as a tidy-up but because it no longer compiles |
+| `nifcore.fallbackTags` | same two sites | same | same |
+| `nifpools.pool` | yes | yes, still a process-lifetime `var` | **untouched by upstream; still required** |
+| `nifpools.globalTags` | yes | yes | **untouched by upstream; still required** |
+| `programs.prog` | yes (`resetProgram`) | yes | **still required**; upstream's only edit here is `ToplevelEntries.del`'s `default(TokenBuf)` |
+
+Why that is "redundant" and not "silently insufficient", which is the answer
+this step existed to produce. For a second in-process run to inherit something,
+state would have to have moved from a global we reset into an object with a
+longer life that nothing resets. **No such object exists here**: upstream
+deleted the fallback rather than relocating it, and replaced the indirection
+with eager binding. `createTokenBuf`/`initTokenBuf` read `nifpools.pool` and
+`globalTags` *at the moment they are called*, so a buffer minted after
+`resetPools` is bound to the fresh pools with nothing left to re-point, and one
+minted before it stays bound to the old ones — the same guarantee the fallback
+gave, arrived at eagerly. The three ways it could still have bitten, and why
+none does:
+
+1. *A buffer that outlives a run and now holds a stale pool.* The only buffers
+   that survive a reset in this repo hang off `programs.prog`
+   (`ToplevelEntry.buffer`), and `resetProgram` discards `prog` in the same
+   breath — the two procs are called as a pair at all four call sites and each
+   one's doc comment forbids calling one without the other. `notes/a2a-front.md`
+   §3's sweep of every process-global `var` is still the complete list and
+   still holds.
+2. *A buffer minted with no pool at all.* It used to pick up the fallback
+   silently; it now trips `requirePools`'s assert at the first interning add.
+   That is loud, in every build hastur produces (`nim c -d:release` keeps
+   `assert`; nothing here uses `-d:danger`), and it is the opposite of a silent
+   inheritance. Our own construction sites were audited against it —
+   `ExpandInput(buf: createTokenBuf(0))`, `ExpandResult(x: createTokenBuf(0))`,
+   the buffer-level `expand`'s `EContext` (which took upstream's added
+   `initBody: initTokenBuf()`), and `SemOutputs`, fixed above. The nine files
+   the branch adds outright (`hexerio`, `phases`, `engine`, `dag`,
+   `artifactstore`, `ledger`, `decldigest`, `toolhash`, `ctfediff`) contain no
+   `TokenBuf` object field at all.
+3. *A2c's snapshot.* `restoreFrontendState` put the fallbacks back so that
+   nil-pool buffers would decode against the parent's pool again. With eager
+   binding the parent's buffers hold the parent's `Pool` ref directly —
+   `FrontendSnapshot`'s own doc comment already said so — so restoring `pool`,
+   `globalTags` and `prog` is the whole restore. The snapshot gets *stronger*:
+   there is no longer a second, implicit pointer into the pool world that an
+   early return could leave dangling.
+
+Follow-up, named: **none is outstanding.** The redundancy was not deferred, it
+was deleted in this commit, because leaving it was not an option the compiler
+would accept. What is left behind is documentation: five doc comments across
+`nifpools`, `semos`, `semmain`, `hexer` and `lengc` that described the
+pool-plus-fallback model were rewritten here rather than left to rot.
+
+**Was anything of ours broken?** No. Nothing had to be restored by other means:
+`tests/inproc` — the test that *is* the correctness premise for A2a/A2c —
+reports every artifact of every tool byte-identical between N in-process runs
+and N processes, and `decl-stability` reports the same four phases and the same
+digest counts as `merge/u1`, `u2` and `u3`.
+
+**Evidence.** Worktree `/tmp/merge-u4`, branch `merge/u4`, with
+`XDG_CACHE_HOME=/tmp/cache-u4` and
+`NIMONY_NATIVENIF=/Users/chanc/Projects/nativenif`.
+`/Users/chanc/Projects/nativenif` left where step 3 put it — `3ec73fef` on
+`jit/upstream-e201a816` — and `src/nativenif.commit` is not in this commit and
+did not move (still `3ec73fef… 2026-09-07`). `build all` printed **no `[deps]`
+line**, which per §3 is the evidence that the pin was honoured rather than
+built over.
+
+```
+$ nim c -r src/hastur/hastur build all
+… out: /private/tmp/merge-u4/bin/nifasm [SuccessX]     → exit 0, no [deps], 0 errors
+
+$ bin/hastur tests/inproc                        ← this commit's gate
+  ok: nifler: 4 output files byte-identical to two processes
+  ok: nimsem: 6 output files byte-identical to two processes
+[inproc/hexer] ok: hexer c: zzafpditq1.x.nif (2406 bytes)      … 9 checks
+[inproc/hexer] all checks passed
+[inproc/lengc] all in-process lengc tests passed
+3 / 3 tests successful in 24.09s.
+SUCCESS.
+
+$ bin/hastur test tests/incremental
+incremental: 16 / 16 phases successful in 8.47s.
+incremental (--vfs:memory+spill): 16 / 16 phases successful in 6.78s.
+incremental (--spawn:always): 16 / 16 phases successful in 7.31s.
+inproc: 4 / 4 phases successful in 2.34s.
+membudget: 5 / 5 phases successful in 2.96s.
+incremental-live (--spawn:always): 5 / 5 phases successful in 1.52s.
+decl-stability: .s.nif 32 decls | in-place changed 1 | insert changed 11 (blind 1, added 2) | stmtadd changed 12 (blind 1) | decls digest 52 syms, sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/1 | .x.nif in-place changed 1
+decl-stability: 4 / 4 phases successful in 0.91s.
+SUCCESS.
+
+$ bin/hastur test tests/ctfe_diff
+ctfediff: 19 file(s), 50 artifact(s), 79 .s.nif, 0 difference(s)
+ctfe_diff: all checks passed
+
+$ bin/hastur test tests/nifcache
+  ok: both modes left the same 343 .nif artifacts, byte for byte
+  ok: both modes left the same 106 .nif artifacts, byte for byte
+nifcache: all checks passed
+
+$ bin/hastur test tests/nimony_r
+  ok   a cached link and a scratch link produce byte-identical executables
+  ok   the compiler itself runs from memory (--version -> 0.6.0)
+nimony_r: all checks passed
+
+$ bin/hastur test tests/ctfe_engine
+  4 sub-program(s), 5 sub-build(s) in-process (the `std/writenif` precompile included), 0 spawned
+  28 non-main `.c.nif` file(s) byte-identical to `NIMONY_CCACHE=off`
+ctfe_engine: all checks passed
+
+$ bin/hastur test tests/ledger
+[ledger] all ledger tests passed
+
+$ bin/hastur tests/nimony
+795 / 795 tests successful in 143.12s.
+SUCCESS.
+
+$ bin/hastur boot --boot-backend:native
+[boot] stages 0 and 1 differ.
+[boot] stages 1 and 2 are byte-identical.
+[boot] stages 2 and 3 are byte-identical.
+[boot] total 46.72s.
+SUCCESS.
+```
+
+**795 → 795 is the correct count.** `git show c6be04e1 --stat` lists 22 files,
+none of them under `tests/`: this commit adds, removes and changes no test.
+Nothing was skipped.
+
+**Numbers.** Taken, because the commit changes how every `TokenBuf` in the
+compiler is constructed and makes `readonlyCursorAt` allocate a `CursorOwner`
+header where it used to return an ownerless cursor — 90 call sites outside
+`nifcore` — so the pools' representation could plausibly have moved the loop.
+
+```
+$ bench/devloop_ab.sh /tmp/devloop_base . self.editbody 5
+self.editbody: A wall median 2.601  min 2.595 | cpu median 3.816  min 3.801 | peak rss 117 MB
+self.editbody: B wall median 0.971  min 0.966 | cpu median 0.992  min 0.988 | peak rss 107 MB
+B/A cpu (median): 0.260   B/A cpu (min): 0.260   B/A peak rss: 0.91
+
+$ bench/devloop_ab.sh /tmp/devloop_base . self.editbody 5     # repeat, load avg 5.02
+self.editbody: A wall median 2.604 | cpu median 3.814 | peak rss 117 MB
+self.editbody: B wall median 0.974 | cpu median 0.995 | peak rss 107 MB
+B/A cpu (median): 0.261   B/A cpu (min): 0.259   B/A peak rss: 0.91
+```
+
+cpu-sum first, per `BENCHMARK.md` §0: **B/A cpu 0.260 and 0.261**, against
+step 3's 0.261 on a quiet machine — the ratio is unchanged and reproduces
+across two runs. Both absolute sides are ~8 % above their logged values (A cpu
+3.81 vs 3.53, B cpu 0.99 vs 0.92) by nearly the same factor, which is the
+signature of machine load and not of a one-sided regression; `uptime` reported
+a load average of 5.02 during the second run, with another agent's worktree
+building. The headline 0.92 s cpu stands as step 3 re-took it; the loop did
+not move.
 
 ## nativenif track
 
