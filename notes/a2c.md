@@ -186,6 +186,13 @@ nimcache:
 
 | | per evaluation |
 |---|---|
+| before | 42.6 ms |
+| after | 26.8 ms |
+
+taken step by step while the phase was built, on a busier machine:
+
+| | per evaluation |
+|---|---|
 | before | 42.8 ms |
 | the `nimony s` process removed | 36.0 ms |
 | the stdlib closure's `.c.nif` shared | 30.4 ms |
@@ -276,10 +283,30 @@ six names — which is exactly what the first cut did.
 * **`--vfs` default.** Measured, no gain: 36.0 ms (disk) vs 35.9 ms
   (memory+spill) per new evaluation. Stays `disk`; nothing was added to the
   ephemeral list.
-* **`dceLive`, 9.2 ms**, is now the largest single phase of an evaluation and
+* **`dceLive`, 8.5 ms**, is now the largest single phase of an evaluation and
   cannot be content-addressed: its output depends on the main module's roots
   by construction. See a2c.txt §5 for the two ways out, both outside this
   phase's files.
+
+## 9. The one regression, and what found it
+
+The first cut of the graph split left the hexer and `dceLive` nodes in BOTH
+the `fpLive` and the `fpAnalysis` graph. hexer writes `.x.nif` OnlyIfChanged,
+so a node whose output kept its old mtime is stale forever under nifmake's
+mtime rule, and it ran twice per sub-program. The fresh-evaluation measurement
+could not see it — there hexer is up to date and a doubled node costs nothing.
+A FORCED rebuild is the one scenario where hexer is genuinely stale, and there
+it cost +48 ms per evaluation, a 31 % `ctfe.forced` regression.
+
+`bench/devloop_ab.sh /tmp/a2c_before . ctfe.forced 5` is what found it, and
+the same script is why it was not mistaken for drift: the block runs of the
+same afternoon reported `hello.forced` at +12.6 % cpu, which the interleaved
+run then measured at -4.3 %. Two block runs of a 12-scenario table are minutes
+apart, and the drift between them is the same size as a 5 % signal.
+
+Emitting hexer and `dceLive` for `fpLive` only — `fpAnalysis` is now the
+`dceEmit`-only graph — brings `ctfe.forced` to 0.974x of the toolchain without
+this phase and leaves the new-evaluation figure unchanged.
 
 ## 8. What still `quit`s
 
