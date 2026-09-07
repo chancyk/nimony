@@ -73,3 +73,23 @@ every tool in `/usr/bin/time -l`; the wrapped builds failed early on both
 sides, so that number is unattributed for now. M1 (JIT_IMPL.md) makes the
 tools record their own peak RSS in their ledger fragment, which answers it
 from inside the build instead.
+
+## Run 11: F1 (declaration-stable frontend output) merged -- interleaved, load decaying from 19
+
+head = fast-devloop with jit/f1 (locals spelled `` x.3`routine`0 ``; hexer's `.decls.nif` digests).
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB | wall | cpu |
+|---|---|---|---|---|
+| sem.nim body edit, rebuild | 2.713 / 3.987 / 116 | 0.766 / 0.748 / 102 | 3.54x | 5.33x |
+| compiler, cold | 5.709 / 14.853 / 116 | 5.683 / 13.634 / 217 | 1.00x | 1.09x |
+
+Why: the appended proc now changes 1 of 1222 `.s.nif` declarations and 0
+`.x.nif` declarations (was 465 / 464), so P0c's per-module live files,
+the `.c.nif` cache and nifasm's per-symbol blob cache all hit. Cost:
+frontend artifacts +31 % in bytes (the owner's name in every local), cold
+build +3 % cpu of which 2.6 % is the new `.decls.nif` sidecar that nothing
+reads yet (B3b will). Golden churn: 21 files, every changed line a local
+rename or an index offset. Follow-ups found in review: diagnostics now
+print the namespaced spelling (`'s.0`testMutateWhileIterating`0' is
+borrowed`) where the user wants `s`; `derefs.nim`'s `err.N` and
+`controlflow.nim`'s `cf.N` still count module-wide.

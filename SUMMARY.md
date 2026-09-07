@@ -10,12 +10,12 @@ compiler produces. This file is the decision aid; `JIT.md` is the design,
 
 | scenario | before | after | peak RSS before / after |
 |---|---|---|---|
-| compiler compiling itself, one body edit in `sem.nim` | 2.78 s | 1.26 s | 116 / 112 MB |
+| compiler compiling itself, one body edit in `sem.nim` | 2.71 s | 0.77 s | 116 / 102 MB |
 | same edit, then run the compiler from memory (`nimony r`) | no such command | 1.34 s | |
 | hello world, edit, build and run | 0.32 s | 0.033 s | 18 / 26 MB |
 | one compile-time evaluation (`const` needing a sub-compile) | 450–490 ms, 32 processes | ~27 ms, 0 processes | 59 / 61 MB |
 | compiler, no change | 74 ms | 35 ms | |
-| compiler, cold | 5.29 s | 5.16 s | 116 / **216 MB** |
+| compiler, cold | 5.71 s | 5.68 s | 116 / **217 MB** |
 
 Correctness evidence, all automated and green: `hastur boot --boot-backend:native`
 stages 1 = 2 = 3 byte-identical; `hastur tests/nimony` 794/794 in every mode;
@@ -40,6 +40,7 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 | 7 | **`nimony r`** (B1): the native graph minus the link node, assembled in-process, `main` called from the arena | `nimony.nim`, `deps.nim`, `engine.nim` | same graph as `nimony n`; one proc is the run boundary for a later out-of-process guest; `--out` still writes the executable | `tests/nimony_r` |
 | 8 | **Tools as procs, nifmake as a library, a scheduler** (A2a/A2b): `runNifler/Nimsem/Hexer/Lengc` + `reset*Globals`; `nifmake/dag.nim`; `nimony` runs a DAG depth in-process when the ledger says its serial cost ≤ a fan-out's | `nimsem/hexer/lengc` entry files, `programs.nim`, `nifpools.nim`, `nifmake/`, `phases.nim`; `nimony` links nimsem+hexer+lengc (2.9 → 4.8 MB) | two runs in one process produce the bytes of two processes (`tests/inproc`); `--spawn:always` / `--vfs:disk` = today's process tree exactly; nifler stays a process | `hastur tests/inproc`, `--report` identical across modes |
 | 9 | **Cost ledger + artifact store** (A1): every tool writes `.ledger/` timing fragments, nifmake folds spawn costs, `--stats` prints them; `--vfs:memory\|memory+spill\|disk\|verify` adapter behind `vfs.nim`'s relays | `src/lib/ledger.nim`, `artifactstore.nim`, ~36 call sites moved onto the relays | disk is the default (bit-identical); `--vfs:verify` byte-compares every memory read against disk; overhead +0.5 % | `tests/ledger`, `tests/vfs`, `tests/nifcache` |
+| 11 | **Declaration-stable frontend output** (F1, on the owner's decision): a local is spelled `` x.3`semExpr`0 `` (per-routine counter, then the owning routine in the disambiguator) and hexer writes line-info-blind per-declaration digests (`<mod>.decls.nif`) | `sembasics.makeLocalSym`, `symparser`, `hexer/decldigest.nim`; 21 goldens | one dot, so every scanner still classifies it local; module-wide uniqueness preserved (found the consumer: `hoistedConsts`); an appended proc changes 1 declaration instead of 465, which is the whole edit-loop gain since B3; costs +31 % artifact bytes and +3 % cold cpu | `decl-stability` scenario in `tests/incremental` |
 | 10 | **Stdlib**: `std/syncio` opt-in read log; `std/writenif` writes `<sfx>.out.nif.reads` | `lib/std/syncio.nim`, `writenif.nim` | one `bool` test per open; it is what lets `const x = readFile(...)` notice the file changed (it did not before) | `tests/incremental` phase "ctfe" |
 
 ## Things you may not want (decide these)
@@ -58,12 +59,13 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 - **Memory**: a cold self-compilation's largest process is 216 MB against
   116 MB before (147 MB with `--spawn:always`). Phase M1 (in flight) puts
   peak RSS into the ledger and makes the scheduler budget it.
-- **Frontend output rules** (F1, in flight, on the owner's decision): local
-  symbols numbered per declaration and line-info-blind declaration digests,
-  so an edit to one proc leaves the other 1226 declarations of `sem.nim`
-  byte-identical. It churns goldens; it is the prerequisite for lowering at
-  symbol granularity (B3b), which is where the remaining 0.5 s of hexer +
-  arkham per edit goes. Everything above stands without it.
+- **Local symbol spelling** (F1, row 11): `` x.3`semExpr`0 `` is a new shape
+  in the symbol namespace, argued legal from the scanners rather than from
+  nifspec's text; it makes `.s.nif`/`.x.nif` 31 % larger, and diagnostics
+  currently print it verbatim (`'s.0`testMutateWhileIterating`0' is
+  borrowed`) where `s` is wanted -- a follow-up. It is the single change
+  that took the edit loop from 1.26 s to 0.77 s; everything above stands
+  without it, and reverting it is one commit plus the 21 goldens.
 
 ## Not done
 
