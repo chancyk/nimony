@@ -1,0 +1,169 @@
+Phase H1 -- dceLive on the compiler corpus
+==========================================
+
+Machine: macOS 26, arm64, Nim 2.2.10. Branch jit/h1 off fast-devloop 55c0521e.
+Corpus: a cold `nimony n src/nimony/nimony.nim`, 131 modules, 131 `.dce.nif`
+analyses totalling 3.1 MB. Pin: nativenif 7b838ec.
+
+"base" is a hexer built from 55c0521e; "head" is the same tree with the
+`markLive` fix (d40594ce). Everything else in the toolchain is identical
+between the two sides -- only `bin/hexer` is swapped -- so every number below
+isolates that one change.
+
+
+1. dceLive by stage
+-------------------
+
+Standalone harness over the real inputs, calling the same dce1/dce2 procs the
+`dl` sub-command calls, timing the stages apart. Median of 3, milliseconds.
+
+  stage                                    base     head
+  read + parse the 131 .dce.nif            18.9     18.6
+  build Table[string, ModuleAnalysis]       6.5      6.6
+  resolveSymbolConflicts                    1.2      1.3
+  markLive (the worklist fixpoint)        311.6      7.2
+  write <main>.all.live.nif (anchor)        2.9      2.9
+  write the 131 per-module <M>.live.nif    14.4     14.2
+  ------------------------------------------------------
+  total                                   355.8     50.8
+
+Graph size: 7867 worklist pops, 53674 dependency visits, 61541 translate
+calls, 20 roots, 17328 uses-owners, 103027 edges, 11360 offers, 4646 resolve
+entries, 6773 live symbols. 311 ms / 7867 pops = 40 us per pop, which is what
+pointed at a copy rather than at the algorithm.
+
+
+2. The real binary, the build graph's exact argv
+------------------------------------------------
+
+  hexer dl --split:<backendDir> <131 .dce.nif> <main>.all.live.nif
+
+  base   real 0.70 (cold)  0.36  0.36  0.35  0.36
+  head   real 0.05         0.05  0.05  0.05  0.05
+
+
+3. In a real rebuild (the live edit)
+------------------------------------
+
+Warm cache, then devloop_ab.sh's `self.editbody` edit -- a statement inserted
+into `semStmt` -- then `nimony n --profile --report`:
+
+  base                              head
+    nimsem     0.330s (1)             nimsem     0.328s (1)
+    dceLive    0.367s (1)             dceLive    0.062s (1)   <-- gate <= 0.08
+    hexer      0.269s (1)             hexer      0.267s (1)
+    arkham     0.259s (3)             arkham     0.256s (3)
+    link       0.125s (1)             link       0.125s (1)
+    dceEmit    0.051s (1)             dceEmit    0.052s (1)
+  exec total   1.071s               exec total   0.762s
+
+The base column reproduces progress.md run 16 exactly (dceLive 0.36).
+
+
+4. Wall, per round -- and why the A/B median does not move
+----------------------------------------------------------
+
+`bench/devloop_ab.sh` runs the scenario 5 times and reports the MEDIAN. For
+`self.editbody` that median does not measure dceLive at all: the edit inserts
+`if isNewScope: discard $i`, which adds no symbol and no use-edge, so after
+round 0 the module's `.dce.nif` comes out byte-identical (P0c's sorted
+serialization) and the dceLive node is never woken again. With --report:
+
+  head round 0   nifmake-report arkham=3 dceEmit=1 dceLive=1 hexer=1 link=1 total=7
+  head round 1   nifmake-report arkham=3 dceEmit=1            hexer=1 link=1 total=6
+  head round 2   nifmake-report arkham=3 dceEmit=1            hexer=1 link=1 total=6
+  head round 3   nifmake-report arkham=3 dceEmit=1            hexer=1 link=1 total=6
+  head round 4   nifmake-report arkham=3 dceEmit=1            hexer=1 link=1 total=6
+
+So 4 of the 5 rounds skip the stage this phase changes, and the median is the
+steady state. Per-round wall, fork-point sources, two interleaved pairs:
+
+  base  round 0 1.38   round 1 1.04  round 2 1.02  round 3 1.04
+  head  round 0 1.09   round 1 1.04  round 2 1.04  round 3 1.03
+  base2 round 0 1.40   round 1 1.04  round 2 1.05  round 3 1.05
+  head2 round 0 1.10   round 1 1.04  round 2 1.04  round 3 1.04
+
+  first rebuild after an edit (dceLive runs):  1.39 -> 1.10  (-0.29 s, 1.26x)
+  steady state (dceLive skipped):              1.04 -> 1.04  (unchanged)
+
+The -0.29 s is the dceLive delta from section 3, landing where it should.
+
+
+5. bench/devloop_ab.sh /tmp/devloop_base <worktree> self.editbody 5
+-------------------------------------------------------------------
+
+Run for the record; read it with section 4 in mind -- its median is the
+steady state, which this phase does not touch.
+
+  uptime before: 14:09  up 18 days, 14:05, load averages: 6.68 5.04 4.55
+
+  round 0  A  wall 2.683  cpu 3.838  rss 117MB
+  round 0  B  wall 1.143  cpu 1.169  rss 147MB
+  round 1  A  wall 2.668  cpu 3.835  rss 117MB
+  round 1  B  wall 1.063  cpu 1.093  rss 107MB
+  round 2  A  wall 2.677  cpu 3.841  rss 117MB
+  round 2  B  wall 1.075  cpu 1.107  rss 107MB
+  round 3  A  wall 2.682  cpu 3.854  rss 117MB
+  round 3  B  wall 1.065  cpu 1.105  rss 107MB
+  round 4  A  wall 2.695  cpu 3.856  rss 117MB
+  round 4  B  wall 1.069  cpu 1.101  rss 107MB
+
+  self.editbody: A wall median 2.682  min 2.668 | cpu median 3.841  min 3.835 | peak rss 117 MB
+  self.editbody: B wall median 1.069  min 1.063 | cpu median 1.105  min 1.093 | peak rss 107 MB
+  B/A cpu (median): 0.288   B/A cpu (min): 0.285   B/A peak rss: 0.91
+
+  uptime after: 14:09  up 18 days, 14:05, load averages: 4.44 4.65 4.43
+
+B's round 0 (1.143) is the only round that pays dceLive, and it is the round
+that moved: run 16 recorded the same scenario at a 1.084 median.
+
+
+6. Cold
+-------
+
+Cold self-compilation, base/head interleaved, 3 rounds each, same sources:
+
+  base cold  5.04  5.08  5.08     median 5.08
+  head cold  4.78  4.79  4.83     median 4.79
+
+-5.7 %: cold runs dceLive once, so it collects the same 0.30 s. The gate was
+"within 3 %" against a regression; this is an improvement, not a regression.
+
+
+7. Byte identity
+----------------
+
+`hexer dl --split:` run by the base and the head binary over the same 131
+analyses, into two clean directories, then `diff -r`:
+
+  IDENTICAL: all 132 live files + anchor byte-for-byte equal   (1.8 MB each)
+
+The only file that differs at all is the ledger fragment
+`.ledger/dceLive_.nif`, and only in its own timings:
+
+  <   (produce ns 314761333)
+  >   (produce ns 17471792)
+
+Also checked in-process: the old and the new `markLive` run back to back over
+the same 131 analyses in one process return the same
+`Table[string, HashSet[SymId]]`, key by key.
+
+
+8. Suites
+---------
+
+  hastur test tests/incremental   16/16, 16/16 (--vfs:memory+spill),
+                                  16/16 (--spawn:always), incremental-live 5/5
+                                  and 5/5, decl-stability 4/4, ctfe-ocache 2/2,
+                                  tool-shadow 2/2, inproc 4/4, membudget 5/5
+                                  -> SUCCESS
+  hastur tests/inproc             3/3 in 27.17s -> SUCCESS
+  hastur test tests/ctfe_diff     19 files, 50 artifacts, 79 .s.nif, 0 differences
+  hastur test tests/nifcache      106 .nif artifacts byte for byte, all checks passed
+  hastur test tests/nimony_r      112 fragments, cached link byte-identical, passed
+  hastur test tests/ledger        all ledger tests passed
+  hastur test tests/ctfe_engine   28 non-main .c.nif byte-identical to CCACHE=off
+  hastur tests/nimony             794 / 794 in 143.12s -> SUCCESS
+  hastur boot --boot-backend:native
+                                  stages 1 and 2 byte-identical
+                                  stages 2 and 3 byte-identical, total 45.22s
