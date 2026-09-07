@@ -241,8 +241,30 @@ compiled path, so this row re-confirms B3's number and is what the next
 attempt has to beat.
 
 
-8. Found while running the suite (not B3b's)
---------------------------------------------
+8. Suite
+--------
+
+  hastur all                        843 / 844 tests successful in 554.04s
+                                    FAILED (1): tests/ledger  -- see below
+  hastur test tests/incremental     16+16+16 incremental phases, 2+2+2
+                                    ctfe-ocache, 4 inproc, 5+5 live, and
+                                    3 / 3 decl-stability, SUCCESS
+  hastur test tests/inproc/hexer    all checks passed
+  hastur boot (C, inside `all`)     stages 2 and 3 byte-identical
+  hastur boot --boot-backend:native stages 1, 2 and 3 byte-identical
+                                    (48.91 s, SUCCESS)
+
+decl-stability's own line, on the 13-declaration fixture:
+
+  decl-stability: .s.nif 13 decls | in-place changed 1 | insert changed 7
+    (blind 7, added 1) | stmtadd changed 8 (blind 2) | .x.nif in-place changed 1
+
+`insert 7 -> blind 7` is `makeLocalSym`'s rename; `stmtadd 8 -> blind 2` is
+line info.  Both reproduce sem's ratios on a fixture that costs 0.8 s.
+
+
+8b. Found while running the suite (not B3b's)
+---------------------------------------------
 
 `hastur test tests/ledger` fails on this machine with
 
