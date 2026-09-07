@@ -62,10 +62,10 @@ Two facts that the plan's framing did not have, and that redirect the work:
   `dceEmit` — which writes `<sub-program>/<mod>.c.nif` — and `dceLive` are
   per-sub-program, and together they are **23 of the 44 ms, the single biggest
   item.**
-* Across the five sub-programs the seven stdlib modules produce **11 distinct
+* Across the five sub-programs the seven stdlib modules produce **12 distinct
   `.c.nif` files out of 35 `dceEmit` runs** (`assertions`, `fenv`,
   `formatfloat`, `math` 1 each; `system` 2; `syncio` 3; `writenif` 3). So
-  content-addressing that output would turn 24 of the 35 runs into hits.
+  content-addressing that output turns 23 of the 35 runs into hits.
 
 ## 2. The `nimony s` child, exactly
 
@@ -161,6 +161,134 @@ file text, not ids, so it needs neither.
 
 ## 5. Local workarounds outside the owned files
 
-None. `identstyle.nim`, `programs.nim`, `nifpools.nim` and `phases.nim` are
-untouched: the snapshot is built from their already-exported
-`pool`/`globalTags`/`prog` and `resetStyleTables`.
+None. `identstyle.nim`, `programs.nim`, `nifpools.nim`, `phases.nim` and
+`src/nifmake/dag.nim` are untouched: the snapshot is built from their
+already-exported `pool`/`globalTags`/`prog` and `resetStyleTables`.
+
+Two files outside the owner list were edited, neither of them on the DO-NOT
+list, and both by one line each in service of a test the plan asks for:
+
+* `src/hastur/ctfediff.nim` — "add that comparison to the ctfe_diff runner:
+  compare the *parent* module's `.s.nif` too". The runner is that file;
+  `tests/ctfe_diff/setup.nim` only calls into it.
+* `src/nimony/semdecls.nim` — `compileMacroPlugin` needed the caller's
+  `baseDir` to build a sub-compile's config, so its one call site passes it.
+
+---
+
+# Phase A2c — what was built
+
+## 6. The two steps, and what each one measured
+
+`bench/results/2026-09-06/a2c.txt` carries the tables and the raw runs. The
+short version, one NEW evaluation of a `tmyops` const on a warm stdlib
+nimcache:
+
+| | per evaluation |
+|---|---|
+| before | 42.8 ms |
+| the `nimony s` process removed | 36.0 ms |
+| the stdlib closure's `.c.nif` shared | 30.4 ms |
+
+### 6.1 The sub-build, in the compiler's own process
+
+`deps.runEvalBuild` is installed on `semos.evalBuildInProcess` at `deps`'
+module init. It answers `EvalBuildUnavailable` when
+`deps.inProcessMakeAvailable()` is false — a bare `bin/nimsem`, a nimony-built
+nimony, or `--spawn:always` — and the caller then spawns exactly as before.
+That is also what keeps `hastur boot` honest: a booted compiler takes the old
+path and the phase is not in its picture at all.
+
+`deps.childArgs` rebuilds the state a spawned `nimony <args> s <project>` would
+have had. It only has to cover `--path`, `-d:release`/`-d:danger` and what
+`cli.parseCommonOption` forwards, because every nimony-specific option sets
+`forwardArg = false`; the epilogue of `compileProgram` (linker defaults,
+`checkFlags`, the two `nimNative*` defines) is replayed after. The check that
+this is right is not the reading: it is that `--spawn:always` and the default
+leave 260 byte-identical `.nif` artifacts in one nimcache, the two
+`*.build.nif` of every sub-program included.
+
+`runMake` grew a `nested` mode that returns `false` instead of `quit`ting. A
+sub-program that does not compile used to be a child's non-zero exit code; in
+this process a `quit` would be a dead compiler for a bad `const`.
+
+### 6.2 The frontend snapshot, and why it is not "share `prog` and the pool"
+
+`notes/a2a-front.md` §4 proposed a fresh `SemContext` sharing `prog` and the
+pool. What has to be re-entrant here is not one `semExpr` but a whole nested
+*compilation*: nimsem, hexer, `dceLive` and `dceEmit`, each of which begins
+with `semmain.resetFrontendGlobals()` inside `phases.runPhaseInproc`. Sharing
+is not available to them.
+
+So `semos.takeFrontendState` moves `pool`, `globalTags` and `prog` aside and
+installs empty ones; `restoreFrontendState` moves them back and drops
+`identstyle`'s lazy indexes. Inside the window the process IS a fresh
+`nimony s` — every phase gets its reset, the pool starts empty, and the
+sub-program's `.dce.nif` ordering (which A2a-hexer showed depends on how many
+strings were interned before the module) is bit-for-bit the spawned form's.
+Outside it the caller finds its own universe where it left it.
+
+Why it is cheap: `Pool`/`TagPool` are `ref`s and `Program` is an object of
+tables, so this is a handful of pointer moves. Why it is safe: `TokenBuf`
+captures the pool it was created with, so the caller's live buffers keep
+decoding throughout; and moving `prog` moves the table headers rather than the
+heap its entries live on, so a `ptr ToplevelEntry` from `programs.getEntry`
+stays valid while the nested build allocates its own.
+
+The evidence is `tests/ctfe_diff`: every mode pair now compares the CALLING
+module's `.s.nif` as well as each evaluation's `.out.nif`, and the pair that
+makes the statement is `--ctfe:subprocess` (which still spawns a whole
+`nimony s` and cannot touch this process's state at all) against the default.
+79 `.s.nif` per pair, 0 differences, over four pairs.
+
+### 6.3 The `.c.nif` cache
+
+Described in `bench/results/2026-09-06/a2c.txt` §4 and in `deps.nim`'s own
+comment. The key is the module's slice of `<main>.live.nif` plus the
+`resolved` entries not owned by the main module plus a digest of its `.x.nif`.
+Validated two ways: the keys partition `tmyops`' 35 emissions into exactly its
+12 distinct outputs, and 518 `.c.nif` across eleven programs are byte-identical
+to a `NIMONY_CCACHE=off` compile.
+
+The `.x.nif` digest is memoized in a `<modname>.xdig` sidecar under the mtime
+it was taken for. A stamp alone would have been cheaper, but the entry NAME has
+to be nimcache-independent or `tests/nifcache` sees the same three files under
+six names — which is exactly what the first cut did.
+
+## 7. What was NOT done, and the number
+
+* **nimsem does not link hexer and lengc.** The plan asked for it. Since A2b
+  the process that runs sem for an ordinary `nimony c` is `bin/nimony`, which
+  already links all three and already has the relay installed, so the whole
+  win is available there. `bin/nimsem` is reached only when the scheduler
+  decided to SPAWN a nimsem node, and there the sub-compile keeps spawning.
+  Linking the tools into nimsem too would roughly double its size and its
+  build time (A2b measured nimony at 2.91 -> 4.77 MB and ~1.6 -> ~4.0 s for
+  exactly this) to speed up a path the scheduler already avoids — and
+  `phases.nim` imports `nimsem`, so nimsem cannot import `phases` back without
+  a module cycle, and `phases.nim` is not this phase's to change.
+* **`runMacroPlugin`'s in-process handoff.** `compileMacroPlugin` goes through
+  the new path (its `nimony s` spawn is gone), but `runMacroPlugin` itself
+  execs a standalone plugin EXECUTABLE over the file protocol, which JIT.md
+  calls a documented contract and which no registered phase can stand in for.
+  There is nothing to hand over in-process until a plugin can be loaded as
+  code, which is B3/B4's `nimrun`.
+* **`--vfs` default.** Measured, no gain: 36.0 ms (disk) vs 35.9 ms
+  (memory+spill) per new evaluation. Stays `disk`; nothing was added to the
+  ephemeral list.
+* **`dceLive`, 9.2 ms**, is now the largest single phase of an evaluation and
+  cannot be content-addressed: its output depends on the main module's roots
+  by construction. See a2c.txt §5 for the two ways out, both outside this
+  phase's files.
+
+## 8. What still `quit`s
+
+Unchanged from `notes/a2b.md` §3.1 for the phases themselves. One thing did
+change class: a build GRAPH that fails inside a nested sub-build now returns
+`false` instead of `quit`ting, so `runEval` reports it at the `const` site.
+The diagnostics of the failing phase reach this process's stdout directly
+rather than a child's captured output, so the text a user sees for a `const`
+that does not compile is the phase's own message instead of the same message
+re-emitted by the parent. `hastur tests/nimony` (794/794 in both `--ctfe`
+modes) is what says no `.msgs` golden depended on the old spelling.
+
