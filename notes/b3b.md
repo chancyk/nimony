@@ -50,12 +50,12 @@ Monotone counters whose values end up in generated SYMBOL NAMES:
 
 | where | field | names it mints |
 |---|---|---|
-| `hexer_context.nim:47` | `EContext.tmpId` | `` `ii.<n> ``, `continueLabel.<n>`, `forStmtLabel.<n>`, `whileStmtLabel.<n>`, `` `coroResult.<n>.<mod> ``, `` `tc.<n> ``, `` `sc.<n> ``, `Dl.<lib>.<n>.<mod>` |
+| `hexer_context.nim:47` | `EContext.tmpId` | `` `ii.<n> ``, `continueLabel.<n>`, `forStmtLabel.<n>`, `whileStmtLabel.<n>`, `` `coroResult.<n>.<mod> ``, `` `tc.<n> ``, `` `sc.<n> ``, `Dl.<lib>.<n>.<mod>`. Its comment says "per proc"; it is never reset per proc |
 | `hexer_context.nim:46` | `EContext.instId` | `` `lf.<n> `` (`iterinliner.nim:401,702`) |
 | `hexer_context.nim:50` | `EContext.localDeclCounters` (seeded 1000) | `<base>.<n>.<mod>` for every hoisted local proc/type/const (`lengcgen.nim:990`) |
 | `hexer_context.nim:32` | `EContext.strLitCounter` | `anonArr.<n>.<mod>` (`lengcgen.nim:1618`) |
 | `passes.nim:21` | `Pass.nextTemp` | xelim's temps; threaded across all eleven passes and into the nested CPS/lambda pipelines (`xelim.nim:1521,1531`) |
-| `lifter.nim:59` | `LiftingCtx.hookNames` | `=destroy_<key>.<n>.<mod>` (`lifter.nim:317`) |
+| `lifter.nim:59` | `LiftingCtx.hookNames` | `=destroy_<key>.<n>.<mod>` (`lifter.nim:319`) |
 | `intramodinliner.nim` | `InlinerCtx.counter` | `base.0h<n>`, `returnLabel.0h<n>` |
 
 First-use ownership — a declaration "owns" a generated top-level node only

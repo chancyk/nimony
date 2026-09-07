@@ -29,6 +29,12 @@ Four consecutive body edits, one run each; stable to +-3 ms.
 
 hexer + arkham = 0.501 s.  The phase's gate is <= 0.2 s.
 
+progress.md run 6 read 0.36 s hexer and 0.41 s arkham for the same two
+stages.  That run was taken on a loaded machine at an earlier head; the
+RATIO is what carries over -- hexer and arkham on the edited module are
+about a third of the edit loop either way -- and every number below is from
+this measurement, not from run 6.
+
 arkham per module, standalone, median of 3:
 
   semygjvq21.c.nif  (4.3 MB)   0.210 s
