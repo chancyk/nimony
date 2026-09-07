@@ -760,7 +760,7 @@ machine, with one script. The rule, from 2026-09-06 on:
    `bench/devloop_bench.sh /tmp/devloop_base base 3` and
    `bench/devloop_bench.sh . head 3`, and append both tables to
    `bench/results/<date>/progress.md` under the merged commit hash.
-3. Read cpu-sum first, wall second. A scenario whose cpu-sum is more than 5 %
+3. Read cpu-sum first, wall second, and peak resident size (the `rss` column, the largest process of the build) beside them: the design's low-memory goal is a gate too. A scenario whose cpu-sum is more than 5 %
    worse than `base` and is not explained by the phase that was just merged
    blocks the next launch until it is understood (profile with
    `nimony c -f --profile`, then bisect by phase branch).
@@ -845,4 +845,5 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3c | merged (nativenif `jit/b3c`, pin c3f27fc: `core/declhead.nim` reads a foreign proc's signature without its body; warm compiler link 0.27 -> 0.086 s, `sem.nim`-edited 0.43 -> 0.28 s; byte-identical; headline 2.78 -> 1.26 s wall) | nativenif c3f27fc |
 | small items | merged (`findTool` never resolves via cwd/PATH, `dag.resolveProgram` for external programs; in-process nodes overlap the fan-out (measured neutral: depths are homogeneous); no-change floor 74 -> 35 ms) | merged from jit/small-items |
 | F1 | running: declaration-stable frontend output (per-declaration local numbering, line-info-blind identity) | |
+| M1 | running: memory in the ledger and the scheduler -- every tool records its peak RSS in its fragment, `--stats` shows it, the scheduler keeps in-process work under `--inproc-mem-budget` (cold self-compilation: driver 215 MB in-process vs 147 MB spawn-always vs 116 MB at the fork point; edit loop and CTFE unchanged) | |
 | B4, B5 | planned | |

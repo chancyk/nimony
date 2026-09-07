@@ -67,3 +67,9 @@ dependency state is live at the same time), and ~30 MB is what the head's
 `nimony`/tools cost on top of the fork point's even when everything spawns
 (per-tool numbers below). The edit loop and CTFE are unchanged in memory:
 the engine's 256 MB arena is reserved address space, not resident pages.
+
+Per-tool attribution of the spawn-always +30 MB was attempted by wrapping
+every tool in `/usr/bin/time -l`; the wrapped builds failed early on both
+sides, so that number is unattributed for now. M1 (JIT_IMPL.md) makes the
+tools record their own peak RSS in their ledger fragment, which answers it
+from inside the build instead.
