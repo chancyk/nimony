@@ -1168,6 +1168,43 @@ proc ocacheDir(config: NifConfig): string =
   ## deleting `nimcache/` (`hastur clean`) is all the eviction there is.
   config.nifcachePath / "ocache"
 
+proc blobCacheDir*(config: NifConfig): string =
+  ## nifasm's per-symbol machine-code cache (nativenif's `blobcache.nim`,
+  ## JIT_IMPL.md B3). Beside `ocache/` and `ccache/`, and with the same
+  ## lifetime: inside the build cache, so `--nimcache:<dir>` scopes it and
+  ## `hastur clean` is the eviction.
+  ##
+  ## ONE directory per nimcache, named by both native paths: `nimony n`'s
+  ## `link` node passes it to nifasm on the command line and `nimony r` hands
+  ## the same string to `AsmSession.useBlobCache` (`engine.runWholeProgram`).
+  ##
+  ## What they share is the DIRECTORY, not each other's fragments. A blob is
+  ## addressed by target + FLAGS + tool build id + module name, and `flags`
+  ## covers `singleThread` and `debugInfo`: `nimony r` assembles
+  ## `--dev-single-thread` with no debug info while a linked executable has
+  ## both, so the two are genuinely different machine code and get different
+  ## keys. Letting them share would be letting one produce the other's bytes.
+  ## Sharing the directory is still what matters -- one store, scoped by
+  ## `--nimcache`, swept by `hastur clean`, with no second convention to learn.
+  ##
+  ## The module name is already suffixed per project, so two projects in one
+  ## nimcache do not collide either.
+  config.nifcachePath / "blobcache"
+
+proc blobCacheEnabled*(config: NifConfig): bool =
+  ## `--no-blobcache` (`config.blobCache`) or `NIMONY_BLOBCACHE=off`.
+  ##
+  ## Unlike `NIMONY_CCACHE`, this one DOES change the `*.build.nif`: the flag it
+  ## suppresses is part of the `link` node's command line, and a build file that
+  ## claimed a cache the linker was not given would be a lie about what ran.
+  ## Turning the cache off is a deliberate escape hatch, not a mode two
+  ## artifact comparisons are expected to straddle.
+  if not config.blobCache: return false
+  when defined(nimony):
+    true
+  else:
+    getEnv("NIMONY_BLOBCACHE") != "off"
+
 proc ocacheBase(c: DepContext; f: FilePair): string =
   ## `<nimcache>/ocache/<hash>` for a module whose object is cached, else "".
   c.ocache.getOrDefault(f.modname, "")
@@ -1636,6 +1673,16 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
       b.withTree "cmd":
         b.addSymbolDef "link"
         b.addStrLit findTool("nifasm")
+        if blobCacheEnabled(c.config):
+          # The per-symbol code cache (JIT_IMPL.md B3). Without it every edit
+          # re-selects instructions for all ~4000 reachable procs of a
+          # compiler-sized image; with it a proc whose module -- and every
+          # module it read a declaration from -- is unchanged is spliced back
+          # in. The image is byte-identical either way: the fragments are
+          # pre-relaxation and the reachability worklist is untouched, so a
+          # `--blobcache` link and a scratch link emit the same symbols in the
+          # same order.
+          b.addStrLit "--blobcache:" & blobCacheDir(c.config)
         b.withTree "output":
           b.addStrLit "-o:"
         b.withTree "input":

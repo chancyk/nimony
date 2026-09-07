@@ -168,6 +168,14 @@ type
                          # frames for it (#1987). Off by default: it costs work
                          # in every template expansion and only a debug build
                          # reads it.
+    blobCache*: bool
+      ## `--no-blobcache` clears it (so does `NIMONY_BLOBCACHE=off`, which also
+      ## reaches child processes). ON by default: nifasm's per-symbol code cache
+      ## (`--blobcache:<nimcache>/blobcache`) is what makes the native link
+      ## incremental, and JIT_IMPL.md B3 measured the image it produces to be
+      ## byte-identical to one assembled from scratch. The flag exists for the
+      ## same reason `--vfs:disk` does — an escape hatch that is one word long
+      ## when a cache is suspected.
 
 proc addDefine*(config: var NifConfig; symbol: string) =
   config.defines.addUnique symbol
@@ -184,8 +192,9 @@ proc initNifConfig*(baseDir: sink string): NifConfig =
     cc: "gcc",
     linker: "",
     appType: appConsole, # console is the default
-    checkFlags: "br"     # = genFlags(DefaultSettings) (BoundCheck + RangeCheck);
+    checkFlags: "br",    # = genFlags(DefaultSettings) (BoundCheck + RangeCheck);
                          # the normal compile path overrides from `--boundchecks` etc.
+    blobCache: true      # nifasm's per-symbol code cache, on unless refused
   )
 
 proc setTargetCPU*(config: var NifConfig; symbol: string): bool =

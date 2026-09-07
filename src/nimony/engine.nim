@@ -55,8 +55,8 @@ import ".." / lib / [nifcore, nifcoreparse, nifchecksums]
 
 import arkham / generate
 import arkham / core / lengdecl
-import nifasm / [driver, hostrun]
-import nifasm / core / [hostsyms, asmerror]
+import nifasm / [driver, hostrun, blobcache]
+import nifasm / core / [hostsyms, asmerror, asmprofile]
 import nifasm / image / memory
 
 const
@@ -88,6 +88,18 @@ type
     viaFile*: bool   ## the main module went through `.asm.nif` after the
                      ## in-memory handoff was refused
     codeLen*, dataLen*, externals*: int
+    emitRootsMs*: float
+      ## The reachability worklist alone, out of `assembleMs`. B3 measured it at
+      ## 96.7 % of a cold link of the compiler, so it is the one sub-stage worth
+      ## a column: everything a code cache can do, it does here.
+    blobCache*: bool         ## the per-symbol code cache was on for this run
+    blobHits*, blobStale*, blobRecorded*: int
+      ## nifasm's own counters, read off the session after `finishCode`. `hits`
+      ## are the fragments replayed, `stale` the ones a validity check rejected,
+      ## `recorded` the ones this run wrote back. A warm link is all hits; a
+      ## cold one is all recorded; an edit is the shape in between, and reading
+      ## the three together is how a cache that quietly stopped working shows
+      ## up as a number rather than as a slow afternoon.
 
   EngineResult* = object
     outcome*: EngineOutcome
@@ -623,6 +635,19 @@ type
     mainModule*: string   ## the root module's suffix
     argv*: seq[string]    ## argv[0] first, then the program's own arguments
     verbose*: bool        ## print the per-stage timing line before the run
+    profile*: bool
+      ## also let nifasm print its own per-stage table (`asmprofile`): every
+      ## stage with its wall time and count, plus the per-module emit cost.
+      ## `--profile` on `nimony r`; `--verbose` implies it, because the numbers
+      ## a reader of the timing line wants next are always in that table.
+    blobCacheDir*: string
+      ## `deps.blobCacheDir(config)`, or "" when the cache is off. The SAME
+      ## directory the `link` node passes to nifasm as `--blobcache:` -- one
+      ## store per nimcache, holding both paths' fragments under their own
+      ## flag keys (`deps.blobCacheDir` says why they cannot be one set).
+      ## Empty is not an error: `useBlobCache` returns on an empty string and
+      ## the session assembles from scratch, which is the `--no-blobcache`
+      ## behaviour and the pre-B3 one.
 
   RunResult* = object
     outcome*: RunOutcome
@@ -679,13 +704,25 @@ proc runTimingLine*(r: RunResult; label: string): string =
   ## `--verbose`'s one line for `nimony r`. Same columns as `timingLine`, minus
   ## arkham's (which ran in the build graph and is on nifmake's own profile) and
   ## minus the run itself, because the line is printed BEFORE the program runs.
+  ##
+  ## `emitRoots` and the three blob-cache counters are here rather than only in
+  ## nifasm's `--profile` table because they are the ANSWER to "why was this run
+  ## the length it was": `assemble` is `emitRoots` plus small change, and
+  ## `emitRoots` is `stale` fragments re-selected while `hits` were spliced.
   result = "[run-engine] " & label &
     " assemble=" & formatFloat(r.timings.assembleMs, ffDecimal, 2) &
+    "ms emitRoots=" & formatFloat(r.timings.emitRootsMs, ffDecimal, 2) &
     "ms lay=" & formatFloat(r.timings.layMs, ffDecimal, 2) &
     "ms bind=" & formatFloat(r.timings.bindMs, ffDecimal, 2) &
     "ms code=" & $r.timings.codeLen &
     "B data=" & $r.timings.dataLen &
     "B ext=" & $r.timings.externals
+  if r.timings.blobCache:
+    result.add " blobcache=on hits=" & $r.timings.blobHits &
+      " stale=" & $r.timings.blobStale &
+      " recorded=" & $r.timings.blobRecorded
+  else:
+    result.add " blobcache=off"
 
 proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
   ## Assemble `<backendDir>/<mainModule>.asm.nif` and everything it reaches
@@ -704,25 +741,33 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
   ##   it would make the two paths disagree -- the one thing `nimony r` must
   ##   not do. `evaluate` intercepts it for the opposite reason: there the
   ##   signal lands on a compiler that still has work to do.
-  ## * **`exit` is intercepted, and needs one more name than nativenif
-  ##   registers.** A native program's `main` ends in `cExit(0)`
-  ##   (`lengcgen.genMainProc`), so EVERY run leaves through it, not only a
-  ##   `quit`. `defaultHostSymbols` registers `exit` and `_exit`, but
-  ##   `hostsyms.cName` strips one leading underscore on registration as well
-  ##   as on lookup, so both land under the key `exit` -- and Mach-O's external
-  ##   for C `_exit` is `__exit`, whose `cName` is `_exit`, which nobody
-  ##   registered. Without the extra name the guest's exit takes the compiler
-  ##   with it (measured; `notes/b1-nimony.md` §3). Registering `__exit` here
-  ##   costs nothing on ELF, where the external is already covered.
+  ## * **`exit` is intercepted, and `defaultHostSymbols` is now enough.** A
+  ##   native program's `main` ends in `cExit(0)` (`lengcgen.genMainProc`), so
+  ##   EVERY run leaves through it, not only a `quit`. B1 had to register
+  ##   `__exit` by hand here: `hostsyms.cName` stripped one leading underscore
+  ##   on registration as well as on lookup, so `intercept("exit")` and
+  ##   `intercept("_exit")` both landed under the key `exit` while Mach-O's
+  ##   external for C `_exit` -- `__exit` -- asked for the key `_exit`, which
+  ##   nobody had. The guest's exit then took the compiler with it (measured;
+  ##   `notes/b1-nimony.md` §3). Fixed upstream in nativenif `f8d2676`, which
+  ##   `src/nativenif.commit` pins, so the workaround is gone and the two
+  ##   registrations `defaultHostSymbols` makes are the whole story.
   ## * **No budget.** A program the user asked to run may take as long as it
   ##   likes; there is no compiler waiting behind it.
   ## * **One parked thread per run.** `guestExit` cannot return into the
   ##   guest's frame, so the thread that called `exit` sleeps forever. A
   ##   `nimony r` process runs one program and then exits, so the leak has a
   ##   lifetime of milliseconds. It is also the reason JIT.md 7.3 wants this
-  ##   out of process eventually, which is B3's `nimrun`.
+  ##   out of process eventually. B3 shipped its code cache and left the
+  ##   `nimrun` guest for B4, because nothing measured asks for it while a
+  ##   `nimony r` process still runs one program and exits; `nimony dev`,
+  ##   which re-runs without a fresh compiler, is what will.
   let t0 = getMonoTime()
   result = RunResult(outcome: roRefused, status: 0, reason: "")
+  if p.profile:
+    # Before anything else: `asmprofile` decides whether to take a timestamp at
+    # every stage entry, and `openFileSession` is already one of them.
+    enableProfiling()
 
   if e.disabled:
     result.reason = e.disabledReason
@@ -754,11 +799,27 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
     # other half of the same promise.
     sess = openFileSession(mainAsm, debugInfo = false, singleThread = true)
     haveSession = true
+    # Before `declare`, which is where the target becomes known and the cache
+    # key is minted (`driver.useBlobCache`). An empty directory string is the
+    # documented way to say "no cache" and returns without touching anything,
+    # so `--no-blobcache` needs no second branch here.
+    sess.useBlobCache(p.blobCacheDir)
+    result.timings.blobCache = p.blobCacheDir.len > 0
     sess.declare()
     sess.beginEmit()
     sess.emitTopLevel()
+    let tRoots = getMonoTime()
     sess.emitRoots()
+    result.timings.emitRootsMs = (getMonoTime() - tRoots).inNanoseconds.float / 1e6
     sess.finishCode()
+    # Written BEFORE the guest runs, not after: `guestExit` parks the thread
+    # that called it and a program is free to take as long as it likes, so a
+    # flush at the end of the proc would be a flush that a `nimony r` of a
+    # long-running program never reaches.
+    sess.saveBlobCache()
+    result.timings.blobHits = sess.bc.hits
+    result.timings.blobStale = sess.bc.stale
+    result.timings.blobRecorded = sess.bc.recorded
     result.timings.assembleMs = (getMonoTime() - tAsm).inNanoseconds.float / 1e6
 
     # No `synthesizeProcessEntry`: that stub turns a kernel's process start
@@ -791,8 +852,7 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
           result.reason = "the program creates threads (" & ext.extName &
             "), and running from memory lowers every thread-local to a global"
           return
-    var host = defaultHostSymbols()
-    host.intercept("__exit", cast[pointer](guestExit))
+    let host = defaultHostSymbols()
     let missing = bindExternals(img, host)
     if missing.len > 0:
       result.reason = "unresolved external symbol(s): " & missing.join(", ")
@@ -804,12 +864,18 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
       result.reason = "the image has no entry point (no `main.0`)"
       return
 
-    if p.verbose:
+    if p.verbose or p.profile:
       # BEFORE the run, not after: everything the program writes belongs to the
       # program, and a compiler line in the middle of it would be the compiler
       # lying about whose output that is. On stderr, and for the same reason:
       # `nimony r prog.nim > out` must put the PROGRAM's stdout in `out`.
       stderr.writeLine runTimingLine(result, p.mainModule)
+    if p.profile:
+      # nifasm's own table, on stderr too, and for the same reason. It is the
+      # detail behind the line above: every stage with its count, the blob
+      # read/write rows, and the per-module emit cost that says WHICH module an
+      # edit made expensive.
+      profReport(p.mainModule & AsmExt)
 
     # The guest writes with raw `write(2)` while the compiler's own streams are
     # buffered, so anything still sitting in them would surface AFTER the
