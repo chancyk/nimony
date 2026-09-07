@@ -303,6 +303,14 @@ proc inprocRelay(req: RunNodeRequest): RunNodeStatus {.nimcall.} =
     spillAll(req.inputs)
     inc gSchedule.spawned
     return RunSpawn
+  if req.decideOnly:
+    # The DAG is asking the whole depth before it starts anything, so that the
+    # nodes it spawns are already running while the ones it keeps run here
+    # (`dag.SpawnBatch`). The decline above is the half that must happen now --
+    # the child reads its inputs off the disk -- and this is the half that must
+    # not: the same node comes back with `decideOnly = false`, and counting it
+    # twice would put the wrong number in `--report`'s `inproc=` field.
+    return RunHandledOk
   let idx = findPhase(gSchedule.registry, req.name)
   let (code, msg) = runPhaseInproc(gSchedule.registry.entries[idx], req.argv[1 .. ^1])
   inc gSchedule.inproc

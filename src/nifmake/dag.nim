@@ -134,9 +134,13 @@ type
     cmdTime*: Table[string, tuple[sec: float, count: int]]
     execWallTime*: float
     inproc*: int
-    inprocWallTime*: float  ## wall spent inside in-process nodes; they run one
-                            ## at a time, before their depth's fan-out, so this
-                            ## is time no other node overlaps (A2b)
+    inprocWallTime*: float  ## wall spent inside in-process nodes. They still
+                            ## run one at a time, but they run WHILE their
+                            ## depth's spawned nodes do, so this is time that
+                            ## overlaps the fan-out rather than time added in
+                            ## front of it, and `execWallTime` already contains
+                            ## it at any depth that spawned anything (A2b, and
+                            ## the overlap follow-up)
 
 let profileNodes = existsEnv("NIMONY_PROFILE_NODES")
   ## `NIMONY_PROFILE_NODES=1` with `--profile`: one stderr line per node,
@@ -457,6 +461,15 @@ type
                          ## (this one included), as the ledger keys them; what
                          ## a per-depth decision is made from. Empty on the
                          ## sequential path, where a depth is one node.
+    decideOnly*: bool    ## ask, do not run. The parallel path asks the whole
+                         ## depth first so it can START the spawned nodes, and
+                         ## only then runs the accepted ones -- on this thread,
+                         ## while the children are in flight. A relay answering
+                         ## a `decideOnly` request must do everything a decline
+                         ## needs (spilling the node's inputs, its own
+                         ## accounting) and nothing an acceptance does:
+                         ## `RunHandledOk` here means "I will run this", and the
+                         ## same node comes back with `decideOnly = false`.
 
   DepthPeer* = object
     name*: string    ## the `cmd` name
@@ -477,7 +490,7 @@ proc relayInstalled*(): bool =
 
 proc offerNode(parts: seq[CmdArg]; name, command: string; node: Node;
                baseDir: string; readyAtDepth: int; depthSeq: int;
-               peers: seq[DepthPeer]): RunNodeStatus =
+               peers: seq[DepthPeer]; decideOnly = false): RunNodeStatus =
   ## Ask the relay. Named so the two paths in `runDag` agree, and guarded so
   ## the default relay costs nothing: assembling the request copies five
   ## `seq`s per node, and the make loop runs it for every node of every depth.
@@ -487,7 +500,7 @@ proc offerNode(parts: seq[CmdArg]; name, command: string; node: Node;
     argv: argvOf(parts), rawArgs: hasRawArgs(parts),
     inputs: node.inputs, outputs: node.outputs, args: node.args,
     baseDir: baseDir, readyAtDepth: readyAtDepth, depthSeq: depthSeq,
-    depthPeers: peers))
+    depthPeers: peers, decideOnly: decideOnly))
 
 # --- the cost ledger ------------------------------------------------------
 #
@@ -584,6 +597,157 @@ proc finish(p: Progressor) =
     stdout.write "\n"
     stdout.flushFile()
 
+# --- a depth's spawned batch --------------------------------------------
+#
+# `execProcesses` starts a depth's children and does not come back until the
+# last one is reaped, so a depth's in-process nodes could only run before it or
+# after it -- and A2b ran them BEFORE, which put their serial time in front of
+# the fan-out instead of inside it (~0.1 s on a forced stdlib rebuild;
+# `bench/results/2026-09-06/progress.md` run 3b, and the follow-up named in
+# JIT_IMPL.md's A2b row). `SpawnBatch` is the same loop with the starting split
+# from the waiting: `fill` occupies the job slots, `poll` reaps what has
+# finished without blocking (called between in-process nodes), `drain` finishes
+# the batch.
+#
+# `execProcesses`'s semantics are kept exactly: at most `jobs` children at a
+# time, the same `{poStdErrToStdOut, poParentStreams, poEvalCommand}` options,
+# the same "mark it Running and stamp its start time" before a child starts and
+# the same accounting after one exits, and the highest ABSOLUTE exit code as
+# the result. One thing is deliberately not copied: `waitpid(-1, ...)`, which
+# reaps ANY child of this process. It is safe inside `execProcesses`, which
+# owns every child for its whole duration; it is not safe here, where the point
+# is that this thread is running an in-process nimsem node beside the batch and
+# that node may spawn a sub-compile of its own.
+
+type
+  SpawnBatch = object
+    ## One DAG depth's spawned nodes. The per-command `seq`s are parallel and
+    ## indexed by command; `slotProc`/`slotCmd` are indexed by job slot, and a
+    ## `nil` in `slotProc` is a free slot.
+    commands: seq[string]
+    cmdNames: seq[string]
+    labels: seq[string]
+    modules: seq[string]
+    startTimes: seq[MonoTime]
+    status: seq[CmdStatus]
+    slotProc: seq[Process]
+    slotCmd: seq[int]
+    started: int      ## commands handed to a process so far
+    reaped: int       ## commands whose process has been waited for
+    maxExitCode: int
+
+proc initSpawnBatch(commands, cmdNames, labels, modules: seq[string];
+                    maxJobs: int): SpawnBatch =
+  ## `maxJobs` of 0 means "all cores", which is `execProcesses`'s own default
+  ## and therefore what `--parallel`/`-j` without a number has always meant.
+  let n = commands.len
+  var slots = maxJobs
+  if slots <= 0: slots = countProcessors()
+  if slots < 1: slots = 1
+  if slots > n: slots = n
+  result = SpawnBatch(
+    commands: commands, cmdNames: cmdNames, labels: labels, modules: modules,
+    startTimes: newSeq[MonoTime](n), status: newSeq[CmdStatus](n),
+    slotProc: newSeq[Process](slots), slotCmd: newSeq[int](slots),
+    started: 0, reaped: 0, maxExitCode: 0)
+
+proc fill(b: var SpawnBatch) =
+  ## Start a child in every free slot until the batch runs out of commands.
+  for s in 0 ..< b.slotProc.len:
+    if b.started >= b.commands.len: break
+    if b.slotProc[s] != nil: continue
+    let idx = b.started
+    b.status[idx] = Running
+    b.startTimes[idx] = getMonoTime()
+    b.slotProc[s] = startProcess(b.commands[idx],
+      options = {poStdErrToStdOut, poParentStreams, poEvalCommand})
+    b.slotCmd[s] = idx
+    inc b.started
+
+proc reapSlot(b: var SpawnBatch; s: int; prog: var Progressor;
+              spawns: var SpawnLog; profile: ptr ProfileData) =
+  ## An exited child: its exit code into the batch's, its wall time into the
+  ## ledger and the profile, its slot back into the pool. Exactly what
+  ## `afterRunEvent` did, inline, because a closure per depth is what
+  ## AGENTS.md asks this module not to grow.
+  let idx = b.slotCmd[s]
+  let p = b.slotProc[s]
+  let code = abs(p.peekExitCode())
+  if code > b.maxExitCode: b.maxExitCode = code
+  b.status[idx] = Finished
+  inc prog.done
+  prog.draw(b.labels[idx])
+  spawns.noteCommand(b.cmdNames[idx], b.modules[idx], b.startTimes[idx])
+  if profile != nil:
+    let sec = toSeconds(getMonoTime() - b.startTimes[idx])
+    profile[].recordCmdTime(b.cmdNames[idx], sec)
+    if profileNodes:
+      stderr.writeLine "[node] spawn  " & b.cmdNames[idx] & " " & b.modules[idx] &
+        " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $b.commands.len
+  close(p)
+  b.slotProc[s] = nil
+  inc b.reaped
+
+proc poll(b: var SpawnBatch; prog: var Progressor; spawns: var SpawnLog;
+          profile: ptr ProfileData): bool =
+  ## Reap every child that has already exited and refill the slots it freed,
+  ## without ever blocking. Called between in-process nodes, so a child that
+  ## finished while this thread was busy is replaced right away instead of
+  ## leaving a core idle until the drain.
+  result = false
+  for s in 0 ..< b.slotProc.len:
+    if b.slotProc[s] == nil: continue
+    if running(b.slotProc[s]): continue
+    reapSlot(b, s, prog, spawns, profile)
+    result = true
+  if result: fill(b)
+
+proc firstLiveSlot(b: SpawnBatch): int =
+  result = -1
+  for s in 0 ..< b.slotProc.len:
+    if b.slotProc[s] != nil: return s
+
+proc drain(b: var SpawnBatch; prog: var Progressor; spawns: var SpawnLog;
+           profile: ptr ProfileData): int =
+  ## Finish the batch and answer with the highest absolute exit code, which is
+  ## what `execProcesses` returned.
+  ##
+  ## How it waits depends on whether there is anything left to START, because
+  ## that is what decides whether waiting on the WRONG child costs anything:
+  ##
+  ## * commands still queued -- a slot that frees up has to be refilled at
+  ##   once, so the wait has to wake on *whichever* child finishes first.
+  ##   `execProcesses` gets that from `waitpid(-1, ...)`, which is not
+  ##   available here (see the note above `SpawnBatch`), so this polls on a
+  ##   1 ms tick. Half a millisecond of slot idle per completion, against a
+  ##   node that costs tens of them.
+  ## * nothing queued -- every remaining child only has to finish, and no slot
+  ##   is waiting for one. Blocking on any of them is then exact and free, so
+  ##   the tail of every batch, and every batch that fits in the slots at once
+  ##   (a single `link` node, most depths of an edit rebuild), never polls.
+  fill(b)
+  while b.reaped < b.commands.len:
+    if poll(b, prog, spawns, profile): continue
+    let live = firstLiveSlot(b)
+    if live < 0: break   # no child left and none to start: nothing to wait for
+    if b.started < b.commands.len:
+      sleep(1)
+    else:
+      discard waitForExit(b.slotProc[live])
+      reapSlot(b, live, prog, spawns, profile)
+  result = b.maxExitCode
+
+type
+  InprocNode = object
+    ## A node the relay has ACCEPTED but not yet run. The whole depth is
+    ## decided before anything starts, so the spawned half can be in flight
+    ## while this half runs on this thread; the expansion is kept because it
+    ## is what the second, running offer is made with.
+    nodeId: int
+    parts: seq[CmdArg]
+    command: string
+    name: string
+
 proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
              progressLo = 0; progressHi = 100; maxJobs = 0): bool =
   ## Execute the DAG in topological order.
@@ -651,7 +815,12 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           peers.add DepthPeer(name: dag.commands[dag.nodes[nodeId].cmdIdx].name,
                               module: ledgerModuleOf(dag.nodes[nodeId]))
 
-      # Pass 2: offer each one to the relay, and collect what it declines.
+      # Pass 2: DECIDE the whole depth. Nothing runs here -- the relay is asked
+      # with `decideOnly`, so it still declines (and spills the declined
+      # node's inputs) exactly as before, but an acceptance is a promise, not
+      # a result. The depth's spawned nodes therefore start before its
+      # in-process nodes run instead of after them.
+      var inprocNodes: seq[InprocNode] = @[]
       for nodeId in pending:
         let node = addr dag.nodes[nodeId]
         if Force in opt:
@@ -663,32 +832,38 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
         if Verbose in opt:
           echo "Command: ", expandedCmd
         let cmdName = dag.commands[node.cmdIdx].name
-        let inprocStart = getMonoTime()
         case offerNode(parts, cmdName, expandedCmd, node[], dag.baseDir, pending.len,
-                       depthSeq, peers)
+                       depthSeq, peers, decideOnly = true)
         of RunSpawn:
           commands.add(expandedCmd)
           nodeIds.add(nodeId)
           cmdNames.add(cmdName)
           labels.add(nodeLabel(dag, node[]))
           modules.add(ledgerModuleOf(node[]))
-        of RunHandledOk:
-          # An in-process node still counts as an executed command, so
-          # `--report` keeps meaning what it meant, and its wall time is
-          # attributed to its phase the way a spawned one's is -- the clock
-          # was already running for the ledger, so `--profile` gets the number
-          # for free.
-          inc prog.done
-          inc profileInproc
-          prog.draw(nodeLabel(dag, node[]))
-          if profile != nil:
-            let sec = toSeconds(getMonoTime() - inprocStart)
-            profile[].recordCmdTime(cmdName, sec)
-            profile[].inprocWallTime += sec
-            if profileNodes:
-              stderr.writeLine "[node] inproc " & cmdName & " " & ledgerModuleOf(node[]) &
-                " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $pending.len
-        of RunHandledFailed:
+        of RunHandledOk, RunHandledFailed:
+          # `RunHandledFailed` cannot come out of a `decideOnly` offer -- a
+          # relay that ran nothing has nothing to fail -- and is folded in
+          # here rather than rejected so a relay that answers it anyway is
+          # simply run and allowed to fail below.
+          inprocNodes.add InprocNode(nodeId: nodeId, parts: parts,
+                                     command: expandedCmd, name: cmdName)
+
+      # Pass 3: start the children, run the in-process nodes on this thread
+      # while they run, then drain. The depth's wall is now the fan-out's,
+      # with the serial half hidden inside it.
+      let depthStart = if profile != nil: getMonoTime() else: MonoTime()
+      var batch = initSpawnBatch(commands, cmdNames, labels, modules, maxJobs)
+      if commands.len > 0:
+        fill(batch)
+
+      var inprocFailure = ""
+      for k in 0 ..< inprocNodes.len:
+        let node = addr dag.nodes[inprocNodes[k].nodeId]
+        let cmdName = inprocNodes[k].name
+        let inprocStart = getMonoTime()
+        let status = offerNode(inprocNodes[k].parts, cmdName, inprocNodes[k].command,
+                               node[], dag.baseDir, pending.len, depthSeq, peers)
+        if status == RunHandledFailed:
           if prog.active:
             stdout.write "\n"
             stdout.flushFile()
@@ -696,51 +871,55 @@ proc runDag*(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
           if profile != nil:
             profile[].recordCmdTime(cmdName, toSeconds(getMonoTime() - inprocStart))
             profile[].inproc = profileInproc
-          failed expandedCmd
-          return false
-
-      # Execute all commands at this depth in parallel
-      if commands.len > 0:
-        var progress = newSeq[CmdStatus](commands.len)
-        # The clock reads are unconditional now: the ledger wants every
-        # command's wall time, not only a `--profile` run's. Two `getMonoTime`
-        # calls against a process spawn is three orders of magnitude apart.
-        var startTimes = newSeq[MonoTime](commands.len)
-        let depthStart = if profile != nil: getMonoTime() else: MonoTime()
-
-        proc beforeRunEvent(idx: int) =
-          progress[idx] = Running
-          startTimes[idx] = getMonoTime()
-
-        proc afterRunEvent(idx: int; p: Process) =
-          progress[idx] = Finished
-          inc prog.done
-          prog.draw(labels[idx])
-          spawns.noteCommand(cmdNames[idx], modules[idx], startTimes[idx])
-          if profile != nil:
-            let sec = toSeconds(getMonoTime() - startTimes[idx])
-            profile[].recordCmdTime(cmdNames[idx], sec)
-            if profileNodes:
-              stderr.writeLine "[node] spawn  " & cmdNames[idx] & " " & modules[idx] &
-                " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $commands.len
-
-        let maxExitCode =
-          if maxJobs > 0:
-            execProcesses(commands, n = maxJobs,
-                          beforeRunEvent = beforeRunEvent, afterRunEvent = afterRunEvent)
-          else:
-            execProcesses(commands,
-                          beforeRunEvent = beforeRunEvent, afterRunEvent = afterRunEvent)
+          failed inprocNodes[k].command
+          inprocFailure = inprocNodes[k].command
+          break
+        # `RunSpawn` here would mean the relay changed its mind between the
+        # two offers, which the per-depth memo of `phases.wantsInproc` rules
+        # out; running it as an in-process node that did nothing would silently
+        # skip it, so it is treated as the failure it is.
+        if status == RunSpawn:
+          failed "nifmake: relay declined a node it had accepted: " & inprocNodes[k].command
+          inprocFailure = inprocNodes[k].command
+          break
+        # An in-process node still counts as an executed command, so `--report`
+        # keeps meaning what it meant, and its wall time is attributed to its
+        # phase the way a spawned one's is -- the clock was already running for
+        # the ledger, so `--profile` gets the number for free.
+        inc prog.done
+        inc profileInproc
+        prog.draw(nodeLabel(dag, node[]))
         if profile != nil:
-          profile[].execWallTime += toSeconds(getMonoTime() - depthStart)
-        if maxExitCode != 0:
-          if prog.active:
-            stdout.write "\n"
-            stdout.flushFile()
-          for i, p in pairs(progress):
-            if p == Running:
-              failed commands[i]
-          return false
+          let sec = toSeconds(getMonoTime() - inprocStart)
+          profile[].recordCmdTime(cmdName, sec)
+          profile[].inprocWallTime += sec
+          if profileNodes:
+            stderr.writeLine "[node] inproc " & cmdName & " " & ledgerModuleOf(node[]) &
+              " " & sec.formatFloat(ffDecimal, 4) & " ready=" & $pending.len
+        # Give the finished children their slots back before the next node:
+        # this thread is the only one that can start a replacement.
+        if commands.len > 0:
+          discard poll(batch, prog, spawns, profile)
+
+      let maxExitCode =
+        if commands.len > 0: drain(batch, prog, spawns, profile)
+        else: 0
+      if commands.len > 0 and profile != nil:
+        profile[].execWallTime += toSeconds(getMonoTime() - depthStart)
+      # The in-process failure is reported first (it happened first) but the
+      # children are drained before returning: they are this process's, and
+      # leaving them writing into a build that has already failed is worse
+      # than the fraction of a second it costs to let them finish.
+      if inprocFailure.len > 0:
+        return false
+      if maxExitCode != 0:
+        if prog.active:
+          stdout.write "\n"
+          stdout.flushFile()
+        for i, st in pairs(batch.status):
+          if st == Running:
+            failed batch.commands[i]
+        return false
   else:
     # Sequential execution
     for nodeId in sortedNodes:
@@ -1049,5 +1228,6 @@ proc profileText*(profile: ProfileData): string =
   result.add "  in-process:     " & $profile.inproc & " of " &
              $(profile.cmdTime.values.toSeq.foldl(a + b.count, 0)) & " commands\n"
   result.add "  wall time:      " & profile.execWallTime.formatFloat(ffDecimal, 3) &
-             "s  (+ " & profile.inprocWallTime.formatFloat(ffDecimal, 3) & "s in-process, serial)\n"
+             "s  (" & profile.inprocWallTime.formatFloat(ffDecimal, 3) &
+             "s in-process, serial, overlapping it)\n"
   result.add "---\n"
