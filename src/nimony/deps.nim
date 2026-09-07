@@ -881,7 +881,12 @@ proc defineHexerCmds(b: var Builder; hexer: string; bits: int; bigEndian: bool;
 
   # Split DCE: liveness phase (single, fast) + per-module emit (parallel).
   # `dceLive` reads every module's .dce.nif analysis, computes the global
-  # live set + generic-resolve table, writes a shared .live.nif.
+  # live set + generic-resolve table, and writes one `<M>.live.nif` per module
+  # plus the whole-program `<main>.all.live.nif` (`--split`, JIT_IMPL.md P0c).
+  # Only output 0 -- the whole-program file -- reaches argv; the per-module
+  # files are declared as outputs so that nifmake knows which node produces
+  # them (and rebuilds when one is missing), and `hexer dl` derives their paths
+  # from `--split:<dir>` itself.
   b.withTree "cmd":
     b.addSymbolDef "dceLive"
     b.addStrLit hexer
@@ -892,10 +897,12 @@ proc defineHexerCmds(b: var Builder; hexer: string; bits: int; bigEndian: bool;
     b.withTree "input":
       b.addIntLit 0
       b.addIntLit -1
-    b.addKeyw "output"
+    b.withTree "output":
+      b.addIntLit 0
+      b.addIntLit 0
 
-  # `dceEmit` rewrites one .x.nif into .c.nif using the shared .live.nif.
-  # Independent across modules, so nifmake can run them in parallel.
+  # `dceEmit` rewrites one .x.nif into .c.nif using that module's own
+  # .live.nif. Independent across modules, so nifmake can run them in parallel.
   # Output path is derived from `--outdir` + input modname (mirrors how
   # `hexer c` derives outputs), so no explicit output slot here.
   b.withTree "cmd":
@@ -907,7 +914,7 @@ proc defineHexerCmds(b: var Builder; hexer: string; bits: int; bigEndian: bool;
     b.addKeyw "args"
     b.withTree "input":
       b.addIntLit 0  # M.x.nif
-      b.addIntLit 1  # main.live.nif
+      b.addIntLit 1  # M.live.nif
 
 proc generateDocBuildFile(c: DepContext): string =
   ## Doc backend: each per-module `dagon module` rule produces both a `.html`
@@ -1476,13 +1483,22 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
     if c.cmd in {DoCompile, DoRun}:
       let backend = c.config.backendDirName(c.rootNode.files[0])
       let backendDir = c.config.nifcachePath / backend
-      let liveFile = backendDir / c.rootNode.files[0].modname & ".live.nif"
+      # The whole-program live file. It is the `dceLive` node's ALWAYS-written
+      # output and nothing reads it during a build: it exists so the node has a
+      # staleness anchor, because all of its per-module outputs are written
+      # `OnlyIfChanged` and a run that changed none of them would otherwise
+      # leave every output older than the input that woke it (see
+      # `dag.needsRebuild`'s "freshest output" comment). `.all.` keeps it apart
+      # from the main module's own `<main>.live.nif`.
+      let liveFile = backendDir / c.rootNode.files[0].modname & ".all.live.nif"
 
       # Split DCE — phase 1: collect every module's .dce.nif analysis,
       # compute the global live set + generic-instance resolve table,
-      # write the shared <main>.live.nif. Single small serial node.
+      # write one <M>.live.nif per module. Single small serial node.
       b.withTree "do":
         b.addIdent "dceLive"
+        b.withTree "args":
+          b.addStrLit "--split:" & backendDir
         for i, n in pairs c.nodes:
           # The .dce.nif sits next to its corresponding .x.nif.
           var dceFile = ""
@@ -1494,10 +1510,15 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
             b.addStrLit dceFile
         b.withTree "output":
           b.addStrLit liveFile
+        for n in c.nodes:
+          b.withTree "output":
+            b.addStrLit backendDir / n.files[0].modname & ".live.nif"
 
       # Split DCE — phase 2: per-module emit. Each `(do dceEmit ...)` is
-      # independent (all share live.nif as a read-only input), so nifmake
-      # parallelises them across cores.
+      # independent, so nifmake parallelises them across cores. Its live-set
+      # input is its OWN module's file: an edit that does not move a module's
+      # live set leaves that file's mtime alone, so this node does not re-run
+      # and neither do the `lengc`/`cc` nodes below it (JIT_IMPL.md P0c).
       for i, n in pairs c.nodes:
         b.withTree "do":
           b.addIdent "dceEmit"
@@ -1510,7 +1531,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
             else:
               b.addStrLit c.config.hexedFile(n.files[0])
           b.withTree "input":
-            b.addStrLit liveFile
+            b.addStrLit backendDir / n.files[0].modname & ".live.nif"
           b.withTree "output":
             b.addStrLit c.config.lengcFile(n.files[0], backend)
 

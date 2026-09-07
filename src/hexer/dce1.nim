@@ -9,7 +9,7 @@
 
 ## Prepare for dead code elimination and generic instance merging.
 
-import std / [assertions, tables, hashes, sets, syncio]
+import std / [assertions, tables, hashes, sets, syncio, algorithm]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / lengc / [leng_model]
@@ -90,24 +90,55 @@ proc analyzeModule*(n: Cursor): ModuleAnalysis =
   result = ModuleAnalysis()
   tr n, result, SymId(0)
 
+proc cmpSymNames*(a, b: string): int =
+  ## `sort` needs an explicit comparator under Nimony, whose stdlib has no
+  ## generic `cmp`. Same idiom as `deps.cmpNames`.
+  if a < b: -1 elif a > b: 1 else: 0
+
+proc sortedSymNames*(syms: HashSet[SymId]): seq[string] =
+  ## The symbol names of `syms`, in a deterministic order.
+  ##
+  ## A `HashSet[SymId]` iterates in hash order of the POOL INDEX, and a pool
+  ## index depends on the order in which the whole process interned symbols.
+  ## Adding one symbol to a module therefore reshuffles every set that
+  ## mentions symbols interned after it, and the `.dce.nif` bytes change even
+  ## though the analysis did not (JIT_IMPL.md P0c; `notes/p0c.md` section 1).
+  ## Sorting by name makes the file a function of its content alone, which is
+  ## what `OnlyIfChanged` needs in order to mean anything.
+  result = newSeq[string](0)
+  for s in syms: result.add pool.syms[s]
+  sort result, cmpSymNames
+
 proc writeAnalysis*(outputFilename: string; a: var ModuleAnalysis;
                     dottedSuffix: string) =
   ## Serialize one `ModuleAnalysis` as `.dce.nif`. Symbols are abbreviated
   ## against `dottedSuffix`; `readModuleAnalysis` expands them again from the
   ## file name, so the round trip is the identity.
+  ##
+  ## Everything is emitted in sorted-by-name order (see `sortedSymNames`), so two
+  ## runs that computed the same analysis produce the same bytes and the
+  ## `OnlyIfChanged` write preserves the mtime. `parseAnalysis` reads into
+  ## sets and tables, so the order is not observable anywhere else.
   var b = nifbuilder.open(outputFilename, writeMode = OnlyIfChanged)
   b.withTree "stmts":
     b.withTree rootName:
-      for root in a.roots:
-        b.addSymbol pool.syms[root], dottedSuffix
-    for owner, uses in mpairs(a.uses):
+      for root in sortedSymNames(a.roots):
+        b.addSymbol root, dottedSuffix
+    var owners = newSeq[string](0)
+    var byName = initTable[string, SymId]()
+    for owner in a.uses.keys:
+      let n = pool.syms[owner]
+      owners.add n
+      byName[n] = owner
+    sort owners, cmpSymNames
+    for owner in owners:
       b.withTree depName:
-        b.addSymbol pool.syms[owner], dottedSuffix
-        for dep in uses:
-          b.addSymbol pool.syms[dep], dottedSuffix
+        b.addSymbol owner, dottedSuffix
+        for dep in sortedSymNames(a.uses.getOrQuit(byName.getOrQuit(owner))):
+          b.addSymbol dep, dottedSuffix
     b.withTree offerName:
-      for offer in a.offers:
-        b.addSymbol pool.syms[offer], dottedSuffix
+      for offer in sortedSymNames(a.offers):
+        b.addSymbol offer, dottedSuffix
   b.close()
 
 proc parseAnalysis*(n0: Cursor; ctx: string): ModuleAnalysis =

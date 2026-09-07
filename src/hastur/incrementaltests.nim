@@ -757,3 +757,151 @@ proc incrementalInprocTests*() =
     quit "FAILURE: " & $failures.len & " inproc phase(s) failed."
   echo "inproc: ", phases, " / ", phases, " phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."
+
+# ---- Per-module DCE live sets (JIT_IMPL.md P0c) ----------------------------
+# `dceLive` used to write ONE whole-program `.live.nif` that every `dceEmit`
+# node read, and it serialised `HashSet[SymId]` in hash order of a pool index
+# -- so one new symbol anywhere reshuffled the file, its `OnlyIfChanged` write
+# fired, and all N `dceEmit` nodes re-ran to produce N identical `.c.nif`
+# files (127 of them, 1.6 s of CPU, on the compiler compiling itself). It now
+# writes one `<M>.live.nif` per module, sorted by symbol name, so a module
+# whose live set did not move keeps its file and its `dceEmit` node.
+#
+# These phases assert that on a three-module chain, which is small enough to
+# name every expected count.
+
+proc incrementalLiveTests*(mode = "") =
+  ## Drive `bin/nimony c --report` over `tests/incremental/p0c_main.nim`
+  ## through edits whose blast radius is known exactly, and assert how many
+  ## `dceEmit`/`lengc`/`cc` nodes re-ran. Restores the fixture regardless of
+  ## outcome.
+  let t0 = epochTime()
+  let leaf = "tests/incremental/p0c_leaf.nim"
+  let mid = "tests/incremental/p0c_mid.nim"
+  let src = "tests/incremental/p0c_main.nim"
+  let modeFlag = if mode.len > 0: " " & mode else: ""
+  let suffix = if mode.len > 0: "-" & modeTag(mode) else: ""
+  let cache = "nimcache" / ("live" & suffix)
+  let nimony = "bin" / "nimony".addFileExt(ExeExt)
+  for f in [leaf, mid, src]:
+    if not fileExists(f):
+      quit "incremental-live: " & f & " missing"
+  if not fileExists(nimony):
+    quit "incremental-live: " & nimony & " not found; run `hastur build nimony` first"
+  removeDir cache
+
+  let baseCmd = nimony.quoteShell & " c -r --silentMake --report" & modeFlag &
+                " --nimcache:" & cache.quoteShell & " " & src.quoteShell
+  let originalLeaf = readFile(leaf)
+  let originalMid = readFile(mid)
+
+  proc restoreSources() =
+    writeFile(leaf, originalLeaf)
+    writeFile(mid, originalMid)
+
+  var lastOutput = ""
+  proc run(label: string): seq[seq[ReportEntry]] =
+    let (output, ec) = execCmdEx(baseCmd)
+    lastOutput = output
+    if ec != 0:
+      stdout.write output
+      restoreSources()
+      quit "incremental-live: '" & label & "' compile failed"
+    parseNifmakeReports(output)
+
+  var failures: seq[string] = @[]
+  var phases = 0
+  template expect(cond: bool; msg: string) =
+    if not (cond): failures.add msg
+
+  # Phase 1: cold. Six modules -- main, mid, leaf, system, syncio and the
+  # formatfloat helper -- so every count below is out of six.
+  inc phases
+  block:
+    let r = run("cold")
+    expect r.len == 2, "cold: expected 2 nifmake invocations, got " & $r.len
+    if r.len == 2:
+      expect reportField(r[1], "dceEmit") >= 3,
+             "cold: only " & $reportField(r[1], "dceEmit") & " dceEmit nodes ran"
+    expect lastOutput.contains("50"),
+           "cold: expected the program to print 50"
+
+  # Phase 2: a BODY-ONLY edit of the leaf -- a private proc appended plus the
+  # module-init line that uses it. No module's interface changes, so nothing
+  # re-sems but the leaf, and no other module's live set moves. Exactly one
+  # `dceEmit` and exactly one `cc` may run. (`lengc` runs twice: the importer
+  # declares the callee's `.c.nif` as an inline source input, so its codegen
+  # re-runs -- but it writes identical bytes, which is why `cc` stays at 1.)
+  inc phases
+  block:
+    writeFile(leaf, originalLeaf &
+      "\nproc p0cLeafPrivate(): int = 7\n\nleafBonus = p0cLeafPrivate()\n")
+    let r = run("body-edit")
+    if r.len == 2:
+      expect reportField(r[1], "dceEmit") == 1,
+             "body-edit: dceEmit ran " & $reportField(r[1], "dceEmit") &
+             " times (expected 1: only the leaf's live set file moved)"
+      expect reportField(r[1], "cc") == 1,
+             "body-edit: cc ran " & $reportField(r[1], "cc") &
+             " times (expected 1)"
+      expect reportField(r[1], "lengc") >= 1,
+             "body-edit: lengc did not re-run for the edited module"
+    expect lastOutput.contains("57"),
+           "body-edit: expected the program to print 57"
+
+  # Phase 3: a no-op rebuild right after that edit. This is the perpetual-
+  # staleness check: the `dceEmit` nodes write their `.c.nif` OnlyIfChanged, so
+  # an emit that changed nothing preserves an mtime OLDER than the live file
+  # that woke it. Before P0c the whole-program `.live.nif` made all of them
+  # look stale forever, and a second no-change build re-ran the fan-out again.
+  inc phases
+  block:
+    let r = run("body-noop")
+    if r.len == 2:
+      expect reportField(r[1], "dceEmit") == 0,
+             "body-noop: dceEmit re-ran " & $reportField(r[1], "dceEmit") &
+             " times with nothing changed"
+      expect reportField(r[1], "dceLive") == 0,
+             "body-noop: dceLive re-ran with nothing changed"
+      expect reportField(r[1], "cc") == 0,
+             "body-noop: cc re-ran " & $reportField(r[1], "cc") & " times"
+    writeFile(leaf, originalLeaf)
+    discard run("resettle")
+
+  # Phase 4: an edit that MOVES a live set. `p0c_leaf.leafDead` is exported and
+  # called by nobody, so DCE drops it; making the middle module call it makes
+  # it live. Two modules must re-emit -- the leaf, whose live set gained a
+  # symbol, and the middle module, whose own Leng changed -- and no more:
+  # `system`, `std/syncio` and the main module are untouched.
+  inc phases
+  block:
+    writeFile(mid, originalMid.replace("leafUsed(x) * 10 + leafBonus",
+                                       "leafUsed(x) * 10 + leafBonus + leafDead(x)"))
+    let r = run("live-edit")
+    if r.len == 2:
+      expect reportField(r[1], "dceEmit") == 2,
+             "live-edit: dceEmit ran " & $reportField(r[1], "dceEmit") &
+             " times (expected 2: the leaf and the middle module)"
+      expect reportField(r[1], "cc") == 2,
+             "live-edit: cc ran " & $reportField(r[1], "cc") &
+             " times (expected 2)"
+    expect lastOutput.contains("56"),
+           "live-edit: expected the program to print 56"
+
+  # Phase 5: and the no-op after THAT, for the same reason as phase 3.
+  inc phases
+  block:
+    let r = run("live-noop")
+    if r.len == 2:
+      expect reportField(r[1], "dceEmit") == 0,
+             "live-noop: dceEmit re-ran " & $reportField(r[1], "dceEmit") &
+             " times with nothing changed"
+
+  restoreSources()
+
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "incremental-live" & modeLabel(mode) & ": " & f
+    quit "FAILURE: " & $failures.len & " incremental-live phase(s) failed."
+  echo "incremental-live", modeLabel(mode), ": ", phases, " / ", phases,
+       " phases successful in ", formatFloat(dt, ffDecimal, precision=2), "s."

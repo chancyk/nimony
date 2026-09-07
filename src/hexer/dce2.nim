@@ -9,7 +9,7 @@
 
 ## Dead code elimination and generic instance merging.
 
-import std / [os, tables, hashes, sets, assertions, syncio]
+import std / [os, tables, hashes, sets, assertions, syncio, algorithm]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 
@@ -278,34 +278,61 @@ proc addAnalysis*(inp: var DceInputs; name: string; a: sink ModuleAnalysis) =
   inp.names.add name
   inp.analyses.add a
 
-proc writeLiveFile*(outfile: string; resolved: ResolveTable;
-                    live: Table[string, HashSet[SymId]]) =
-  ## Serialize the global DCE result to a single file consumed by all
-  ## downstream `dceEmit` invocations. Symbols are written with their
-  ## full module suffix (no abbreviation): the dotted-suffix shortcut
-  ## expands using the reader's `thisModule` which is derived from the
-  ## filename, but this file aggregates symbols from many modules — only
-  ## one expansion would be correct, all the others would be wrong. So
-  ## we pay the file-size cost rather than mis-expand.
-  var b = nifbuilder.open(outfile, writeMode = OnlyIfChanged)
-  b.withTree "stmts":
-    b.withTree resolveTag:
-      for key, winner in pairs(resolved):
+proc addResolved(b: var Builder; resolved: ResolveTable; keys: openArray[string]) =
+  ## `(resolved (kv key winner)*)` for `keys`, which the caller has sorted.
+  b.withTree resolveTag:
+    for key in keys:
+      if resolved.hasKey(key):
         b.withTree "kv":
           b.addStrLit key
-          b.addSymbol pool.syms[winner], ""
+          b.addSymbol pool.syms[resolved.getOrQuit(key)], ""
+
+proc addLiveMod(b: var Builder; modName: string; syms: HashSet[SymId]) =
+  ## One `(mod "name" sym*)` block, symbols in sorted-by-name order.
+  b.withTree modTag:
+    b.addStrLit modName
+    for s in sortedSymNames(syms):
+      b.addSymbol s, ""
+
+proc sortedResolveKeys(resolved: ResolveTable): seq[string] =
+  result = newSeq[string](0)
+  for key in resolved.keys: result.add key
+  sort result, cmpSymNames
+
+proc writeLiveFile*(outfile: string; resolved: ResolveTable;
+                    live: Table[string, HashSet[SymId]];
+                    mode = OnlyIfChanged) =
+  ## Serialize the whole-program DCE result. Symbols are written with their
+  ## full module suffix (no abbreviation): the dotted-suffix shortcut
+  ## expands using the reader's `thisModule` which is derived from the
+  ## filename, but this file aggregates symbols from many modules -- only
+  ## one expansion would be correct, all the others would be wrong. So
+  ## we pay the file-size cost rather than mis-expand.
+  ##
+  ## Everything is emitted sorted by NAME. A `Table`/`HashSet` keyed by
+  ## `SymId` iterates in hash order of a pool index, and a pool index depends
+  ## on the order in which this process happened to intern symbols -- so one
+  ## extra symbol anywhere in the program reshuffled the entire file and the
+  ## `OnlyIfChanged` write below never fired. That is what made a body-only
+  ## edit re-run all 127 `dceEmit` nodes (JIT_IMPL.md P0c, `notes/p0c.md`).
+  ##
+  ## `mode` is `AlwaysWrite` when this file is the `dceLive` node's staleness
+  ## anchor; see `writeModuleLiveFiles`.
+  var b = nifbuilder.open(outfile, writeMode = mode)
+  b.withTree "stmts":
+    addResolved b, resolved, sortedResolveKeys(resolved)
     b.withTree liveTag:
-      for modName, syms in pairs(live):
-        b.withTree modTag:
-          b.addStrLit modName
-          for s in syms:
-            b.addSymbol pool.syms[s], ""
+      var mods = newSeq[string](0)
+      for modName in live.keys: mods.add modName
+      sort mods, cmpSymNames
+      for modName in mods:
+        addLiveMod b, modName, live.getOrQuit(modName)
   b.close()
 
-proc writeLiveFile*(outfile: string; ls: LiveSet) {.inline.} =
+proc writeLiveFile*(outfile: string; ls: LiveSet; mode = OnlyIfChanged) {.inline.} =
   ## Overload over the result object, so a caller that keeps a `LiveSet`
   ## around does not have to take it apart again.
-  writeLiveFile(outfile, ls.resolved, ls.live)
+  writeLiveFile(outfile, ls.resolved, ls.live, mode)
 
 proc parseLiveSet*(n0: Cursor; ctx: string): LiveSet =
   ## The buffer-level reader for a `.live.nif`. `ctx` only names the source in
@@ -390,28 +417,98 @@ proc loadDceInputs*(dceFiles: openArray[string]; t: var PhaseTimer): DceInputs =
   for file in dceFiles:
     result.addAnalysis(splitModulePath(file).name, readModuleAnalysis(file, t))
 
-proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string;
-                     t: var PhaseTimer) =
-  ## Path-based wrapper: read the `.dce.nif` analyses, compute the global
-  ## resolve table + live sets, and write them to `liveOut`. This is the
-  ## small serial step in the split DCE pipeline.
-  let inputs = loadDceInputs(dceFiles, t)
-  let ls = computeLiveSet(inputs)
-  t.noteProduce()
-  writeLiveFile(liveOut, ls)
-  t.noteWrite()
-
-proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string) =
-  ## Untimed path-based wrapper (the pre-A2a signature).
-  var t = initPhaseTimer("", "", "")
-  computeLiveSet(dceFiles, liveOut, t)
-
 proc liveOf*(ls: LiveSet; modName: string): HashSet[SymId] =
   ## What `modName` has to keep. A module the liveness phase never saw keeps
   ## nothing, which is what makes an unreferenced module compile to an empty
   ## `.c.nif` rather than a crash.
   if ls.live.hasKey(modName): ls.live.getOrQuit(modName)
   else: initHashSet[SymId]()
+
+proc addInstantiationKey(keys: var HashSet[string]; sym: SymId) {.inline.} =
+  let name = pool.syms[sym]
+  if isInstantiation(name): keys.incl removeModule(name)
+
+proc resolveKeysOf(a: ModuleAnalysis; liveSyms: HashSet[SymId]): seq[string] =
+  ## Every resolve-table key a module can ever look up, derived from its own
+  ## analysis. `tr` above calls `translate` for (1) a `TypeS` symbol DEF,
+  ## (2) a non-local, alive `ProcS`/`VarS`/`ConstS`/`GvarS`/`TvarS` symbol
+  ## def, (3) every `Symbol` USE and (4) any other `SymbolDef`. `translate` is
+  ## the identity unless the name `isInstantiation`, and an instantiation name
+  ## always carries a module suffix, so a local name never reaches the table --
+  ## which leaves (4) with nothing but its `fld` half. `dce1.analyzeModule`
+  ## records (1), (2) and that `fld` half in `offers`, and the non-local half
+  ## of (3) in `roots`/`uses`. The live set is folded in as well: those are the
+  ## defs `tr` keeps and then translates.
+  ##
+  ## So this is a superset of what one module's emit can ask for, and a small
+  ## fraction of the whole table -- which is the point: the whole table copied
+  ## into every module's file would be 39 MB on the self-compilation.
+  var keys = initHashSet[string]()
+  for s in a.roots: addInstantiationKey keys, s
+  for s in a.offers: addInstantiationKey keys, s
+  for owner, uses in pairs(a.uses):
+    addInstantiationKey keys, owner
+    for dep in uses: addInstantiationKey keys, dep
+  for s in liveSyms: addInstantiationKey keys, s
+  result = newSeq[string](0)
+  for k in keys: result.add k
+  sort result, cmpSymNames
+
+proc moduleLiveFile*(dir, modName: string): string {.inline.} =
+  ## Where module `modName`'s own live file lives. The whole-program file that
+  ## sits beside it is named `<main>.all.live.nif`, so the two never collide
+  ## even though the main module has a per-module file of its own.
+  dir / modName & ".live.nif"
+
+proc writeModuleLiveFiles*(dir: string; inputs: DceInputs; ls: LiveSet) =
+  ## Split the whole-program result into one `<M>.live.nif` per module, each
+  ## holding exactly what that module's `dceEmit` reads: its own live set and
+  ## the resolve entries it can consult (`resolveKeysOf`). The shape is the
+  ## same as the whole-program file, so `parseLiveSet`, `readLiveFile`,
+  ## `liveOf` and both `dceEmit` overloads need no change.
+  ##
+  ## Each file is written `OnlyIfChanged`, and that is the phase: a module
+  ## whose live set did not move keeps its mtime, nifmake leaves its `dceEmit`
+  ## node alone, and the `lengc`/`cc` below it stay put too. The whole-program
+  ## file is the node's always-written staleness anchor, because a `dceLive`
+  ## run whose outputs are ALL `OnlyIfChanged` and all unchanged would leave
+  ## every output older than the input that woke it and re-fire forever
+  ## (`dag.needsRebuild`'s "freshest output" comment).
+  for i in 0 ..< inputs.names.len:
+    let modName = inputs.names[i]
+    let syms = liveOf(ls, modName)
+    var b = nifbuilder.open(moduleLiveFile(dir, modName), writeMode = OnlyIfChanged)
+    b.withTree "stmts":
+      addResolved b, ls.resolved, resolveKeysOf(inputs.analyses[i], syms)
+      b.withTree liveTag:
+        addLiveMod b, modName, syms
+    b.close()
+
+proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string;
+                     t: var PhaseTimer; splitDir = "") =
+  ## Path-based wrapper: read the `.dce.nif` analyses, compute the global
+  ## resolve table + live sets, and write them to `liveOut`. This is the
+  ## small serial step in the split DCE pipeline.
+  ##
+  ## With `splitDir` (the build graph's `--split:<dir>`) it also writes one
+  ## `<M>.live.nif` per module into that directory, and `liveOut` becomes the
+  ## node's always-written staleness anchor rather than an input of anything.
+  ## Without it the behaviour is exactly the pre-P0c one, which is what a
+  ## hand-run `hexer dl` and `tests/inproc/hexer` get.
+  let inputs = loadDceInputs(dceFiles, t)
+  let ls = computeLiveSet(inputs)
+  t.noteProduce()
+  if splitDir.len > 0:
+    writeLiveFile(liveOut, ls, AlwaysWrite)
+    writeModuleLiveFiles(splitDir, inputs, ls)
+  else:
+    writeLiveFile(liveOut, ls)
+  t.noteWrite()
+
+proc computeLiveSet*(dceFiles: openArray[string]; liveOut: string) =
+  ## Untimed path-based wrapper (the pre-A2a signature).
+  var t = initPhaseTimer("", "", "")
+  computeLiveSet(dceFiles, liveOut, t)
 
 proc dceEmit*(xnif: string; ls: LiveSet; outdir: string;
               t: var PhaseTimer; s: var HexerStatus) =

@@ -32,4 +32,9 @@ incrementalTests("--spawn:always")
 # ... and the scheduler's own assertions: the `inproc` field, byte identity
 # against `--spawn:always`, and a spawn-free compile-time evaluation.
 incrementalInprocTests()
+# P0c: per-module DCE live sets. A three-module chain small enough that every
+# expected `dceEmit`/`cc` count can be named exactly, once per scheduler mode
+# (the counts are per PHASE, so they must not depend on who ran the phase).
+incrementalLiveTests()
+incrementalLiveTests("--spawn:always")
 echo "SUCCESS."

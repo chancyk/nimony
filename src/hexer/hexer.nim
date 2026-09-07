@@ -62,11 +62,15 @@ Usage:
 Command:
   c file.nif                compile semchecked NIF file to Leng
   d file1.nif file2.nif ... perform dead code elimination for the given NIF files
+  dl a.dce.nif ... out.nif  compute the whole-program live set + resolve table
+  de m.x.nif live.nif       emit one module's .c.nif from a live set
 
 Options:
   --bits:N                  `int` has N bits; possible values: 64, 32, 16
   --os:NAME                 target operating system (default: the host's)
-  --outdir:DIR              (d only) write .c.nif outputs to DIR
+  --outdir:DIR              (d, de only) write .c.nif outputs to DIR
+  --split:DIR               (dl only) also write one <M>.live.nif per module
+                            into DIR, each only if its bytes changed
   --isMain                  mark the file as the main module
   --native                  target the native backend (arkham+nifasm, no C)
   --app:TYPE                application type: console, gui, lib, staticlib (default: console)
@@ -178,6 +182,7 @@ proc runHexer*(args: seq[string]): int =
   var bigEndian = false
   var flags = DefaultSettings
   var outdir = ""
+  var splitDir = ""
   var action = ""
   var isMain = false
   var native = false
@@ -209,6 +214,8 @@ proc runHexer*(args: seq[string]): int =
         isWindows = normalize(val) == "windows"
       of "outdir":
         outdir = val
+      of "split":
+        splitDir = val
       of "ismain":
         isMain = true
       of "native":
@@ -267,10 +274,17 @@ proc runHexer*(args: seq[string]): int =
       # Compute the global live set + resolve table from a list of
       # per-module `.dce.nif` analyses. Last argument is the output
       # `.live.nif`; all preceding arguments are the input `.dce.nif`s.
+      #
+      # With `--split:<dir>` the phase additionally writes one
+      # `<M>.live.nif` per module into `<dir>` (`OnlyIfChanged`), which is
+      # what the build graph asks for: `dceEmit` then depends on its own
+      # module's file instead of the whole-program one, so an edit re-emits
+      # only the modules whose live set actually moved (JIT_IMPL.md P0c).
       if files.len < 2:
         return fail "dl: expected <dce-file>... <live-output>"
       var timer = initPhaseTimer(files[^1].parentDir, "dceLive", "")
-      computeLiveSet(files.toOpenArray(0, files.len - 2), files[^1], timer)
+      computeLiveSet(files.toOpenArray(0, files.len - 2), files[^1], timer,
+                     splitDir)
       timer.noteOutput(files[^1])
       timer.finish()
     of "de":
