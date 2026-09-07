@@ -770,7 +770,7 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
 
 proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
                      extraPath = ""; outFile = "";
-                     analysisOnly = false): int =
+                     analysisOnly = false; verbose = false): int =
   ## Run a sub-compile's build graphs in THIS process, with the caller's
   ## frontend state moved aside for the duration (`FrontendSnapshot`). Answers
   ## `EvalBuildUnavailable` when there is no in-process path here, which is the
@@ -787,9 +787,15 @@ proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
                                 extraPath, outFile, analysisOnly)
   finally:
     restoreFrontendState(saved)
+  # `--verbose` says which of the two paths a sub-build took, so that "a
+  # `const` costs no process" is something a test can read off the compiler
+  # rather than infer from the filesystem (`tests/ctfe_engine`).
+  if verbose and result != EvalBuildUnavailable:
+    echo "[ctfe-build] in-process ", extractModuleSuffix(project)
 
 proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
-                      analysisOnly = false): tuple[output: string, exitCode: int] =
+                      analysisOnly = false;
+                      verbose = false): tuple[output: string, exitCode: int] =
   ## `nimony <forwarded args> --nimcache:<dir> s <sfx>.p.nif`, the whole graph
   ## down to the linked binary — unless `analysisOnly`, which adds
   ## `--ctfe-analysis-only` and stops it once every `.c.nif` exists, because the
@@ -808,10 +814,12 @@ proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
   ## does not compile, since those reach a child's captured stdout and this
   ## process's own.
   let inproc = runNestedBuild(baseDir, file, nimcachePath, commandLineArgs,
-                              analysisOnly = analysisOnly)
+                              analysisOnly = analysisOnly, verbose = verbose)
   if inproc != EvalBuildUnavailable:
     return (output: "", exitCode: inproc)
 
+  if verbose:
+    echo "[ctfe-build] spawning ", extractModuleSuffix(file)
   let nimonyExe = findTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
     (if analysisOnly: " --ctfe-analysis-only" else: "") &
@@ -841,11 +849,12 @@ proc subprocessCtfeArgs(commandLineArgs: string): string =
 
 proc runProgram(baseDir, file: string; nimcachePath: string; usedModules: HashSet[string];
                 commandLineArgs: string;
-                sourceDir = ""): tuple[output: string, exitCode: int] =
+                sourceDir = ""; verbose = false): tuple[output: string, exitCode: int] =
   # Compile the .p.nif through the full pipeline, then run the resulting
   # binary. Only the execution step uses `workingDir` so relative paths like
   # `doc/version.md` resolve next to the caller module.
-  result = buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs)
+  result = buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs,
+                            verbose = verbose)
   if result.exitCode != 0: return
 
   let modname = extractModuleSuffix(file)
@@ -886,7 +895,8 @@ proc prepareEval*(c: var SemContext): string =
       # `.nim` versus `.p.nif` project, which `buildGraph` reads off the
       # extension itself.
       let inproc = runNestedBuild(c.g.config.baseDir, writeNifSrc,
-                                  c.g.config.nifcachePath, c.commandLineArgs)
+                                  c.g.config.nifcachePath, c.commandLineArgs,
+                                  verbose = c.g.config.verbose)
       if inproc != EvalBuildUnavailable:
         if inproc != 0:
           return "failed to precompile std/writenif"
@@ -1113,7 +1123,8 @@ when defined(nimonyEngine):
     let (buildOut, buildCode) = buildEvalProgram(c.g.config.baseDir, m.progFile,
                                                  c.g.config.nifcachePath,
                                                  c.commandLineArgs,
-                                                 analysisOnly = true)
+                                                 analysisOnly = true,
+                                                 verbose = c.g.config.verbose)
     if buildCode != 0:
       # A sub-program that does not COMPILE fails the same way in both modes;
       # falling back would only compile it again to watch it fail again.
@@ -1165,7 +1176,8 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
           else: c.commandLineArgs
         let (output, exitCode) = runProgram(c.g.config.baseDir, m.progFile,
                                             c.g.config.nifcachePath, usedModules,
-                                            args, sourceDir)
+                                            args, sourceDir,
+                                            verbose = c.g.config.verbose)
         if exitCode != 0:
           return ensureMove(output)
     # The files the sub-program read are dependencies of the CALLING module,
