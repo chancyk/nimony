@@ -611,6 +611,17 @@ proc bifPluginInput(input: var TokenBuf; firstName: string): string =
   endRead(n)
   result = storeToString(buf)
 
+proc localNsTail(c: SemContext): string =
+  ## The trailing part a namespaced local carries after its disambiguator:
+  ## `` `semExpr`0 ``, or "" at module level.
+  if c.localNs.len == 0: "" else: LocalNsSep & c.localNs
+
+proc pluginTempCounterKey(c: SemContext): string =
+  ## `makeLocalSym`'s counter key for the plugin temp base in the routine being
+  ## checked: identifier plus namespace. The plugin mints names in that same
+  ## namespace, so the two counters must be the SAME entry of `c.locals`.
+  result = pluginTempBase & localNsTail(c)
+
 proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
                               nextName: string) =
   if nextName.len == 0:
@@ -618,16 +629,18 @@ proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
 
   var nextBase = ""
   var nextDisamb = 0
-  assert splitLocalSymName(nextName, nextBase, nextDisamb) and
-    nextBase == pluginTempBase and nextDisamb >= firstDisamb,
+  var nextTail = ""
+  assert splitLocalSymName(nextName, nextBase, nextDisamb, nextTail) and
+    nextBase == pluginTempBase and nextDisamb >= firstDisamb and
+    nextTail == localNsTail(c),
     "invalid .unusedname returned by plugin"
 
   for disamb in firstDisamb ..< nextDisamb:
-    let name = pluginTempBase & "." & $disamb
-    c.freshSyms.incl pool.syms.getOrIncl(name)
+    c.freshSyms.incl pool.syms.getOrIncl(
+      localSymName(pluginTempBase, disamb, c.localNs))
 
   if nextDisamb > firstDisamb:
-    c.locals[pluginTempBase] = nextDisamb - 1
+    c.locals[pluginTempCounterKey(c)] = nextDisamb - 1
 
 # ── Plugin output ───────────────────────────────────────────────────────────
 #
@@ -734,8 +747,8 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   ## as binary `.bif` behind the unchanged `.in.nif`/`.types.nif` names — the
   ## plugin-side loader sniffs the header (and still accepts text, so
   ## hand-written inputs keep working). Inspect one with `niftools bif2nif`.
-  let firstDisamb = c.locals.getOrDefault(pluginTempBase, -1) + 1
-  let firstName = pluginTempBase & "." & $firstDisamb
+  let firstDisamb = c.locals.getOrDefault(pluginTempCounterKey(c), -1) + 1
+  let firstName = localSymName(pluginTempBase, firstDisamb, c.localNs)
   let pluginInput = bifPluginInput(input, firstName)
   let pluginAdditionalInput =
     if additionalInput.len > 0: bifPluginInput(additionalInput, firstName)

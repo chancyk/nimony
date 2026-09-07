@@ -81,7 +81,12 @@ proc genEnumToStrProc*(c: var SemContext; dest: var TokenBuf; typeDecl: var Curs
   dest.addDotToken()
 
   var paramName = "e"
+  # The parameter belongs to the synthesized `$` func, not to whatever the
+  # compiler happened to be checking when the enum's `$` was demanded.
+  let outerLocalNs = c.localNs
+  c.localNs = localNamespaceOf(dollorSymId)
   c.makeLocalSym(paramName)
+  c.localNs = outerLocalNs
   let paramSymId = pool.syms.getOrIncl(paramName)
   dest.addParLe("params", enumSymInfo)
   dest.addParLe("param", enumSymInfo)

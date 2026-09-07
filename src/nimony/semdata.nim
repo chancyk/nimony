@@ -172,6 +172,17 @@ type
     instantiatedFrom*: seq[NifLineInfo]
     importTab*: OrderedTable[StrId, seq[SymId]] ## mapping of identifiers to modules containing the identifier
     globals*, locals*: Table[string, int]
+    localNs*: string
+      ## The namespace segment `makeLocalSym` appends to the local symbols it
+      ## mints right now: the enclosing routine's module-less name with its
+      ## dots written as `` ` `` (`semExpr.0` -> `` semExpr`0 ``), or "" when
+      ## there is no enclosing routine (a `var` inside a top-level `if`).
+      ##
+      ## It exists so that a local's spelling is a function of ITS OWN routine
+      ## and nothing else: `c.locals` is keyed by identifier AND namespace, so
+      ## inserting a declaration can no longer renumber another declaration's
+      ## locals. See `notes/f1.md`. Established by `semProcImpl` and by the
+      ## three generic-instantiation sites, saved and restored explicitly.
     fieldCounts*: Table[string, int]
       ## Per-name field counts for the object type currently being declared.
       ## Unlike `globals`/`locals` this is NOT a monotonic counter: a field is

@@ -1065,6 +1065,13 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
       buildErr c, dest, it.n.info, "TR pattern not implemented"
       skip it.n
     c.routine = createSemRoutine(kind, c.routine)
+    # Every local minted from here on belongs to THIS routine and is named
+    # after it, so an edit elsewhere in the module cannot renumber it
+    # (`notes/f1.md`). Saved and restored like the two stacks below, because a
+    # nested routine must hand the namespace back to its parent.
+    let outerLocalNs = c.localNs
+    if symId != SymId(0):
+      c.localNs = localNamespaceOf(symId)
     # Save/restore rather than a matching `dec`: both the template case below
     # and `semGenericParams` bump `inGenericDefinition`, and an error path must
     # not leak either increment into the enclosing definition. Captured BEFORE
@@ -1181,6 +1188,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
     finally:
       c.inGenericDefinition = outerGenericDefinition
       c.visOwner.setLen outerVisOwner
+      c.localNs = outerLocalNs
       c.routine = c.routine.parent
   if newName == NoSymId:
     producesVoid c, dest, info, it.typ

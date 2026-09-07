@@ -146,28 +146,70 @@ proc isLocalName*(s: string): bool =
     if c == '.': inc dots
   result = dots <= 1
 
-proc splitLocalSymName*(s: string; basename: var string;
-                        disamb: var int): bool =
-  ## Splits a local symbol such as `tmp.14` into `tmp` and `14`.
+const LocalNsSep* = '`'
+  ## Separates a local symbol's disambiguator from the NAMESPACE segment that
+  ## says which routine the local belongs to: `` x.3`semExpr`0 `` is the local
+  ## `x`, third of its name inside the routine `semExpr.0`. The owner's own dots
+  ## are written as this character too, so the whole spelling keeps exactly one
+  ## dot and stays a local name by `isLocalName`.
+  ##
+  ## A backtick for the same reason `derivedName` uses one: it is legal
+  ## unescaped anywhere after a symbol's first byte, it is not part of the dot
+  ## grammar every scanner in this file walks, and it keeps the result out of
+  ## the Nim-spellable namespace.
+
+proc localSymName*(basename: string; disamb: int; ns: string): string =
+  ## The one place that assembles a local symbol out of its three parts. `ns`
+  ## empty means "no enclosing routine" and reproduces the plain
+  ## `identifier.<number>` spelling exactly.
+  result = basename
+  result.add '.'
+  result.addInt disamb
+  if ns.len > 0:
+    result.add LocalNsSep
+    result.add ns
+
+proc splitLocalSymName*(s: string; basename: var string; disamb: var int;
+                        tail: var string): bool =
+  ## Splits a local symbol into its identifier, its leading disambiguator
+  ## number and whatever the disambiguator carries after that number:
+  ## `tmp.14` -> (`tmp`, 14, ``) and `` tmp.14`f`0 `` -> (`tmp`, 14,
+  ## `` `f`0 ``). False for anything that is not a local symbol: more than one
+  ## dot, no dot, or no digit right after it.
   basename = ""
   disamb = 0
-  var dot = s.len - 1
-  while dot >= 0 and s[dot] in {'0'..'9'}:
-    dec dot
-  if dot <= 0 or dot == s.len - 1 or s[dot] != '.':
-    return false
-  for i in 0 ..< dot:
+  tail = ""
+  var dot = -1
+  for i in 0 ..< s.len:
     if s[i] == '.':
-      return false
+      if dot >= 0: return false
+      dot = i
+  if dot <= 0 or dot == s.len - 1:
+    return false
   var value = 0
-  for i in dot + 1 ..< s.len:
-    let digit = ord(s[i]) - ord('0')
+  var j = dot + 1
+  while j < s.len and s[j] in {'0'..'9'}:
+    let digit = ord(s[j]) - ord('0')
     if value > (high(int) - digit) div 10:
       return false
     value = value * 10 + digit
+    inc j
+  if j == dot + 1:
+    return false
   basename = substr(s, 0, dot - 1)
   disamb = value
+  tail = substr(s, j)
   result = true
+
+proc splitLocalSymName*(s: string; basename: var string;
+                        disamb: var int): bool =
+  ## Splits an UNNAMESPACED local symbol such as `tmp.14` into `tmp` and `14`.
+  ## False for `` tmp.14`f`0 ``, which the four-argument overload splits.
+  var tail = ""
+  result = splitLocalSymName(s, basename, disamb, tail) and tail.len == 0
+  if not result:
+    basename = ""
+    disamb = 0
 
 proc removeModule*(s: string): string =
   # From "abc.12.Mod132a3bc" extract "abc.12".
@@ -259,3 +301,21 @@ when isMainModule:
   assert disamb == 14
   assert not splitLocalSymName("tmp.14.mod", basename, disamb)
   assert not splitLocalSymName("tmp.part.14", basename, disamb)
+
+  # A namespaced local splits only through the four-argument overload.
+  var tail = ""
+  assert not splitLocalSymName("tmp.14`f`0", basename, disamb)
+  assert splitLocalSymName("tmp.14`f`0", basename, disamb, tail)
+  assert basename == "tmp"
+  assert disamb == 14
+  assert tail == "`f`0"
+  assert localSymName("tmp", 14, "f`0") == "tmp.14`f`0"
+  assert localSymName("tmp", 14, "") == "tmp.14"
+  # ...and it is still a LOCAL name to everything that classifies one.
+  var isGlobal = false
+  assert isLocalName("x.3`semExpr`0")
+  assert extractBasename("x.3`semExpr`0", isGlobal) == "x"
+  assert not isGlobal
+  assert extractModule("x.3`semExpr`0") == ""
+  assert not isInstantiation("x.3`semExpr`0")
+  assert removeModule("x.3`semExpr`0") == "x.3`semExpr`0"
