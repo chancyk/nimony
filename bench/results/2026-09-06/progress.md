@@ -161,3 +161,56 @@ Verdict: no stdlib-wide regression from the merged phases (≤ 3 %, inside the
 round-to-round spread). The monotonic rise across run 2's three block passes
 was drift between passes, which is why the 5 % question is answered with the
 interleaved script and the 2x questions with the table.
+
+## Run 3 (quiet; no agents), median of 3 -- A2b merged, engine + in-process scheduler both on by default
+
+head = a47899cf (adds B2 default flip + fix, A2b with the depth clause rewritten).
+
+| scenario | base wall | head wall | wall ratio | base cpu | head cpu | cpu ratio |
+|---|---|---|---|---|---|---|
+| hello.forced | 0.422 | 0.402 | 1.05x | 0.666 | 0.638 | 1.04x |
+| hello.nochange | 0.014 | 0.006 | 2.33x | 0.012 | 0.005 | 2.40x |
+| hello.edit | 0.082 | 0.065 | 1.26x | 0.108 | 0.094 | 1.15x |
+| ctfe.cold | 2.549 | 0.880 | 2.90x | 3.744 | 1.391 | 2.69x |
+| ctfe.warm | 0.011 | 0.007 | 1.57x | 0.010 | 0.007 | 1.43x |
+| ctfe.edit | 0.196 | 0.072 | 2.72x | 0.190 | 0.099 | 1.92x |
+| ctfe.forced | 3.607 | 0.892 | 4.04x | 5.367 | 1.282 | 4.19x |
+| bench.cold | 5.873 | 1.394 | 4.21x | 9.244 | 1.924 | 4.80x |
+| bench.edit | 0.421 | 0.100 | 4.21x | 0.417 | 0.128 | 3.26x |
+| stdlib.cold | 5.165 | 5.390 | 0.96x | 28.816 | 28.059 | 1.03x |
+| stdlib.forced | 1.931 | 2.130 | 0.91x | 9.188 | 8.650 | 1.06x |
+| stdlib.edit | 0.430 | 0.440 | 0.98x | 1.261 | 0.745 | 1.69x |
+
+raw (wall / cpu):
+```
+base  hello.forced    wall 0.422 0.422 0.419  cpu 0.666 0.668 0.647
+head  hello.forced    wall 0.404 0.401 0.402  cpu 0.638 0.632 0.639
+base  hello.nochange  wall 0.014 0.015 0.014  cpu 0.012 0.012 0.012
+head  hello.nochange  wall 0.006 0.006 0.006  cpu 0.005 0.005 0.005
+base  hello.edit      wall 0.082 0.082 0.082  cpu 0.109 0.108 0.106
+head  hello.edit      wall 0.065 0.065 0.065  cpu 0.095 0.092 0.094
+base  ctfe.cold       wall 2.787 2.490 2.549  cpu 3.773 3.724 3.744
+head  ctfe.cold       wall 0.875 0.908 0.880  cpu 1.391 1.395 1.387
+base  ctfe.warm       wall 0.012 0.011 0.011  cpu 0.010 0.010 0.010
+head  ctfe.warm       wall 0.007 0.007 0.008  cpu 0.007 0.007 0.007
+base  ctfe.edit       wall 0.196 0.198 0.188  cpu 0.183 0.203 0.190
+head  ctfe.edit       wall 0.072 0.073 0.072  cpu 0.088 0.099 0.100
+base  ctfe.forced     wall 3.630 3.606 3.607  cpu 5.355 5.367 5.373
+head  ctfe.forced     wall 0.800 0.892 0.897  cpu 1.182 1.282 1.287
+base  bench.cold      wall 6.668 5.868 5.873  cpu 9.315 9.202 9.244
+head  bench.cold      wall 1.396 1.388 1.394  cpu 1.908 1.924 1.925
+base  bench.edit      wall 0.440 0.421 0.420  cpu 0.475 0.415 0.417
+head  bench.edit      wall 0.124 0.099 0.100  cpu 0.174 0.127 0.128
+base  stdlib.cold     wall 5.030 5.165 5.243  cpu 28.400 28.816 29.633
+head  stdlib.cold     wall 5.295 5.390 5.419  cpu 27.516 28.059 28.325
+base  stdlib.forced   wall 1.932 1.917 1.931  cpu 9.197 9.158 9.188
+head  stdlib.forced   wall 2.125 2.130 2.137  cpu 8.643 8.757 8.650
+base  stdlib.edit     wall 0.436 0.430 0.430  cpu 1.266 1.261 1.259
+head  stdlib.edit     wall 0.421 0.440 0.557  cpu 0.711 0.745 0.851
+```
+
+Reading: the edit loop and every CTFE scenario are now 1.3-4.2x faster in wall
+and cheaper in cpu; stdlib-wide cold is +4 % wall / -3 % cpu and forced +10 %
+wall / -6 % cpu. The forced wall cost is the next thing to profile (see the
+A2b review commit: the in-process node of a depth runs BEFORE the depth's
+fan-out instead of overlapping it).
