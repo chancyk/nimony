@@ -37,4 +37,10 @@ incrementalInprocTests()
 # (the counts are per PHASE, so they must not depend on who ran the phase).
 incrementalLiveTests()
 incrementalLiveTests("--spawn:always")
+# B3b: how declaration-local the compiler's own output is. Not a rebuild-count
+# assertion -- it splits the fixture's `.s.nif`/`.x.nif` into the children of
+# their root `(stmts …)` and counts how many of them an edit moves, which is
+# the premise symbol-granularity lowering is built on
+# (`bench/results/2026-09-06/b3b.txt`).
+incrementalDeclStabilityTests()
 echo "SUCCESS."

@@ -1,7 +1,7 @@
 ## The incremental-build regression: drive `nimony c --report` through a fixed
 ## sequence of scenarios and assert which phases actually re-ran.
 
-import std / [syncio, os, osproc, strutils, times, algorithm, sequtils]
+import std / [syncio, os, osproc, strutils, times, algorithm, sequtils, tables]
 
 # ---- Incremental-build regression test ------------------------------------
 # `nifmake --report` prints a machine-readable summary of which commands
@@ -905,3 +905,321 @@ proc incrementalLiveTests*(mode = "") =
     quit "FAILURE: " & $failures.len & " incremental-live phase(s) failed."
   echo "incremental-live", modeLabel(mode), ": ", phases, " / ", phases,
        " phases successful in ", formatFloat(dt, ffDecimal, precision=2), "s."
+
+# ---- B3b: declaration stability of the edited module ----------------------
+# `JIT_IMPL.md` phase B3b wants hexer and arkham to re-lower only the top-level
+# declarations whose sem output changed. The premise -- "a body edit changes
+# ONE declaration" -- is not free: it holds only as long as nothing in the
+# module's serialized form is a function of a declaration's POSITION. Two
+# things are, and both were found by measuring `src/nimony/sem.nim`
+# (`bench/results/2026-09-06/b3b.txt` section 3):
+#
+#   * NIF line info. Every top-level declaration anchors its own `@...` token,
+#     so an edit that shifts line numbers rewrites every declaration below it
+#     in the same file -- 277 of sem's 1228 for a two-line insertion.
+#   * `sembasics.makeLocalSym` numbers a local from `SemContext.locals`, a
+#     MODULE-wide per-name counter. Insert one proc with an implicit `result`
+#     and every later `result.N` in the module is renumbered -- 465 of 1227
+#     for the `self.editbody` benchmark's own edit.
+#
+# The procs below turn those into a tracked regression on a small fixture:
+# they print the same numbers the phase measured on sem, and they fail if
+# declaration locality gets WORSE than it is today. They are the "measure
+# before you build" harness B3b is blocked on, so the next attempt starts from
+# evidence rather than from folklore.
+
+type
+  NifDecl* = object
+    ## One child of a serialized NIF module's root `(stmts ...)`.
+    name*: string    ## its `:SymbolDef`, or the node's tag when it has none
+    body*: string    ## the declaration's text, verbatim
+    blind*: string   ## the same with every line-info suffix removed
+
+  DeclDelta* = object
+    ## How two versions of one module compare, declaration by declaration.
+    total*, same*, changed*, added*, removed*: int
+
+proc stripNifLineInfo*(s: string): string =
+  ## Drop every NIF line-info suffix (`@` up to the next space, parenthesis or
+  ## newline) outside of string literals. What is left is the declaration's
+  ## CONTENT: two declarations that differ only because an edit above them
+  ## moved the line counter then compare equal.
+  result = newStringOfCap(s.len)
+  var i = 0
+  var inStr = false
+  while i < s.len:
+    let c = s[i]
+    if inStr:
+      result.add c
+      if c == '\\' and i + 1 < s.len:
+        result.add s[i+1]
+        inc i, 2
+      else:
+        if c == '"': inStr = false
+        inc i
+    elif c == '"':
+      inStr = true
+      result.add c
+      inc i
+    elif c == '@':
+      inc i
+      while i < s.len and s[i] notin {' ', '(', ')', '\n'}: inc i
+    else:
+      result.add c
+      inc i
+
+proc declNameOf(line: string): string =
+  ## A top-level declaration is keyed by its `:SymbolDef` when it has one --
+  ## `(proc@... :step5.0.<mod> ...` -- and by its tag otherwise, which is what
+  ## the anonymous nodes (comments, hoisted consts) collapse onto.
+  let fields = line.splitWhitespace()
+  if fields.len > 1 and fields[1].len > 0 and fields[1][0] == ':':
+    result = fields[1]
+  elif fields.len > 0:
+    result = fields[0]
+  else:
+    result = ""
+
+proc splitNifDecls*(path: string): seq[NifDecl] =
+  ## Split a serialized NIF module into the children of its root `(stmts ...)`.
+  ##
+  ## Two details of the format matter. The trailing embedded `(.index ...)` is
+  ## a whole-file artifact whose byte offsets shift whenever anything above it
+  ## does, so it is cut off at the offset the header's `.indexat` names rather
+  ## than parsed. And `nifcoreparse.toModuleString` indents the root's children
+  ## by exactly one space, which is what makes a line-based split exact here.
+  result = @[]
+  var raw = readFile(path)
+  const marker = "(.indexat "
+  let at = raw.find(marker)
+  if at >= 0:
+    let close = raw.find(')', at)
+    if close > at:
+      let digits = raw[at + marker.len ..< close].strip()
+      try:
+        let cut = parseInt(digits)
+        if cut > 0 and cut <= raw.len: raw.setLen cut
+      except ValueError: discard
+  var inBody = false
+  var cur: seq[string] = @[]
+  var name = ""
+  for line in raw.splitLines:
+    if not inBody:
+      if line.startsWith("(stmts"): inBody = true
+      continue
+    if line.startsWith(" ("):
+      if cur.len > 0:
+        let body = cur.join("\n")
+        result.add NifDecl(name: name, body: body, blind: stripNifLineInfo(body))
+        cur = @[]
+      name = declNameOf(line)
+      cur.add line
+    elif cur.len > 0:
+      cur.add line
+  if cur.len > 0:
+    let body = cur.join("\n")
+    result.add NifDecl(name: name, body: body, blind: stripNifLineInfo(body))
+
+proc diffDecls*(before, after: seq[NifDecl]; blind: bool): DeclDelta =
+  ## Compare two splits of the same module. Declarations are matched by name,
+  ## and repeated names (the anonymous ones) positionally within their group,
+  ## so a declaration that merely MOVED without changing counts as unchanged --
+  ## which is precisely the question B3b asks.
+  result = DeclDelta(total: before.len, same: 0, changed: 0, added: 0, removed: 0)
+  var afterByName = initTable[string, seq[int]]()
+  for i in 0 ..< after.len:
+    afterByName.mgetOrPut(after[i].name, @[]).add i
+  var used = initTable[string, int]()
+  for d in before:
+    let group = afterByName.getOrDefault(d.name, @[])
+    let k = used.getOrDefault(d.name, 0)
+    used[d.name] = k + 1
+    if k >= group.len:
+      inc result.removed
+    else:
+      let o = after[group[k]]
+      let a = if blind: d.blind else: d.body
+      let b = if blind: o.blind else: o.body
+      if a == b: inc result.same else: inc result.changed
+  for name, group in afterByName:
+    let consumed = used.getOrDefault(name, 0)
+    if group.len > consumed: result.added += group.len - consumed
+
+proc declUnchanged(before, after: seq[NifDecl]; needle: string): bool =
+  ## Whether the one declaration whose name contains `needle` is byte-identical
+  ## in both splits. Used to assert the invariant a new declaration must always
+  ## satisfy: it may not invalidate declarations that PRECEDE it.
+  result = false
+  for d in before:
+    if d.name.contains(needle):
+      for o in after:
+        if o.name == d.name: return d.body == o.body
+      return false
+
+proc findModuleNif(cache, sourceName, ext: string): string =
+  ## The `<suffix>.<ext>.nif` of the module compiled from `sourceName`. A
+  ## module's suffix is a hash, so it is found rather than derived: a
+  ## serialized module's root carries the path it was parsed from, right on
+  ## the `(stmts` line.
+  result = ""
+  for f in walkFiles(cache / "*.s.nif"):
+    var lines = 0
+    for line in readFile(f).splitLines:
+      if line.startsWith("(stmts"):
+        if line.contains(sourceName):
+          let base = f.lastPathPart
+          result = cache / base[0 ..< base.len - ".s.nif".len] & "." & ext & ".nif"
+        break
+      inc lines
+      if lines > 4: break
+    if result.len > 0: break
+
+proc incrementalDeclStabilityTests*() =
+  ## Measure -- and pin -- how declaration-local the compiler's own output is
+  ## under the three edits `bench/results/2026-09-06/b3b.txt` section 3
+  ## measured on `sem.nim`, here applied to `tests/incremental/b3b_lib.nim`:
+  ##
+  ##   (a) in-place: a string literal replaced by another of the SAME length.
+  ##       No line shift, no new declaration. Exactly one declaration of the
+  ##       `.s.nif` may change -- this is the invariant a declaration-level
+  ##       incremental hexer is built on, and the one this test defends.
+  ##   (b) insert: a proc with an implicit `result` added in the MIDDLE. Today
+  ##       that renumbers every later local of the same name, so the churn
+  ##       survives stripping line info -- which is the fact the phase's
+  ##       prerequisite 1 (proc-scoped local numbering in
+  ##       `sembasics.makeLocalSym`) rests on. What is asserted is the
+  ##       invariant that must hold either way: nothing ABOVE the insertion
+  ##       point may move.
+  ##   (c) stmtadd: one statement inserted into a proc in the middle, which
+  ##       shifts every following line. Ignoring line info must recover
+  ##       declaration locality -- the fact prerequisite 2 (a line-info-blind
+  ##       digest plus an info rebase for spliced fragments) rests on.
+  let t0 = epochTime()
+  let lib = "tests/incremental/b3b_lib.nim"
+  let src = "tests/incremental/b3b_main.nim"
+  let nimony = "bin" / "nimony".addFileExt(ExeExt)
+  for f in [lib, src]:
+    if not fileExists(f): quit "decl-stability: " & f & " missing"
+  if not fileExists(nimony):
+    quit "decl-stability: " & nimony & " not found; run `hastur build nimony` first"
+
+  let cache = "nimcache" / "declstab"
+  removeDir cache
+  let originalLib = readFile(lib)
+
+  proc restoreSources() = writeFile(lib, originalLib)
+
+  proc build(label: string) =
+    let cmd = nimony.quoteShell & " c --silentMake --nimcache:" &
+              cache.quoteShell & " " & src.quoteShell
+    let (output, ec) = execCmdEx(cmd)
+    if ec != 0:
+      stdout.write output
+      restoreSources()
+      quit "decl-stability: '" & label & "' compile failed"
+
+  var failures: seq[string] = @[]
+  template expect(cond: bool; msg: string) =
+    if not (cond): failures.add msg
+  var phases = 0
+
+  build("cold")
+  let sNif = findModuleNif(cache, "b3b_lib.nim", "s")
+  let xNif = findModuleNif(cache, "b3b_lib.nim", "x")
+  if sNif.len == 0 or not fileExists(sNif):
+    restoreSources()
+    quit "decl-stability: no .s.nif for b3b_lib under " & cache
+  let sBase = splitNifDecls(sNif)
+  let xBase = if xNif.len > 0 and fileExists(xNif): splitNifDecls(xNif)
+              else: @[]
+  expect sBase.len >= 11,
+         "cold: the fixture's .s.nif has only " & $sBase.len &
+         " top-level declarations; it cannot measure locality"
+
+  # (a) in-place, same length: `"b3b step five"` -> `"b3b step FIVE"`.
+  inc phases
+  writeFile(lib, originalLib.replace("b3b step five", "b3b step FIVE"))
+  build("in-place")
+  let sInplace = diffDecls(sBase, splitNifDecls(sNif), false)
+  expect sInplace.changed == 1 and sInplace.added == 0 and sInplace.removed == 0,
+         "in-place: " & $sInplace.changed & " changed / " & $sInplace.added &
+         " added / " & $sInplace.removed & " removed declarations in the " &
+         ".s.nif; a same-length literal edit inside one proc must touch " &
+         "exactly one declaration or symbol-granularity lowering has no premise"
+  var xInplaceChanged = -1
+  if xBase.len > 0 and fileExists(xNif):
+    let d = diffDecls(xBase, splitNifDecls(xNif), false)
+    xInplaceChanged = d.changed
+    # The `.x.nif` may swap one SSO string const for another, so `added` and
+    # `removed` move in lockstep there; `changed` may not.
+    expect d.changed <= 1,
+           "in-place: " & $d.changed & " changed declarations in the .x.nif " &
+           "(expected at most 1)"
+
+  # (b) a proc with an implicit `result` inserted in the MIDDLE. Appending at
+  # EOF would prove nothing here -- `makeLocalSym`'s counter only renumbers
+  # what comes AFTER the new declaration, and in the compiler's own modules
+  # what comes after is the generic instantiations spliced in from imports,
+  # which is why `sem.nim` sees 465 of 1227 for an appended proc.
+  inc phases
+  writeFile(lib, originalLib.replace("proc step6*(x: int): int =",
+    "proc b3bInserted*(x: int): int =\n  var acc = x + 11\n" &
+    "  let s = \"b3b inserted\"\n  result = acc + s.len\n\n" &
+    "proc step6*(x: int): int ="))
+  build("insert")
+  let sInsertNow = splitNifDecls(sNif)
+  let sInsertRaw = diffDecls(sBase, sInsertNow, false)
+  let sInsertBlind = diffDecls(sBase, sInsertNow, true)
+  expect sInsertRaw.added >= 1, "insert: the new proc is not in the .s.nif"
+  expect declUnchanged(sBase, sInsertNow, "step1."),
+         "insert: `step1`, which PRECEDES the insertion point, changed; a new " &
+         "declaration must never invalidate the declarations above it"
+  expect sInsertBlind.changed <= sInsertRaw.changed,
+         "insert: ignoring line info made the churn WORSE (" &
+         $sInsertBlind.changed & " vs " & $sInsertRaw.changed & ")"
+  # Today `sInsertBlind.changed` is the number of declarations that FOLLOW the
+  # insertion point, and every one of them differs only by a renumbered local
+  # (`result.N`, `acc.N`, `s.N`) -- `sembasics.makeLocalSym` counts per name
+  # per MODULE. That is prerequisite 1 of B3b; when it lands this number goes
+  # to 0 and the bound below stays satisfied.
+  expect sInsertBlind.changed <= sBase.len - 4,
+         "insert: " & $sInsertBlind.changed & " of " & $sBase.len &
+         " declarations changed with line info ignored; a proc inserted in " &
+         "the middle must not invalidate more than what follows it"
+
+  # (c) one statement inserted into a proc in the middle of the file.
+  inc phases
+  writeFile(lib, originalLib.replace("  var acc = x + 5\n",
+                                     "  var acc = x + 5\n  acc = acc + 0\n"))
+  build("stmtadd")
+  let sStmtNow = splitNifDecls(sNif)
+  let sStmtRaw = diffDecls(sBase, sStmtNow, false)
+  let sStmtBlind = diffDecls(sBase, sStmtNow, true)
+  expect sStmtRaw.added == 0 and sStmtRaw.removed == 0,
+         "stmtadd: the edit added or removed a declaration; it was supposed " &
+         "to change one proc's body only"
+  expect sStmtBlind.changed <= sStmtRaw.changed,
+         "stmtadd: ignoring line info made the churn WORSE (" &
+         $sStmtBlind.changed & " vs " & $sStmtRaw.changed & ")"
+  expect sStmtBlind.changed <= 3,
+         "stmtadd: " & $sStmtBlind.changed & " declarations differ even " &
+         "with line info ignored (expected at most 3); a line-info-blind " &
+         "declaration digest no longer recovers locality"
+
+  restoreSources()
+  build("restore")
+
+  echo "decl-stability: .s.nif ", sBase.len, " decls | in-place changed ",
+       sInplace.changed, " | insert changed ", sInsertRaw.changed,
+       " (blind ", sInsertBlind.changed, ", added ", sInsertRaw.added,
+       ") | stmtadd changed ", sStmtRaw.changed, " (blind ",
+       sStmtBlind.changed, ")",
+       (if xInplaceChanged >= 0: " | .x.nif in-place changed " &
+                                 $xInplaceChanged else: "")
+
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "decl-stability: " & f
+    quit "FAILURE: " & $failures.len & " decl-stability phase(s) failed."
+  echo "decl-stability: ", phases, " / ", phases, " phases successful in ",
+       formatFloat(dt, ffDecimal, precision=2), "s."
