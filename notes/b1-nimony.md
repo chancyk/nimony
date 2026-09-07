@@ -315,3 +315,74 @@ stated before measuring: `self.run` is `self.editbody` minus the Mach-O write,
 the ad-hoc codesign and the exec, because the 1.38 s whole-image assemble
 moves into the compiler's process rather than disappearing. B3 is what turns
 that number.
+
+---
+
+## 7. What the implementation found
+
+### The build graph needed one `Command` value, not a new `FinalPhase`
+
+`DoRunMem` (`deps.nim`). `BackendCommands = {DoCompile, DoRun, DoRunMem}`
+opens the "Build rules" section to it; the three link-command definitions were
+already gated on `{DoCompile, DoRun}` and so emit nothing; the "Link
+executable" rule gets one `elif c.cmd == DoRunMem: discard`. The build file
+gets its own stem, `.finalr.build.nif`, so `nimony n` and `nimony r` sharing a
+nimcache do not hand nifmake two differently shaped graphs under one name.
+Measured: `n` after `r` costs one link node (1.0 s on the compiler) and `r`
+after `n` costs one assemble (1.0 s), i.e. neither invalidates the other's
+work.
+
+### `quit` clamps a status at 128
+
+`quit(200)` from Nim exits 127: POSIX reserves 128+ for "killed by signal N" in
+a wait status, and Nim reinterprets on the way out. `nimony n` + exec gives the
+shell 200, so `nimony r` goes through libc's `exit` directly (`exitAs` in
+`nimony.nim`), with the compiler's own streams flushed by hand first — the same
+thing `nifrun` does, for the same reason.
+
+### A cross compile had to be refused before the build
+
+`--cpu`/`--os` naming another machine produce an image `hostrun` would then
+CALL in this process. Nothing about the build could make that work, so the
+refusal is the first thing `runProject` does. It sits inside the
+`-d:nimonyEngine` guard: `hostCPU`/`hostOS`/`platform` are host-Nim names and
+`hastur boot --boot-backend:native` compiles `nimony.nim` with nimony, which
+caught it in stage 2.
+
+### `--verbose` belongs on stderr here
+
+`evaluate`'s `timingLine` goes to stdout because a compile-time evaluation's
+stdout is the compiler's. A program's is not: `nimony r prog.nim > out` must
+put the PROGRAM's output in `out`. Printed before the run, too — the compiler
+must not interleave a line into output that is not its own.
+
+### `.compile`d foreign objects are refused, not mis-linked
+
+A native build with `{.compile.}` TUs sets `nativeSysLink` and finishes through
+the system linker (`deps.nim:1443`). `DoRunMem` emits no link node at all, so
+those symbols reach `bindExternals` unresolved and the run is refused by name
+with the "use `nimony n`" hint. That is the honest answer — nimsem does not
+link them and `dlsym` cannot invent them — but it is a refusal discovered after
+the build rather than before it. A pre-build check on `c.toBuild.len` would be
+a small improvement.
+
+### Not done
+
+* **The arena is never released.** One `nimony r` maps 256 MB and the process
+  ends a few milliseconds later, so it does not matter here; a `nimony dev`
+  (B4) running many programs in one process would have to, and cannot, because
+  the guest's exit parked a thread inside it.
+* **A guest fault takes the compiler with it.** Same position B2 is in: no
+  signal handler, because handling SIGSEGV on the guest thread cannot resume it.
+  For `r` this is much less of a problem than for CTFE — the program crashing IS
+  the answer the user wanted — but the diagnostic says "nimony" where it should
+  say the program's name.
+* **Thread creation on Linux/x86-64.** `ThreadSpawners` scans the image's
+  external symbols, which catches the libc-linked shapes; the `nimNoLibc`
+  Linux/x86-64 arm of `std/rawthreads` issues `clone(2)` inline and has no
+  external to scan for. Everywhere else on a `nimNoLibc` target the stdlib is a
+  compile-time `{.error.}` and the question never arises.
+* **B3's blobs.** `runWholeProgram` is one proc and the only thing that touches
+  nifasm. A cached-blob loader replaces the `openFileSession`/`declare`/
+  `emit*`/`finishCode` block with a load, and an out-of-process `nimrun` guest
+  replaces the whole proc; `RunProgram`/`RunResult` are what stays.
