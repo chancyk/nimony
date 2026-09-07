@@ -581,6 +581,255 @@ proc evaluate*(e: var Engine; backendDir, mainSuffix, sourceDir: string;
     if haveArena and result.outcome != eoBudget: releaseArena arena
     result.timings.totalMs = (getMonoTime() - t0).inNanoseconds.float / 1e6
 
+# ── `nimony r`: a whole program, from memory (JIT.md 7.3, JIT_IMPL.md B1) ───
+#
+# The second customer of the same machinery. A `const` is eight modules the
+# engine lowers itself; a program is however many the user wrote, and their
+# `.asm.nif` files have already been produced -- in parallel, incrementally --
+# by the build graph's arkham nodes (`deps.generateFinalBuildFile`, `DoRunMem`).
+# So this half starts one step later than `evaluate` does: at the main module's
+# `.asm.nif`, exactly where the `link` node it replaces starts.
+#
+# Everything below `runWholeProgram` is deliberately inside that one proc, so
+# that B3's out-of-process `nimrun` guest can replace it whole -- a pipe to a
+# loader returns the same `RunResult` and `nimony.nim` never learns which one
+# ran the program.
+
+type
+  RunOutcome* = enum
+    roRan       ## the program ran; `status` is what it gave the shell
+    roRefused   ## the engine will not run this program; `reason` says why
+
+  RunProgram* = object
+    ## Everything `runWholeProgram` needs, as one record rather than five
+    ## parameters that would have to be threaded through B3's replacement too.
+    backendDir*: string   ## `<nimcache>/<main>.n`, holding every `.asm.nif`
+    mainModule*: string   ## the root module's suffix
+    argv*: seq[string]    ## argv[0] first, then the program's own arguments
+    verbose*: bool        ## print the per-stage timing line before the run
+
+  RunResult* = object
+    outcome*: RunOutcome
+    status*: int
+    reason*: string
+    timings*: EngineTimings
+
+const
+  ThreadSpawners = ["pthread_create", "bsdthread_create", "thread_create"]
+    ## JIT.md 7.1 item 7's cheap half. `singleThread` lowered every `(tvar ...)`
+    ## to an ordinary global, which is only sound while the program stays
+    ## single-threaded -- so a program that can create a thread must be refused
+    ## rather than silently given one shared copy of what it declared as
+    ## per-thread storage. Names, not a promise: the check is a scan of the
+    ## image's own external symbols.
+    ##
+    ## It is a backstop rather than the main line. On a `nimNoLibc` target
+    ## `std/rawthreads` is a `{.error.}` on everything but Linux/x86-64
+    ## (`lib/std/rawthreads.nim`), so the usual answer arrives at compile time;
+    ## and Linux/x86-64's own arm issues `clone(2)` inline, with no external to
+    ## scan for. That gap is real and is written down in `notes/b1-nimony.md`.
+
+type
+  GuestBlocks = object
+    ## The two NULL-terminated pointer arrays a C `main` is called with, and
+    ## the strings they point into. One object because the strings have to
+    ## outlive the pointers and both have to outlive the call; a `seq[cstring]`
+    ## alone would point into temporaries.
+    argStrings, envStrings: seq[string]
+    argPtrs, envPtrs: seq[cstring]
+
+proc buildGuestBlocks(p: RunProgram; g: var GuestBlocks) =
+  ## argv the way a C `main` expects it, and envp reconstructed from the
+  ## compiler's own environment: `nimony n` + exec hands the program the
+  ## environment it inherited, and running it from memory has to hand it the
+  ## same one -- `lengcgen.genMainProc` stores `envp` in `nimEnviron` and
+  ## `std/envvars` reads it from there. An EMPTY block, never a null pointer:
+  ## walking a null `nimEnviron` is a segfault where walking an empty one is an
+  ## empty answer.
+  g.argStrings = p.argv
+  g.argPtrs = @[]
+  for i in 0 ..< g.argStrings.len:
+    g.argPtrs.add g.argStrings[i].cstring
+  g.argPtrs.add nil.cstring
+  g.envStrings = @[]
+  for key, val in envPairs():
+    g.envStrings.add key & "=" & val
+  g.envPtrs = @[]
+  for i in 0 ..< g.envStrings.len:
+    g.envPtrs.add g.envStrings[i].cstring
+  g.envPtrs.add nil.cstring
+
+proc runTimingLine*(r: RunResult; label: string): string =
+  ## `--verbose`'s one line for `nimony r`. Same columns as `timingLine`, minus
+  ## arkham's (which ran in the build graph and is on nifmake's own profile) and
+  ## minus the run itself, because the line is printed BEFORE the program runs.
+  result = "[run-engine] " & label &
+    " assemble=" & formatFloat(r.timings.assembleMs, ffDecimal, 2) &
+    "ms lay=" & formatFloat(r.timings.layMs, ffDecimal, 2) &
+    "ms bind=" & formatFloat(r.timings.bindMs, ffDecimal, 2) &
+    "ms code=" & $r.timings.codeLen &
+    "B data=" & $r.timings.dataLen &
+    "B ext=" & $r.timings.externals
+
+proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
+  ## Assemble `<backendDir>/<mainModule>.asm.nif` and everything it reaches
+  ## into an arena and call `main(argc, argv, envp)` there. Never raises: a
+  ## refusal is `roRefused` with a reason the driver prints.
+  ##
+  ## The differences from `evaluate`, and why each one:
+  ##
+  ## * **No output capture.** fd 1 and fd 2 are the user's terminal. The guest
+  ##   writes with raw `write(2)`, so the only thing needed to keep the order
+  ##   right is flushing the compiler's own buffered streams first.
+  ## * **`kill` is not intercepted.** `cAbort` raises SIGABRT at `getpid()`;
+  ##   under `nimony n` + exec that is what the shell reports as 134, and
+  ##   in-process it is the same signal for the same reason. Taking it away
+  ##   would turn an abort into a 127 the linked binary never produces, i.e.
+  ##   it would make the two paths disagree -- the one thing `nimony r` must
+  ##   not do. `evaluate` intercepts it for the opposite reason: there the
+  ##   signal lands on a compiler that still has work to do.
+  ## * **`exit` is intercepted, and needs one more name than nativenif
+  ##   registers.** A native program's `main` ends in `cExit(0)`
+  ##   (`lengcgen.genMainProc`), so EVERY run leaves through it, not only a
+  ##   `quit`. `defaultHostSymbols` registers `exit` and `_exit`, but
+  ##   `hostsyms.cName` strips one leading underscore on registration as well
+  ##   as on lookup, so both land under the key `exit` -- and Mach-O's external
+  ##   for C `_exit` is `__exit`, whose `cName` is `_exit`, which nobody
+  ##   registered. Without the extra name the guest's exit takes the compiler
+  ##   with it (measured; `notes/b1-nimony.md` §3). Registering `__exit` here
+  ##   costs nothing on ELF, where the external is already covered.
+  ## * **No budget.** A program the user asked to run may take as long as it
+  ##   likes; there is no compiler waiting behind it.
+  ## * **One parked thread per run.** `guestExit` cannot return into the
+  ##   guest's frame, so the thread that called `exit` sleeps forever. A
+  ##   `nimony r` process runs one program and then exits, so the leak has a
+  ##   lifetime of milliseconds. It is also the reason JIT.md 7.3 wants this
+  ##   out of process eventually, which is B3's `nimrun`.
+  let t0 = getMonoTime()
+  result = RunResult(outcome: roRefused, status: 0, reason: "")
+
+  if e.disabled:
+    result.reason = e.disabledReason
+    return
+  if not hostIsSupported():
+    result.reason = "running a program from memory is not implemented for this host"
+    return
+
+  let mainAsm = p.backendDir / p.mainModule & AsmExt
+  if not fileExists(mainAsm):
+    result.reason = "the build produced no " & p.mainModule & AsmExt
+    return
+
+  var sess = default(AsmSession)
+  var arena = default(Arena)
+  var img = default(MemImage)
+  var haveSession = false
+  var haveArena = false
+  try:
+    let tAsm = getMonoTime()
+    # `openFileSession` rather than `addMainModule`: arkham ran as build-graph
+    # nodes, so the root is a file here, and nifasm's own lazy loader opens the
+    # other modules out of the same directory by suffix -- the same thing the
+    # `link` node this replaces does with `(input 0 0)`.
+    #
+    # `singleThread`: `layInMemory` REFUSES an image that still carries
+    # thread-locals, because a loaded image has no thread-local mechanism of
+    # its own. The refusal is the loud failure; `ThreadSpawners` below is the
+    # other half of the same promise.
+    sess = openFileSession(mainAsm, debugInfo = false, singleThread = true)
+    haveSession = true
+    sess.declare()
+    sess.beginEmit()
+    sess.emitTopLevel()
+    sess.emitRoots()
+    sess.finishCode()
+    result.timings.assembleMs = (getMonoTime() - tAsm).inNanoseconds.float / 1e6
+
+    # No `synthesizeProcessEntry`: that stub turns a kernel's process start
+    # into a C call, and there is already a process here.
+    let tLay = getMonoTime()
+    arena = reserveArena()
+    haveArena = true
+    img = loadImage(sess.ctx, arena)
+    result.timings.layMs = (getMonoTime() - tLay).inNanoseconds.float / 1e6
+  except AsmError as ex:
+    result.reason = "nifasm: " & ex.msg
+  except CatchableError as ex:
+    result.reason = "nifasm: " & ex.msg
+  except Defect as ex:
+    result.reason = "nifasm: " & ex.msg
+  if result.reason.len > 0:
+    if haveArena: releaseArena arena
+    if haveSession: sess.closeSession()
+    return
+
+  result.timings.codeLen = img.codeLen
+  result.timings.dataLen = img.dataLen
+  result.timings.externals = img.externals.len
+
+  try:
+    let tBind = getMonoTime()
+    for ext in img.externals:
+      for spawner in ThreadSpawners:
+        if ext.extName == spawner or ext.extName == "_" & spawner:
+          result.reason = "the program creates threads (" & ext.extName &
+            "), and running from memory lowers every thread-local to a global"
+          return
+    var host = defaultHostSymbols()
+    host.intercept("__exit", cast[pointer](guestExit))
+    let missing = bindExternals(img, host)
+    if missing.len > 0:
+      result.reason = "unresolved external symbol(s): " & missing.join(", ")
+      return
+    makeExecutable(arena, img)
+    result.timings.bindMs = (getMonoTime() - tBind).inNanoseconds.float / 1e6
+
+    if img.entry == 0:
+      result.reason = "the image has no entry point (no `main.0`)"
+      return
+
+    if p.verbose:
+      # BEFORE the run, not after: everything the program writes belongs to the
+      # program, and a compiler line in the middle of it would be the compiler
+      # lying about whose output that is.
+      echo runTimingLine(result, p.mainModule)
+
+    # The guest writes with raw `write(2)` while the compiler's own streams are
+    # buffered, so anything still sitting in them would surface AFTER the
+    # program's first line. Flush, then hand over.
+    flushFile stdout
+    flushFile stderr
+
+    var blocks = GuestBlocks(argStrings: @[], envStrings: @[],
+                             argPtrs: @[], envPtrs: @[])
+    buildGuestBlocks(p, blocks)
+    let tRun = getMonoTime()
+    let guest = runImage(img, blocks.argStrings.len.cint, addr blocks.argPtrs[0],
+                         addr blocks.envPtrs[0], budgetMs = 0)
+    result.timings.runMs = (getMonoTime() - tRun).inNanoseconds.float / 1e6
+
+    case guest.outcome
+    of goReturned, goExited:
+      result.outcome = roRan
+      result.status = guest.status.int
+    of goNotStarted:
+      result.reason = "the guest thread would not start"
+    of goTimedOut:
+      # Unreachable: no budget was passed, so the wait has no deadline to miss.
+      # Spelled out rather than elided so the arm is already here when B4 wants
+      # one.
+      result.reason = "the program ran past a budget it was not given"
+  except AsmError as ex:
+    result.reason = "nifasm: " & ex.msg
+  except CatchableError as ex:
+    result.reason = "engine: " & ex.msg
+  finally:
+    if haveSession: sess.closeSession()
+    # The arena is NOT released: the guest's exit parked a thread inside it,
+    # and on any other outcome the program's own memory may still be reachable
+    # from that thread. A `nimony r` process ends a few milliseconds later.
+    result.timings.totalMs = (getMonoTime() - t0).inNanoseconds.float / 1e6
+
 proc timingLine*(r: EngineResult; label: string): string =
   ## One line for `--verbose`: where the milliseconds went, and how big the
   ## image was. Written by hand rather than through `strformat` so the columns

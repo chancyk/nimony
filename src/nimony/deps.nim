@@ -223,6 +223,9 @@ type
     DoTranslate, # translate to C like "nim --compileOnly"
     DoCompile, # like `nim c` but with nifler
     DoRun, # like `nim run`
+    DoRunMem, # `nimony r`: build to `.asm.nif` and stop; the caller runs the
+              # program out of its own memory (`engine.runWholeProgram`), so
+              # the graph has no link node and produces no executable
     DoDoc # like `nim doc`: front-end then dagon backend
 
   BuildFlag* = enum
@@ -295,6 +298,12 @@ type
                                   ## disk, so this build wrote the module's
                                   ## `.c.nif` from the cache instead of running
                                   ## `dceEmit` for it.
+
+const
+  BackendCommands* = {DoCompile, DoRun, DoRunMem}
+    ## The commands that build a backend at all. `DoRunMem` differs from the
+    ## other two only below the per-module codegen node: it wants every
+    ## module's `.asm.nif` and nothing after it.
 
 proc toPair(c: DepContext; f: string): FilePair =
   if f.endsWith(".nif"):
@@ -1418,6 +1427,13 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
   if phase == fpLive: stem = ".final0.build.nif"
   elif phase == fpAnalysis: stem = ".final1.build.nif"
   elif phase == fpCodegen: stem = ".final2.build.nif"
+  elif c.cmd == DoRunMem: stem = ".finalr.build.nif"
+    # `nimony r`'s graph is the ordinary one minus the link node, so it must not
+    # be written over `nimony n`'s: nifmake decides staleness from the build
+    # file it is handed, and two differently shaped graphs under one name make
+    # every alternation between the two commands look like a changed build.
+    # The ARTIFACTS are shared -- `.c.nif` and `.asm.nif` are at the same paths
+    # -- so `nimony n` after a `nimony r` runs the link node and nothing else.
   result = c.config.nifcachePath / c.rootNode.files[0].modname & stem
   var b = nifbuilder.open(result)
   defer: b.close()
@@ -1640,7 +1656,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
         b.addKeyw "output"
 
     # Build rules
-    if c.cmd in {DoCompile, DoRun}:
+    if c.cmd in BackendCommands:
       let backend = c.config.backendDirName(c.rootNode.files[0])
       let backendDir = c.config.nifcachePath / backend
       # The whole-program live file. It is the `dceLive` node's ALWAYS-written
@@ -1740,6 +1756,14 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
         # The analysis graph stops after DCE: no codegen, no objects, nothing
         # to link. The object cache is resolved from the `.c.nif` files this
         # graph produces, and the `fpCodegen` graph does the rest.
+        discard
+      elif c.cmd == DoRunMem:
+        # `nimony r`: arkham above has written every module's `.asm.nif`, and
+        # the caller assembles them into its own memory instead of asking
+        # nifasm for an image on disk (`engine.runWholeProgram`). Dropping the
+        # node here rather than emitting it and ignoring its output is what
+        # makes the saving real: the whole-image assemble, the Mach-O write and
+        # its ad-hoc signature are the part `nimony r` does not pay for.
         discard
       elif wasm:
         b.withTree "do":
@@ -2734,7 +2758,9 @@ proc buildGraphImpl(config: sink NifConfig; project: string;
     if c.config.backend == backendWasm:
       exeOutPath = c.config.wasmFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
     let exeOutDir = exeOutPath.parentDir
-    if exeOutDir.len > 0:
+    if exeOutDir.len > 0 and cmd != DoRunMem:
+      # `nimony r` writes no executable, so it must not create the directory
+      # one would have gone in either.
       onRaiseQuit createDir(path(exeOutDir))
     if not runMake(nifmakeCommand, buildFinalFilename, 50, 100):
       return false
@@ -2795,6 +2821,38 @@ proc buildGraphImpl(config: sink NifConfig; project: string;
              quoteShell(c.config.wasmFile(c.rootNode.files[0], backend)) & executableArgs
       else:
         exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
+
+type
+  RunTarget* = object
+    ## What `nimony r` needs after the build in order to run the program
+    ## itself: the directory the native backend filled and the module whose
+    ## `.asm.nif` is the program's root. One record instead of four out
+    ## parameters, and the only thing `nimony.nim` has to know about the
+    ## backend's file layout.
+    ok*: bool           ## the build graph ran to completion
+    backendDir*: string ## `<nimcache>/<main>.n`
+    mainModule*: string ## the main module's suffix; `<mainModule>.asm.nif` is
+                        ## the root the assembler is handed
+    exe*: string        ## the linked executable, or "" when none was asked for
+
+proc buildGraphForRun*(config: sink NifConfig; project: string;
+    flags: set[BuildFlag];
+    commandLineArgs, commandLineArgsLengc: string; moduleFlags: set[ModuleFlag];
+    passC, passL: string; linkExe: bool): RunTarget =
+  ## `nimony r`'s build: the native backend's graph, arkham included, and no
+  ## link node unless `linkExe` (i.e. unless the user asked for an executable
+  ## with `--out`/`--outdir` and is entitled to one). The program itself is run
+  ## by the caller out of `backendDir`, so nothing here executes anything.
+  let f = FilePair(nimFile: project, modname: moduleSuffix(project, config.paths))
+  let backend = config.backendDirName(f)
+  result = RunTarget(ok: false,
+                     backendDir: config.nifcachePath / backend,
+                     mainModule: f.modname,
+                     exe: (if linkExe: config.exeFile(f, backend) else: ""))
+  let cmd = if linkExe: DoCompile else: DoRunMem
+  result.ok = buildGraphImpl(ensureMove config, project, flags, commandLineArgs,
+                             commandLineArgsLengc, moduleFlags, cmd, passC, passL,
+                             "", nested = false)
 
 proc buildGraph*(config: sink NifConfig; project: string;
     flags: set[BuildFlag];

@@ -30,6 +30,25 @@ when not defined(nimony):
   # did before this phase.
   import phases
 
+when defined(nimonyEngine):
+  # `nimony r`. Gated the same way `semos.nim` gates it: the engine links
+  # arkham and nifasm out of the sibling `../nativenif` checkout, so a plain
+  # clone still builds a nimony -- one that says `r` needs that checkout
+  # instead of pretending to have it (`compileProgram`'s `RunProject` arm).
+  import engine
+
+  proc cExit(code: cint) {.importc: "exit", header: "<stdlib.h>", noreturn.}
+
+  proc exitAs(status: int) {.noreturn.} =
+    ## The program's status, verbatim. `quit` clamps anything at or above 128
+    ## to 127 (POSIX reserves those for "killed by signal N" in a WAIT status),
+    ## and reinterpreting a guest's status is exactly what `nimony r` may not
+    ## do: `nimony n` + exec gives the shell 200 for `quit(200)` and so must
+    ## this. Buffers flushed by hand, since libc's `exit` is reached directly.
+    flushFile stdout
+    flushFile stderr
+    cExit status.cint
+
 include ".." / lib / compat2
 
 template makeDir(p: string) =
@@ -49,6 +68,12 @@ Command:
   l project.nim               compile the full project via LLVM backend
   n project.nim               compile the full project via the native backend
                               (arkham + nifasm; static, libc-free executable)
+  r project.nim [args...]     compile with the native backend and RUN the
+                              program out of the compiler's own memory: no
+                              image is written and no linker runs. Everything
+                              after project.nim is the program's argv, and its
+                              exit status becomes nimony's. `--out:PATH` asks
+                              for the executable as well.
   check project.nim           check the full project for errors; can be
                               combined with `--usages`, `--def` for
                               editor integration
@@ -148,7 +173,8 @@ proc processSingleModule(nimFile: string; config: sink NifConfig; moduleFlags: s
 
 type
   Command = enum
-    None, SingleModule, FullProject, CheckProject, SemCheckNif, DocProject
+    None, SingleModule, FullProject, CheckProject, SemCheckNif, DocProject,
+    RunProject
 
 proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
   case key.normalize:
@@ -168,6 +194,17 @@ proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
     config.addDefine "nimNativeAlloc"
     config.addDefine "nimNativeIo"
     FullProject
+  of "r":
+    # The same backend as `n`, stopping one node earlier: every module's
+    # `.asm.nif` is produced and the program is then assembled into this
+    # process's own memory and called there (JIT.md 7.3). It has to set the
+    # very same defines, because the program the engine runs must be the same
+    # program `n` would have linked -- that is what makes `nimony r` and
+    # `nimony n` + exec comparable, which is what the tests compare.
+    config.backend = backendNative
+    config.addDefine "nimNativeAlloc"
+    config.addDefine "nimNativeIo"
+    RunProject
   of "w":
     # Wasm backend: Leng -> ithaqua, producing one whole-program `.wasm`
     # module (no C compiler, no linker — the JS/wasm host resolves the fixed
@@ -203,6 +240,12 @@ type
     passC: string
     passL: string
     executableArgs: string
+    programArgs: seq[string]
+      ## `nimony r`'s argv for the program, UNQUOTED. `executableArgs` beside it
+      ## is a shell command line, which is what `-r`'s `exec` needs and exactly
+      ## what an in-process call must not have: the engine hands the strings to
+      ## the guest's `main` one pointer at a time, so a `quoteShell` would put
+      ## the quotes into argv.
 
 proc createCmdOptions(baseDir: sink string): CmdOptions =
   CmdOptions(
@@ -220,7 +263,8 @@ proc createCmdOptions(baseDir: sink string): CmdOptions =
     passL: "",
     checkModes: DefaultSettings,
     forwardArgsToExecutable: false,
-    executableArgs: ""
+    executableArgs: "",
+    programArgs: @[]
   )
 
 proc parsePositiveInt(val: string): int =
@@ -260,9 +304,16 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
       else:
         if c.forwardArgsToExecutable:
           c.executableArgs.add " " & quoteShell(key)
+          c.programArgs.add key
         else:
           c.args.add key
           if c.cmd == FullProject and c.doRun and c.args.len >= 1:
+            c.forwardArgsToExecutable = true
+          elif c.cmd == RunProject and c.args.len >= 1:
+            # `nimony r prog.nim a b`: the project file is the last token this
+            # compiler reads. `-r` needs the flag first because `nimony c -r`
+            # and `nimony c` are the same command; `r` IS the command, so
+            # there is nothing to wait for.
             c.forwardArgsToExecutable = true
 
     of cmdLongOption, cmdShortOption:
@@ -270,6 +321,13 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
         c.executableArgs.add " --" & key
         if val.len > 0:
           c.executableArgs.add ":" & quoteShell(val)
+        # The unquoted twin, for a program called rather than exec'd. `getopt`
+        # has already split `--k:v`/`--k=v`, so this is the one spelling both
+        # forms come back as -- which is what the exec path does too.
+        if val.len > 0:
+          c.programArgs.add "--" & key & ":" & val
+        else:
+          c.programArgs.add "--" & key
       else:
         var forwardArg = true
         var forwardArgLengc = false
@@ -437,6 +495,54 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
 
     of cmdEnd: assert false, "cannot happen"
 
+proc runProject(c: var CmdOptions) =
+  ## `nimony r`: build the native backend down to every module's `.asm.nif`,
+  ## then assemble and call the program in this very process
+  ## (`engine.runWholeProgram`). Nothing is written to disk unless `--out` /
+  ## `--outdir` asked for an executable, in which case the ordinary link node
+  ## runs as well and the program is STILL run from memory -- one build, two
+  ## answers.
+  ##
+  ## The program's status becomes nimony's. That is stricter than `-r`, whose
+  ## `exec` turns any non-zero result into a generic `FAILURE:` line; a command
+  ## whose whole purpose is running the program has to be transparent about
+  ## what the program said.
+  makeDir(c.config.nifcachePath)
+  let project = c.args[0].addFileExt(".nim")
+  let wantExe = c.config.outFile.len > 0 or c.config.outDir.len > 0
+  when defined(nimonyEngine):
+    let target = buildGraphForRun(c.config, project, c.buildFlags,
+                                  c.commandLineArgs, c.commandLineArgsLengc,
+                                  c.moduleFlags, c.passC, c.passL, wantExe)
+    if not target.ok:
+      quit "FAILURE: could not build " & project
+    # argv[0] is the program's own name, the way an exec'd one sees it: the
+    # executable's path when there is one, else the project file.
+    var argv: seq[string] = @[]
+    if target.exe.len > 0: argv.add target.exe
+    else: argv.add project
+    for a in c.programArgs: argv.add a
+    var e = initEngine()
+    let r = runWholeProgram(e, RunProgram(backendDir: target.backendDir,
+                                          mainModule: target.mainModule,
+                                          argv: argv,
+                                          verbose: c.config.verbose))
+    case r.outcome
+    of roRan:
+      exitAs r.status
+    of roRefused:
+      # No fallback here. JIT.md 7.5's C-backend fallback is for compile-time
+      # evaluation, where a refusal must not be visible to the user; for `r`
+      # the honest answer is the diagnostic and the command that does work.
+      quit "nimony r: cannot run this program from memory: " & r.reason &
+           "\n  use `nimony n" & (if wantExe: "" else: " -r") &
+           "` to link and run it instead"
+  else:
+    discard project
+    discard wantExe
+    quit "nimony r needs the sibling `../nativenif` checkout at build time " &
+         "(the compiler was built without `-d:nimonyEngine`); use `nimony n -r`"
+
 proc compileProgram(c: var CmdOptions) =
   if c.config.backend == backendNative and c.config.appType notin {appConsole, appGui}:
     quit "the native backend supports executables only (no --app:lib/staticlib)"
@@ -537,6 +643,8 @@ proc compileProgram(c: var CmdOptions) =
     buildGraph c.config, c.args[0], c.buildFlags,
       c.commandLineArgs, c.commandLineArgsLengc, c.moduleFlags, (if c.doRun: DoRun else: DoCompile),
       c.passC, c.passL, c.executableArgs
+  of RunProject:
+    runProject(c)
 
 when isMainModule:
   var c = createCmdOptions(determineBaseDir())
