@@ -237,7 +237,18 @@ Steps 1 and 2 are worth doing on their own merits even if the rest never
 happens: they are what makes any artifact diff in this compiler mean
 "something changed" instead of "something moved".
 
-## 8. Risks in what was NOT done
+## 8. One pre-existing failure found on the way
+
+`hastur test tests/ledger` fails here with *"nifmake must record a spawn
+cost for nimsem"* (`tests/ledger/setup.nim:378`). Reproduced with this
+branch's two modified files checked out at the fork point, so it is not
+B3b's. The assertion wants at least one nimsem sample with
+`ewma.spawnNs > 0`, but since A2b the scheduler runs a single-node depth
+in-process — whether nimsem is spawned at all in that build is a scheduler
+decision driven by the ledger's own cost estimates on the machine at hand.
+The test asserts a spawn the scheduler is free not to make.
+
+## 9. Risks in what was NOT done
 
 * The 1.38 s edit loop keeps its 0.25 s hexer and 0.25 s arkham. B4's hot
   reload wants symbol granularity by definition, so this comes back.

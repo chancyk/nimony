@@ -241,7 +241,24 @@ compiled path, so this row re-confirms B3's number and is what the next
 attempt has to beat.
 
 
-8. Verdict
+8. Found while running the suite (not B3b's)
+--------------------------------------------
+
+`hastur test tests/ledger` fails on this machine with
+
+  [ledger] FAIL: nifmake must record a spawn cost for nimsem
+
+(`tests/ledger/setup.nim:378`).  Reproduced with `src/hastur/
+incrementaltests.nim` and `tests/incremental/setup.nim` checked out at the
+fork point `bad14fbf`, so it predates this branch.  The assertion wants at
+least one nimsem sample with `ewma.spawnNs > 0`, and since A2b the scheduler
+runs a single-node depth IN PROCESS -- so whether nimsem is ever spawned in
+that build is a scheduler decision, i.e. a function of the ledger's own cost
+estimates on the machine at hand.  The test asserts a spawn that the
+scheduler is free not to make.
+
+
+9. Verdict
 ----------
 
 Neither half of B3b is implemented, and the measurement is the reason.
