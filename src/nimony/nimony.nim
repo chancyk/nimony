@@ -31,6 +31,10 @@ when not defined(nimony):
   import phases
 
 when defined(nimonyEngine):
+  # Only the two names the cross-compile guard in `runProject` needs; a full
+  # import would put arrays called `CPU`/`OS` into this module's scope.
+  from ".." / lib / platform import nameToCPU, nameToOS
+
   # `nimony r`. Gated the same way `semos.nim` gates it: the engine links
   # arkham and nifasm out of the sibling `../nativenif` checkout, so a plain
   # clone still builds a nimony -- one that says `r` needs that checkout
@@ -507,10 +511,18 @@ proc runProject(c: var CmdOptions) =
   ## `exec` turns any non-zero result into a generic `FAILURE:` line; a command
   ## whose whole purpose is running the program has to be transparent about
   ## what the program said.
-  makeDir(c.config.nifcachePath)
-  let project = c.args[0].addFileExt(".nim")
-  let wantExe = c.config.outFile.len > 0 or c.config.outDir.len > 0
   when defined(nimonyEngine):
+    if c.config.targetCPU != nameToCPU(hostCPU) or
+       c.config.targetOS != nameToOS(hostOS):
+      # A cross compile has no arena to run in: the image is code for another
+      # machine, and `hostrun` would call it here. Refused before the build
+      # rather than after it, because the build is the expensive half and
+      # nothing about it could make the run possible.
+      quit "nimony r runs the program in this process, so it cannot cross " &
+           "compile (--cpu/--os name another target); use `nimony n`"
+    makeDir(c.config.nifcachePath)
+    let project = c.args[0].addFileExt(".nim")
+    let wantExe = c.config.outFile.len > 0 or c.config.outDir.len > 0
     let target = buildGraphForRun(c.config, project, c.buildFlags,
                                   c.commandLineArgs, c.commandLineArgsLengc,
                                   c.moduleFlags, c.passC, c.passL, wantExe)
@@ -538,8 +550,6 @@ proc runProject(c: var CmdOptions) =
            "\n  use `nimony n" & (if wantExe: "" else: " -r") &
            "` to link and run it instead"
   else:
-    discard project
-    discard wantExe
     quit "nimony r needs the sibling `../nativenif` checkout at build time " &
          "(the compiler was built without `-d:nimonyEngine`); use `nimony n -r`"
 

@@ -4,7 +4,23 @@
 # See the file "license.txt", included in this
 # distribution, for details about the copyright.
 
-## The Leng engine behind compile-time evaluation (`--ctfe:engine`, JIT.md 7.2).
+## The Leng engine: a program assembled into this process's memory and called
+## there instead of being linked and exec'd. Two customers, the two halves of
+## JIT.md 7:
+##
+## * `evaluate` -- compile-time evaluation (`--ctfe:engine`, JIT.md 7.2), the
+##   subject of everything down to `timingLine`;
+## * `runWholeProgram` -- `nimony r` (JIT.md 7.3, JIT_IMPL.md B1), at the
+##   bottom of the file, which starts one step later because the build graph's
+##   arkham nodes have already produced every module's `.asm.nif`.
+##
+## They share the loader, the target dispatch and the timing record, and they
+## differ in every place where a compiler evaluating a `const` and a user
+## running a program genuinely want different things -- output capture, `kill`,
+## the budget, and what a refusal means. Each difference is argued at the site
+## that makes it.
+##
+## The rest of this header is about `evaluate`.
 ##
 ## A `const` that `expreval` cannot fold becomes a whole PROGRAM
 ## (`exprexec.executeExpr`), and the subprocess path compiles and links that
@@ -791,8 +807,9 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
     if p.verbose:
       # BEFORE the run, not after: everything the program writes belongs to the
       # program, and a compiler line in the middle of it would be the compiler
-      # lying about whose output that is.
-      echo runTimingLine(result, p.mainModule)
+      # lying about whose output that is. On stderr, and for the same reason:
+      # `nimony r prog.nim > out` must put the PROGRAM's stdout in `out`.
+      stderr.writeLine runTimingLine(result, p.mainModule)
 
     # The guest writes with raw `write(2)` while the compiler's own streams are
     # buffered, so anything still sitting in them would surface AFTER the

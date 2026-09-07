@@ -298,6 +298,22 @@ proc checkOutWritesExecutable() =
     else:
       ok "--out writes an executable that agrees with the in-memory run"
 
+proc checkCrossCompileRefused() =
+  ## `nimony r` runs the program in the compiler's own process, so a `--cpu` /
+  ## `--os` naming another machine is not something it can do -- and the honest
+  ## answer is a diagnostic naming the command that can, not a build followed
+  ## by a crash inside somebody else's instruction set.
+  let src = work / "cross" / "cross.nim"
+  writeSrc src, HelloSrc
+  let r = nimonyR(src, work / "cross" / "nc", "",
+                  "--cpu:amd64 --os:linux")
+  if r.code == 0:
+    fail "cross: `nimony r --cpu:amd64 --os:linux` succeeded\n" & r.output.strip
+  elif "cross compile" notin r.output:
+    fail "cross: refused without saying why\n" & r.output.strip
+  else:
+    ok "a cross compile is refused, not attempted"
+
 proc checkCompilerItself() =
   ## The biggest program in the repository, ~130 modules: `nimony r` of the
   ## compiler, printing its version. It is here because everything smaller
@@ -345,6 +361,7 @@ checkPanic()
 checkCorpus()
 checkNoExecutable()
 checkOutWritesExecutable()
+checkCrossCompileRefused()
 checkCompilerItself()
 
 removeDir work
