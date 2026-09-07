@@ -17,8 +17,8 @@
 ##
 ## ```
 ## if the phase is not registered:              spawn
-## elif estimated produce < spawnCost * k:      in-process     (k = 3)
-## elif ready nodes at this depth < cores:      in-process
+## elif the depth is one node:                  in-process (the edit-rebuild, the CTFE snippet)
+## elif n*est <= ceil(n/cores)*est + k*spawn:  in-process (n = ready nodes at this depth)
 ## else:                                        spill inputs, spawn
 ## ```
 ##
@@ -198,12 +198,6 @@ proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
   if req.rawArgs: return false
   if req.argv.len == 0: return false
 
-  # A depth too thin to fill the cores has nothing to fan out to, so a process
-  # buys only its own cost. This is JIT.md 6.2's second clause and it is the
-  # one that carries an edit-rebuild and a compile-time evaluation, where a
-  # depth is one or two nodes.
-  if req.readyAtDepth < s.cores: return true
-
   let key = LedgerKey(phase: req.name, module: moduleOfNode(req))
   # An empty toolhash asks about the phase regardless of which binary measured
   # it: the scheduler is weighing somebody else's tool, and stamping the query
@@ -212,20 +206,25 @@ proc wantsInproc*(s: PhaseSchedule; req: RunNodeRequest): bool =
   var spawnCost = est.spawnNs
   if spawnCost < MinSpawnCostNs: spawnCost = MinSpawnCostNs
 
-  # JIT.md 6.2's first clause, "is this node worth a process", scaled to the
-  # depth. In-process nodes run SEQUENTIALLY, so at a depth of `n` nodes the
-  # real comparison is `n` calls against one fan-out, not one call against one
-  # spawn -- and the literal per-node form answers "not worth it" for every
-  # one of 99 cheap `hexer` nodes and then runs them one after another. That
-  # is 0.6 s of wall on a cold stdlib build that the fan-out does in a tenth
-  # of it, and it contradicts JIT.md 6.3's own expectation that "a cold
-  # 100-module build still fans out".
+  # JIT.md 6.2 asks "is a process worth it for this node"; at a depth of `n`
+  # ready nodes the honest form of that question compares the two ways the
+  # depth can be run. In-process nodes run SEQUENTIALLY, so that costs
+  # `n * est`. Fanning out costs one spawn (weighted by `k`, the plan's
+  # allowance for what a process costs beyond its wall time) plus
+  # `ceil(n / cores)` rounds of the phase. Go in-process when the sequential
+  # run is no slower:
   #
-  # The two agree exactly where they meet: at `readyAtDepth == cores` this is
-  # `est * cores < spawn * k * cores`, i.e. `est < spawn * k`, the rule as
-  # written. It only tightens as a depth grows past the core count, which is
-  # the only region where the per-node form and the fan-out disagree.
-  result = est.produceNs * req.readyAtDepth < spawnCost * s.k * s.cores
+  #   n * est  <=  ceil(n / cores) * est + k * spawn
+  #
+  # A single node is always in-process (`est <= est + k*spawn`), which is the
+  # edit-rebuild and the compile-time evaluation. Five 20 ms nimsem nodes on
+  # ten cores fan out (100 > 20 + 9); five 1 ms lengc nodes do not (5 < 10);
+  # 99 hexer nodes fan out, as JIT.md 6.3 expects of a cold stdlib build. The
+  # earlier clause "fewer ready nodes than cores -> in-process" answered the
+  # first case wrong and cost a forced stdlib rebuild 15 % of wall.
+  let n = max(req.readyAtDepth, 1)
+  let rounds = (n + s.cores - 1) div s.cores
+  result = est.produceNs * n <= est.produceNs * rounds + spawnCost * s.k
 
 # --- the relay -------------------------------------------------------------
 
