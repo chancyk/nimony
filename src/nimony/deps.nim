@@ -2687,8 +2687,8 @@ proc buildGraphImpl(config: sink NifConfig; project: string;
     commandLineArgs, commandLineArgsLengc: string; moduleFlags: set[ModuleFlag]; cmd: Command;
     passC, passL: string, executableArgs: string; nested: bool): bool =
   result = true
-  let nifler = findTool("nifler")
-  let nifmake = findTool("nifmake")
+  let nifler = demandTool("nifler")
+  let nifmake = demandTool("nifmake")
   let forceRebuild = ForceRebuild in flags
 
   if config.compat:

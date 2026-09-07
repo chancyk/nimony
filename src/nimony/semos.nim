@@ -448,7 +448,7 @@ proc getFile*(info: NifLineInfo): string =
     result = ""
 
 proc selfExec*(c: var SemContext; file: string; moreArgs: string) =
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = demandTool("nimony")
   exec quoteShell(nimonyExe) & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
   #exec os.getAppFilename() & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
 
@@ -483,7 +483,7 @@ proc pluginCompileCmd(config: NifConfig; cacheDir: string): string =
   # a leaf of the build graph. Without this, a plugin whose source imports the
   # module declaring it (`lib/std/deps/smartcli.nim` imports `std/smartcli`)
   # would need itself built first, and the nested builds never bottom out.
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = demandTool("nimony")
   let pluginDir = nimonyDir() / "src/nimony/lib"
   let srcLibPath = nimonyDir() / "src" / "lib"
   result = quoteShell(nimonyExe) &
@@ -832,7 +832,7 @@ proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
 
   if verbose:
     echo "[ctfe-build] spawning ", extractModuleSuffix(file)
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = demandTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
     (if analysisOnly: " --ctfe-analysis-only" else: "") &
     " --nimcache:" & quoteShell(nimcachePath) &
@@ -914,7 +914,7 @@ proc prepareEval*(c: var SemContext): string =
         if inproc != 0:
           return "failed to precompile std/writenif"
         return ""
-      let nimonyExe = findTool("nimony")
+      let nimonyExe = demandTool("nimony")
       var cmd = quoteShell(nimonyExe) & c.commandLineArgs &
         " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
         " c " & quoteShell(writeNifSrc)

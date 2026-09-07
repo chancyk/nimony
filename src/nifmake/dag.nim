@@ -183,6 +183,48 @@ proc hasRawArgs*(parts: seq[CmdArg]): bool =
   for i in 0 ..< parts.len:
     if parts[i].raw: return true
 
+proc searchPathFor(name: string): string =
+  ## `name` in one of `PATH`'s directories, absolute, or `""`. Hand-rolled
+  ## rather than `os.findExe` for one reason: `findExe` looks in the CURRENT
+  ## DIRECTORY first on Windows (and on POSIX for any name holding a `/`),
+  ## and the current directory is the candidate this whole resolution exists
+  ## to rule out — a file called `nimony` in the directory a build runs from
+  ## is not the compiler.
+  result = ""
+  for dir in getEnv("PATH").split(PathSep):
+    if dir.len == 0: continue
+    let cand = dir / name
+    if fileExists(cand): return cand
+
+proc resolveProgram*(name: string): string =
+  ## The program a `(cmd …)` template's first token names. A command is
+  ## either one of ours (`nimsem`, `hexer`, `nifasm`, a `{.build.}` tool) or
+  ## an external program (`cc`, the system linker, `nim` as a builder), and
+  ## the two resolve differently:
+  ##
+  ## * ours live next to the running executable, so `bin*/` wins and answers
+  ##   with an absolute path;
+  ## * an external one is looked up in `PATH` here rather than left to the
+  ##   shell, so that what nifmake runs is what nifmake resolved.
+  ##
+  ## The current directory is never a candidate for either. It used to be the
+  ## FIRST one (`tooldirs.findTool` began with `fileExists(name)`), and the
+  ## hit was returned as a bare word, which a shell then resolved through
+  ## `PATH` again — so a build whose `--out` binary was called `nimony` and
+  ## sat in the cwd answered its CTFE sub-compile with `/bin/sh: nimony:
+  ## command not found`.
+  ##
+  ## A name that is nowhere is returned unchanged: the shell's "command not
+  ## found" is then the truth about it, and `generateMakefile` must still be
+  ## able to write a rule for a program this machine does not have.
+  let exe = name.addFileExt(ExeExt)
+  if name.isAbsolute: return exe
+  let ours = toolDir(exe)
+  if fileExists(ours): return ours
+  let onPath = searchPathFor(exe)
+  if onPath.len > 0: return onPath
+  result = name
+
 proc addFilename(parts: var seq[CmdArg]; filename, prefix, suffix: string) =
   if filename.len > 0:
     # This is not a bug, a suffix is always assumed to be part of the filename
@@ -202,7 +244,7 @@ proc expandCommandArgs*(cmd: Command; inputs, outputs, args: seq[string];
   var toolArgs: seq[string] = @[]
   var first = 0
   if cmd.slots[0].kind == csLiteral:
-    let tool = findTool(cmd.slots[0].text)
+    let tool = resolveProgram(cmd.slots[0].text)
     result.add CmdArg(body: tool)
     first = 1
     if baseDir.len > 0 and cmd.ext.len > 0:

@@ -29,6 +29,12 @@ incrementalTests("--vfs:memory+spill")
 # rebuilt.
 incrementalOCacheTests("--spawn:always")
 incrementalTests("--spawn:always")
+# A build whose own output is named after one of the tools, run from the
+# directory that output lands in. Both scheduler modes: the default runs the
+# compile-time evaluation's sub-compile in-process, `--spawn:always` spawns it,
+# and only the spawned one ever reached a shell with the tool's name in it.
+incrementalToolShadowTests()
+incrementalToolShadowTests("--spawn:always")
 # ... and the scheduler's own assertions: the `inproc` field, byte identity
 # against `--spawn:always`, and a spawn-free compile-time evaluation.
 incrementalInprocTests()

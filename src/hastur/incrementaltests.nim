@@ -1236,3 +1236,85 @@ proc incrementalDeclStabilityTests*() =
     quit "FAILURE: " & $failures.len & " decl-stability phase(s) failed."
   echo "decl-stability: ", phases, " / ", phases, " phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."
+
+# ---- A tool must not be shadowed by the build's own output ----------------
+# `findTool` used to try `fileExists(name)` first, i.e. the CURRENT DIRECTORY,
+# and to answer with the bare name it had matched. Both halves were wrong and
+# together they made one build fail: a program built with `--out:./nimony`
+# leaves a file called `nimony` in the directory the next build runs from,
+# `findTool("nimony")` picks it up, and the CTFE sub-compile is spliced into a
+# shell line as the bare word `nimony` — which `/bin/sh` resolves through
+# `PATH`, where it is not. `nimony: command not found`, from the middle of a
+# compile that has nothing to do with `PATH`.
+#
+# The scenario is the shape of the failure and nothing else: build twice from
+# a scratch directory, with the output named after the compiler, from a fresh
+# nimcache each time.
+
+proc incrementalToolShadowTests*(mode = "") =
+  ## Build a program whose `const` needs a compile-time-eval sub-compile from
+  ## a scratch directory, writing the executable as `./nimony` — the name of
+  ## the tool that sub-compile has to find. Twice, from a fresh nimcache both
+  ## times, so the second run is the one whose cwd already holds the decoy.
+  let t0 = epochTime()
+  let modeFlag = if mode.len > 0: " " & mode else: ""
+  let suffix = if mode.len > 0: "-" & modeTag(mode) else: ""
+  let nimony = absolutePath("bin" / "nimony".addFileExt(ExeExt))
+  if not fileExists(nimony):
+    quit "tool-shadow: " & nimony & " not found; run `hastur build nimony` first"
+  let scratch = absolutePath("nimcache" / ("toolshadow" & suffix))
+  let cache = scratch / "nc"
+  let src = scratch / "shadow.nim"
+  let decoy = scratch / "nimony".addFileExt(ExeExt)
+  removeDir scratch
+  createDir scratch
+  # `f` is not foldable by the parser, so the `const` is a real evaluation and
+  # the sub-compile the decoy used to break actually happens.
+  writeFile(src, """import std / syncio
+
+proc f(x: int): int =
+  result = 1
+  for i in 0 ..< x: result = result * 3 + i
+
+const c = f(4)
+echo c
+""")
+
+  var failures: seq[string] = @[]
+  template expect(cond: bool; msg: string) =
+    if not (cond): failures.add msg
+
+  let previous = getCurrentDir()
+  var phases = 0
+  try:
+    setCurrentDir scratch
+    for round in 1 .. 2:
+      inc phases
+      let label = "round " & $round
+      # A fresh nimcache every round: the memo of P0a would otherwise let the
+      # second round skip the very sub-compile this is about.
+      removeDir cache
+      # `-o:./nimony`, relative and with the leading `./`, because that is what
+      # a user writes and what puts the decoy in the cwd. `-r` so a build that
+      # produced a broken executable is caught too.
+      let cmd = nimony.quoteShell & " c -r --silentMake" & modeFlag &
+                " --nimcache:" & cache.quoteShell & " --out:./nimony shadow.nim"
+      let (output, ec) = execCmdEx(cmd)
+      expect ec == 0,
+             label & ": the build failed (exit " & $ec & "):\n" & output
+      expect output.contains("99"),
+             label & ": expected the program to print 99, got: " & output
+      expect fileExists(decoy),
+             label & ": no `nimony` was written into the build directory, so " &
+             "the next round would not test anything"
+      if ec != 0: break
+  finally:
+    setCurrentDir previous
+
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "tool-shadow" & modeLabel(mode) & ": " & f
+    quit "FAILURE: " & $failures.len & " tool-shadow phase(s) failed."
+  removeDir scratch
+  echo "tool-shadow", modeLabel(mode), ": ", phases, " / ", phases,
+       " phases successful in ", formatFloat(dt, ffDecimal, precision=2), "s."
