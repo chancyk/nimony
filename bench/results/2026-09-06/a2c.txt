@@ -6,7 +6,7 @@ mode:    NIMONY_VFS=disk (the default), C backend, debug, --ctfe:auto (= the
          engine on this host)
 before:  fast-devloop @5de8445f, built in this worktree and copied to
          /tmp/a2c_before   (P0a P0b A1a A1b A1c A1d A2a* A2b B2)
-after:   jit/a2c @2b59abe6 + the boot fix, /tmp/a2c_after2
+after:   jit/a2c @f9854ec8, /tmp/a2c_after3
 
 
 1. What is measured, and why it is not `ctfe.cold / 5`
@@ -32,11 +32,16 @@ The same run with only the outer `.s.nif` deleted (five memo HITS) is the
 baseline to subtract: it is the cost of the outer module's sem and of the
 memo checks, which no phase here changes.
 
-    5 memo-hit evaluations   11.4 ms      <- subtracted
-    5 fresh evaluations     225.3 ms  (before)   191.2 ms  (after step 1)
-                                              163.2 ms  (after step 2)
+    5 memo-hit evaluations   11.3 ms  (before)   10.9 ms  (after)
+    5 fresh evaluations     224.6 ms  (before)  144.8 ms  (after)
 
 so one NEW evaluation:
+
+    before   42.6 ms
+    after    26.8 ms
+
+taken step by step while the phase was built (a slightly busier machine, so
+the absolute numbers are ~1 ms higher than the pair above):
 
     before   42.8 ms
     step 1   36.0 ms   (the `nimony s` process removed)
@@ -47,8 +52,8 @@ in the nimcache and survive between runs, which is what a dev loop looks like.
 Wiping them before every run instead — so each cache is warm only WITHIN one
 compile of five consts — gives the pessimistic figure:
 
-    before   49.4 ms
-    after    38.1 ms
+    before   50.1 ms
+    after    38.4 ms
 
 Both are under the 50 ms the plan asks for; the 25 ms figure of JIT.md 7.2
 needs the two items in §5.
@@ -70,18 +75,18 @@ reported as one line rather than hidden.
       memo check, parse of `.out.nif`            1.5       1.5
     spawn of `nimony s` + dyld + tool init       4.7        —
     sub-build: deps scan, build-file emission,
-      mtime walks (2 graphs before, 3 after)     3.2       ~4
-    sub-build: nimsem of the snippet             1.3       1.5
-    sub-build: hexer of the snippet              1.0       2.0
-    sub-build: dceLive                           8.8       9.2
-    sub-build: dceEmit x8 -> x1                  9.9       0.3
+      mtime walks (2 graphs before, 3 after)     3.2       ~3
+    sub-build: nimsem of the snippet             1.3       1.2
+    sub-build: hexer of the snippet              1.0       0.9
+    sub-build: dceLive                           8.8       8.5
+    sub-build: dceEmit x8 -> x1                 10.0       0.3
     engine: arkham (1 run, 7 asm-cache hits)     3.3       3.3
     engine: assemble (nifasm)                    6.6       6.6
     engine: lay + bind + run                     0.3       0.3
     unattributed (graph walk, ccache keys,
-      `.c.nif` writes)                           2.2       1.7
+      `.c.nif` writes)                           1.9       1.2
     ---------------------------------------------------------------
-    end to end                                  42.8      30.4
+    end to end                                  42.6      26.8
 
 `dceEmit` fragments per sub-program: 8 before, 1 after (the main module, whose
 suffix is a checksum of the expression and is therefore never cached).
@@ -175,7 +180,7 @@ again with the cache, into the same nimcache path:
 5. What remains, with the number
 ---------------------------------
 
-  * **`dceLive`, 9.2 ms** — the largest single phase left. It reads all eight
+  * **`dceLive`, 8.5 ms** — the largest single phase left. It reads all eight
     `.dce.nif` and computes the live set from the MAIN module's roots, so it
     is per-program by construction and cannot be content-addressed across
     sub-programs. Making it cheaper means either keeping the parsed stdlib
@@ -210,16 +215,23 @@ added to the ephemeral list.
 7. Raw runs
 ------------
 
+  final pair, quiet machine (load < 2), caches kept across runs:
+  before  5 memo-hit   11 11 11 11 11 11 12       median 11.3
+  before  5 fresh     224 225 225 224 226 225 225 median 224.6  -> 42.6 per eval
+  head    5 memo-hit   11 12 12 11 11 11 11       median 10.9
+  head    5 fresh     145 144 146 145 152 146 145 median 144.8  -> 26.8 per eval
+
+  final pair, caches wiped every run:
+  before  5 memo-hit   median 11.2   5 fresh median 261.5   -> 50.1 per eval
+  head    5 memo-hit   median 11.3   5 fresh median 203.4   -> 38.4 per eval
+
+  step by step while the phase was built (busier machine):
   before  5 memo-hit   11 11 12 12 11 11 11      median 11.4
   before  5 fresh     225 225 226 225 227 233 224 median 225.3
   step1   5 memo-hit   12 11 11 11 11 11 12      median 11.4
   step1   5 fresh     191 191 190 218 203 191 191 median 191.2
   step2   5 memo-hit   12 11 11 11 11 12 11      median 11.4
   step2   5 fresh     163 179 151 150 166 153 169 median 163.2
-
-  caches wiped every run:
-  before  5 memo-hit   median 11.2   5 fresh median 258.1   -> 49.4 per eval
-  after   5 memo-hit   median 10.9   5 fresh median 201.3   -> 38.1 per eval
 
   child alone (before), fresh evaluation:
     31.4 31.4 31.1 31.7 32.2 32.5 33.5 32.6 39.1  median 32.2
@@ -233,7 +245,27 @@ added to the ephemeral list.
     bind=0.03ms run=0.18ms total=10.17ms
 
 
-8. Progress benchmark (bench/devloop_bench.sh)
+8. One regression the block benchmark could not see
+----------------------------------------------------
+
+Splitting the analysis into two graphs first left the hexer and `dceLive`
+nodes in BOTH of them. hexer writes `.x.nif` OnlyIfChanged, so a node whose
+output keeps its old mtime is stale forever under nifmake's mtime rule — and
+the one scenario where hexer is genuinely stale is a FORCED rebuild, which is
+also the one scenario the fresh-evaluation measurement above does not cover.
+
+`bench/devloop_ab.sh /tmp/a2c_before . ctfe.forced 5` (this phase's own before
+against its after, interleaved):
+
+    with the doubled nodes:   B/A cpu 1.314  (1.285 -> 1.688 s)
+    with them emitted once:   B/A cpu 0.974  (1.495 -> 1.456 s)
+
+The block runs could not have found it: the same afternoon they reported
+`hello.forced` at +12.6 % cpu, which the interleaved script then measured at
+-4.3 %. Drift between two blocks is the same size as the signal.
+
+
+9. Progress benchmark (bench/devloop_bench.sh)
 -----------------------------------------------
 
 See the table appended to `bench/results/2026-09-06/progress.md` under run 4.

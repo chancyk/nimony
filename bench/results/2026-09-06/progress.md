@@ -214,3 +214,78 @@ and cheaper in cpu; stdlib-wide cold is +4 % wall / -3 % cpu and forced +10 %
 wall / -6 % cpu. The forced wall cost is the next thing to profile (see the
 A2b review commit: the in-process node of a depth runs BEFORE the depth's
 fan-out instead of overlapping it).
+
+## Run 4 (quiet; load < 2 before each block), median of 3 -- A2c merged
+
+head = f9854ec8 (adds A2c: the compile-time-evaluation sub-build in the
+compiler's own process, and the content-addressed `.c.nif` of the stdlib
+closure).
+
+| scenario | base wall | head wall | wall ratio | base cpu | head cpu | cpu ratio |
+|---|---|---|---|---|---|---|
+| hello.forced | 0.419 | 0.402 | 1.04x | 0.663 | 0.632 | 1.05x |
+| hello.nochange | 0.014 | 0.006 | 2.33x | 0.012 | 0.005 | 2.40x |
+| hello.edit | 0.079 | 0.064 | 1.23x | 0.106 | 0.092 | 1.15x |
+| ctfe.cold | 2.474 | 0.811 | 3.05x | 3.731 | 1.324 | 2.82x |
+| ctfe.warm | 0.011 | 0.007 | 1.57x | 0.010 | 0.007 | 1.43x |
+| ctfe.edit | 0.190 | 0.071 | 2.68x | 0.203 | 0.099 | 2.05x |
+| ctfe.forced | 3.610 | 0.829 | 4.36x | 5.366 | 1.229 | 4.37x |
+| bench.cold | 5.896 | 1.172 | 5.03x | 9.194 | 1.734 | 5.30x |
+| bench.edit | 0.418 | 0.096 | 4.35x | 0.415 | 0.124 | 3.35x |
+| stdlib.cold | 5.089 | 5.354 | 0.95x | 28.430 | 27.621 | 1.03x |
+| stdlib.forced | 1.917 | 2.094 | 0.92x | 9.080 | 8.665 | 1.05x |
+| stdlib.edit | 0.433 | 0.519 | 0.83x | 1.283 | 0.717 | 1.79x |
+
+raw (wall / cpu):
+```
+base  hello.forced    wall 0.421 0.417 0.419  cpu 0.663 0.652 0.663
+head  hello.forced    wall 0.403 0.402 0.401  cpu 0.632 0.640 0.630
+base  hello.nochange  wall 0.014 0.014 0.015  cpu 0.012 0.012 0.013
+head  hello.nochange  wall 0.006 0.006 0.006  cpu 0.005 0.005 0.005
+base  hello.edit      wall 0.078 0.079 0.080  cpu 0.091 0.106 0.107
+head  hello.edit      wall 0.064 0.064 0.064  cpu 0.080 0.093 0.092
+base  ctfe.cold       wall 2.874 2.474 2.456  cpu 3.731 3.738 3.673
+head  ctfe.cold       wall 0.811 0.863 0.807  cpu 1.324 1.336 1.315
+base  ctfe.warm       wall 0.011 0.011 0.011  cpu 0.010 0.010 0.010
+head  ctfe.warm       wall 0.007 0.007 0.007  cpu 0.007 0.006 0.007
+base  ctfe.edit       wall 0.186 0.192 0.190  cpu 0.199 0.205 0.203
+head  ctfe.edit       wall 0.073 0.071 0.071  cpu 0.098 0.100 0.099
+base  ctfe.forced     wall 3.588 3.647 3.610  cpu 5.330 5.403 5.366
+head  ctfe.forced     wall 0.789 0.829 0.832  cpu 1.192 1.230 1.229
+base  bench.cold      wall 6.766 5.870 5.896  cpu 9.339 9.194 9.178
+head  bench.cold      wall 1.174 1.172 1.167  cpu 1.716 1.734 1.738
+base  bench.edit      wall 0.446 0.416 0.418  cpu 0.481 0.415 0.412
+head  bench.edit      wall 0.117 0.096 0.094  cpu 0.169 0.124 0.111
+base  stdlib.cold     wall 5.005 5.089 5.213  cpu 27.761 28.430 28.837
+head  stdlib.cold     wall 5.553 5.285 5.354  cpu 26.881 27.621 27.876
+base  stdlib.forced   wall 1.886 1.966 1.917  cpu 9.001 9.157 9.080
+head  stdlib.forced   wall 2.094 2.088 2.100  cpu 8.568 8.665 8.669
+base  stdlib.edit     wall 0.433 0.427 0.435  cpu 1.282 1.283 1.295
+head  stdlib.edit     wall 0.411 0.519 0.550  cpu 0.713 0.717 0.861
+```
+
+Against run 3's head, every scenario is equal or better in cpu; the largest
+move is `stdlib.forced` at +0.2 % (8.650 -> 8.665), inside the noise floor.
+`stdlib.edit`'s wall (0.440 -> 0.519) is one slow run of three (0.411 0.519
+0.550) against an unchanged cpu, i.e. scheduling rather than work.
+
+## Run 4b: interleaved A/B on ctfe.forced, 5 rounds
+
+`bench/devloop_ab.sh /tmp/devloop_base . ctfe.forced 5`:
+
+```
+round 0  A  wall 3.652  cpu 5.394      B  wall 0.785  cpu 1.177
+round 1  A  wall 3.598  cpu 5.362      B  wall 0.836  cpu 1.228
+round 2  A  wall 3.604  cpu 5.384      B  wall 0.840  cpu 1.233
+round 3  A  wall 3.583  cpu 5.381      B  wall 0.828  cpu 1.224
+round 4  A  wall 3.600  cpu 5.372      B  wall 0.865  cpu 1.224
+A cpu median 5.381 min 5.362 | B cpu median 1.224 min 1.177
+B/A cpu: 0.227 (median), 0.220 (min)
+```
+
+The same script against this phase's OWN fork point (`/tmp/a2c_before`, the
+`fast-devloop` tip built in the A2c worktree) is what caught the one
+regression this phase introduced and then removed -- see
+`bench/results/2026-09-06/a2c.txt` §8. It is also what settled `hello.forced`,
+which the block runs of the same afternoon reported at +12.6 % cpu and the
+interleaved script at -4.3 %.
