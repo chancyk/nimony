@@ -20,7 +20,16 @@ when defined(nimony):
 import std/[os, tables, sets, syncio, hashes, assertions, strutils, formatfloat, dirs, paths, algorithm, monotimes]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
-import ".." / nifmake / dag
+when not defined(nimony):
+  # The build-graph library, and with it the in-process scheduler. Gated
+  # because `hastur boot` compiles nimony WITH nimony, and `dag.nim` is not in
+  # nimony's language yet: `osproc.execProcesses` takes two callbacks,
+  # `topologicalSort` sorts through a comparison closure, and `strutils.align`
+  # / `alignLeft` / `sequtils.foldl` are not there. A booted nimony therefore
+  # spawns `nifmake` for every graph -- which is exactly the behaviour of the
+  # release before this one, and `nifmake` is a carry tool (host-Nim built at
+  # every boot stage), so nothing is lost but the speed-up.
+  import ".." / nifmake / dag
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder, vfs, ledger]
 from ".." / lib / artifactstore import storeStatsLine
 from ".." / lib / nifchecksums import computeChecksum
@@ -2282,38 +2291,48 @@ proc makeJobs(): int =
   ## a forwarded flag lands in the `.build.nif`, and two settings would then
   ## produce different build files. 0 means "all cores", nifmake's default and
   ## the bare `-j` every release before this one passed.
-  let v = getEnv("NIMONY_JOBS")
-  if v.len == 0: return 0
-  try:
-    result = parseInt(v)
-    if result < 1: result = 0
-  except ValueError:
-    result = 0
+  ##
+  ## A nimony-built compiler has no environment API, so it always answers "all
+  ## cores" -- the same gap `inProcessMakeAvailable` documents, and the same
+  ## consequence: a booted compiler behaves like the release before this one.
+  when defined(nimony):
+    0
+  else:
+    let v = getEnv("NIMONY_JOBS")
+    if v.len == 0: return 0
+    try:
+      result = parseInt(v)
+      if result < 1: result = 0
+    except ValueError:
+      result = 0
 
 type
   MakeInvocation = object
     ## Everything both paths need, resolved once per build so the two cannot
-    ## drift apart.
+    ## drift apart. Deliberately holds no type out of `dag.nim`: the object has
+    ## to exist in a nimony-built compiler too, where that module is not
+    ## imported at all.
     spawnPrefix: string        ## `nifmake … run ` (a trailing space)
     baseDir: string
-    opt: set[dag.CliOption]
+    force, rerun: bool
     maxJobs: int
     inProcess: bool
     report: bool
     profile: bool
     silent: bool
 
+proc inProcessMakeAvailable(): bool =
+  ## Is the in-process scheduler in front of the DAG? `nimony`'s `main`
+  ## installs it unless the user asked for `--spawn:always`, and nothing else
+  ## in the toolchain installs a relay -- so a `nimsem` that reaches this code
+  ## (the legacy `nimsem e` path) keeps spawning and links none of the tools.
+  when defined(nimony):
+    false
+  else:
+    dag.relayInstalled()
+
 proc initMakeInvocation(nifmake, baseDir: string; flags: set[BuildFlag];
                         rerun: bool; maxJobs: int): MakeInvocation =
-  # `--jobs:1` is sequential, not "one process at a time through
-  # `execProcesses`": the whole point of asking for it is a build whose output
-  # interleaving and node order are the DAG's, so it takes the path that has
-  # no batch in it.
-  var opt: set[dag.CliOption] = if maxJobs == 1: {} else: {dag.Parallel}
-  if ForceRebuild in flags: opt.incl dag.Force
-  if rerun: opt.incl dag.Rerun
-  if Profile in flags: opt.incl dag.Profile
-  if Report in flags: opt.incl dag.Report
   result = MakeInvocation(
     spawnPrefix: quoteShell(nifmake) &
       (if ForceRebuild in flags: " --force" else: "") &
@@ -2323,9 +2342,10 @@ proc initMakeInvocation(nifmake, baseDir: string; flags: set[BuildFlag];
       (if rerun: " --rerun" else: "") &
       (if maxJobs == 1: "" elif maxJobs > 0: " -j:" & $maxJobs else: " -j") & " run ",
     baseDir: baseDir,
-    opt: opt,
+    force: ForceRebuild in flags,
+    rerun: rerun,
     maxJobs: maxJobs,
-    inProcess: dag.relayInstalled(),
+    inProcess: inProcessMakeAvailable(),
     report: Report in flags,
     profile: Profile in flags,
     silent: SilentMake in flags or Report in flags)
@@ -2341,38 +2361,48 @@ proc runMake(inv: MakeInvocation; buildFile: string; lo, hi: int) =
     exec inv.spawnPrefix & progress & quoteShell(buildFile)
     return
 
-  var opt = inv.opt
-  if not inv.silent: opt.incl dag.Progress
-  var profile = dag.initProfileData()
-  let parseStart = getMonoTime()
-  var d = dag.parseNifFile(buildFile, inv.baseDir)
-  profile.parseTime = dag.toSeconds(getMonoTime() - parseStart)
-  let wantProfile = inv.profile or inv.report
-  let ok = dag.runDag(d, opt, (if wantProfile: addr profile else: nil), lo, hi, inv.maxJobs)
-  if inv.profile: stderr.write dag.profileText(profile)
-  if inv.report:
-    stdout.write dag.reportLine(profile)
-    # A spawned nifmake flushed at process exit, i.e. before nimony went on to
-    # link or to run the program. In-process the line would sit in this
-    # process's buffer until `main` returns and surface AFTER the built
-    # program's own output, which reads as a different build order than it is.
-    stdout.flushFile()
-  if not ok:
-    # The spawned form died inside `exec`, which prints the nifmake command
-    # line it could not complete. In-process there is no command line for the
-    # graph, and `runDag` has already named the node that failed, so the build
-    # file is the useful identifier.
-    #
-    # Flush first. A failing node's diagnostics went to THIS process's stdout,
-    # which is block-buffered when the compiler's output is a pipe, while
-    # `quit` writes its message straight to stderr -- so without this the
-    # trailer arrives before the error it is a trailer for. The spawned form
-    # got the ordering for free because the child exited (and flushed) before
-    # `exec` returned, and `hastur`'s `removeMakeErrors` strips exactly the
-    # last `nifmake:`/`FAILURE:` lines, so the ordering is what every `.msgs`
-    # golden of a failing compile depends on.
-    stdout.flushFile()
-    quit "FAILURE: build graph " & buildFile
+  when not defined(nimony):
+    # `--jobs:1` is sequential, not "one process at a time through
+    # `execProcesses`": the whole point of asking for it is a build whose
+    # output interleaving and node order are the DAG's, so it takes the path
+    # that has no batch in it.
+    var opt: set[dag.CliOption] = if inv.maxJobs == 1: {} else: {dag.Parallel}
+    if inv.force: opt.incl dag.Force
+    if inv.rerun: opt.incl dag.Rerun
+    if inv.profile: opt.incl dag.Profile
+    if inv.report: opt.incl dag.Report
+    if not inv.silent: opt.incl dag.Progress
+    var profile = dag.initProfileData()
+    let parseStart = getMonoTime()
+    var d = dag.parseNifFile(buildFile, inv.baseDir)
+    profile.parseTime = dag.toSeconds(getMonoTime() - parseStart)
+    let wantProfile = inv.profile or inv.report
+    let ok = dag.runDag(d, opt, (if wantProfile: addr profile else: nil), lo, hi, inv.maxJobs)
+    if inv.profile: stderr.write dag.profileText(profile)
+    if inv.report:
+      stdout.write dag.reportLine(profile)
+      # A spawned nifmake flushed at process exit, i.e. before nimony went on
+      # to link or to run the program. In-process the line would sit in this
+      # process's buffer until `main` returns and surface AFTER the built
+      # program's own output, which reads as a different build order than it
+      # is.
+      stdout.flushFile()
+    if not ok:
+      # The spawned form died inside `exec`, which prints the nifmake command
+      # line it could not complete. In-process there is no command line for
+      # the graph, and `runDag` has already named the node that failed, so the
+      # build file is the useful identifier.
+      #
+      # Flush first. A failing node's diagnostics went to THIS process's
+      # stdout, which is block-buffered when the compiler's output is a pipe,
+      # while `quit` writes its message straight to stderr -- so without this
+      # the trailer arrives before the error it is a trailer for. The spawned
+      # form got the ordering for free because the child exited (and flushed)
+      # before `exec` returned, and `hastur`'s `removeMakeErrors` strips
+      # exactly the last `nifmake:`/`FAILURE:` lines, so the ordering is what
+      # every `.msgs` golden of a failing compile depends on.
+      stdout.flushFile()
+      quit "FAILURE: build graph " & buildFile
 
 proc buildGraph*(config: sink NifConfig; project: string;
     flags: set[BuildFlag];

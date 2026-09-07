@@ -21,7 +21,14 @@ import ".." / lib / [tooldirs, argsfinder, nimversion, vfs, artifactstore]
 
 import ".." / gear2 / modnames
 import semmain, sem, nifconfig, semos, semdata, deps, langmodes, cli
-import phases
+when not defined(nimony):
+  # The in-process scheduler. Gated for the reason `deps.nim` states at its own
+  # `import`: `hastur boot` compiles nimony with nimony, which cannot compile
+  # `nifmake/dag.nim` yet. A booted nimony parses `--spawn`/`--jobs`/
+  # `--inproc-k` exactly the same way -- they only ever set environment
+  # variables -- and then spawns `nifmake` for every graph, which is what it
+  # did before this phase.
+  import phases
 
 include ".." / lib / compat2
 
@@ -207,6 +214,34 @@ proc createCmdOptions(baseDir: sink string): CmdOptions =
     executableArgs: ""
   )
 
+proc parsePositiveInt(val: string): int =
+  ## A digit-only parse that answers 0 for anything else, so the caller can
+  ## reject with its own message. Hand-rolled rather than `parseInt` because
+  ## `except ValueError` is not in nimony's language and this file is compiled
+  ## by nimony in `hastur boot`; `cli.parseBudgetMB` has the same shape for
+  ## the same reason.
+  result = 0
+  if val.len == 0: return 0
+  for c in val:
+    if c < '0' or c > '9': return 0
+    result = result * 10 + (ord(c) - ord('0'))
+
+proc rememberForChildren(key, val: string) =
+  ## A2b's three settings travel in the environment rather than in
+  ## `c.commandLineArgs`, for the reason A1b gives for `--vfs`: a forwarded
+  ## flag is spliced into the `.build.nif`, and two settings would then emit
+  ## different build files -- which is what the phase's byte-identity gate
+  ## forbids. The environment reaches every child instead, the nested
+  ## `nimony s` of a compile-time evaluation included.
+  ##
+  ## A nimony-built compiler has no environment API and no in-process
+  ## scheduler to configure, so it parses the flags and ignores them. That is
+  ## the same gap `deps.inProcessMakeAvailable` documents.
+  when not defined(nimony):
+    putEnv(key, val)
+  else:
+    discard
+
 proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
   for kind, key, val in getopt(cmdLineArgs):
     case kind
@@ -239,7 +274,7 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
           # at its own default. `--spawn:` given later still wins, which is
           # what makes `--vfs:disk --spawn:auto` mean "old store, new
           # scheduler" for a bisect.
-          putEnv("NIMONY_SPAWN", "always")
+          rememberForChildren("NIMONY_SPAWN", "always")
         if keyNorm == "help":
           echo Usage
           quit(QuitSuccess)
@@ -308,27 +343,26 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
             # from tolerating. The environment reaches every child, the nested
             # `nimony s` of a compile-time evaluation included.
             case normalize(val)
-            of "always": putEnv("NIMONY_SPAWN", "always")
-            of "auto", "": putEnv("NIMONY_SPAWN", "auto")
+            of "always": rememberForChildren("NIMONY_SPAWN", "always")
+            of "auto", "": rememberForChildren("NIMONY_SPAWN", "auto")
             else: quit "invalid value for --spawn; expected always or auto"
             forwardArg = false
           of "jobs":
-            var n = 0
-            try:
-              n = parseInt(val)
-            except ValueError:
-              quit "invalid value for --jobs; expected a process count"
-            if n < 1: quit "--jobs value must be >= 1"
-            putEnv("NIMONY_JOBS", $n)
+            # The per-DAG-depth process cap. `--jobs:1` also drops the batch
+            # entirely and runs the graph node by node, which is what makes a
+            # build's output readable when something in it fails.
+            let n = parsePositiveInt(val)
+            if n < 1: quit "invalid value for --jobs; expected a process count >= 1"
+            rememberForChildren("NIMONY_JOBS", $n)
             forwardArg = false
           of "inproc-k", "inprock":
-            var n = 0
-            try:
-              n = parseInt(val)
-            except ValueError:
-              quit "invalid value for --inproc-k; expected a number"
-            if n < 1: quit "--inproc-k value must be >= 1"
-            putEnv("NIMONY_INPROC_K", $n)
+            # JIT.md 6.2's `k`: a registered phase runs in-process while its
+            # estimated cost is under `k` spawn costs. Exposed because the
+            # right value is a property of the machine, and 3 is a measurement
+            # on one of them.
+            let n = parsePositiveInt(val)
+            if n < 1: quit "invalid value for --inproc-k; expected a number >= 1"
+            rememberForChildren("NIMONY_INPROC_K", $n)
             forwardArg = false
           of "profile":
             c.buildFlags.incl Profile
@@ -522,8 +556,9 @@ when isMainModule:
   # installs nothing, which is what makes the escape hatch exact rather than
   # approximate: no relay, so `deps.runMake` spawns `nifmake` and `nifmake`
   # spawns every node, the way it always did.
-  installPhaseRelay(spawnModeFromEnv(smAuto), c.config.nifcachePath,
-                    inprocKFromEnv(DefaultInprocK))
+  when not defined(nimony):
+    installPhaseRelay(spawnModeFromEnv(smAuto), c.config.nifcachePath,
+                      inprocKFromEnv(DefaultInprocK))
   compileProgram(c)
   storeFlush()
   # The driver is the parent of every other tool process, so its own VFS time
