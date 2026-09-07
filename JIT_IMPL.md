@@ -706,7 +706,7 @@ machine, with one script. The rule, from 2026-09-06 on:
 |---|---|---|
 | P0a | merged (`-f` no longer forwarded; `runEval` memo with `.out.nif.reads` sidecar from `std/writenif`; `-d:vfsProfile` builds; `bench/ctfe_bench.nim` + `bench/ctfe_latency.sh`; tmyops forced 3.63 s -> 0.91 s, edit-rebuild 0.194 s -> 0.092 s; 793/793 tests, boot byte-identical) | merged from jit/p0a |
 | P0b | merged (ocache under `nimcache/ocache/`; main module never owns a shared instantiation; second sub-program compiles 1 object instead of 8; `tmyops` user CPU 2.61 s -> 1.91 s) | merged from jit/p0b |
-| P0c | running | |
+| P0c | merged (root cause: `.live.nif` serialized hash sets in pool-index order, so `OnlyIfChanged` never held; now sorted, one `<M>.live.nif` per module with its resolve subset, `<main>.all.live.nif` as the always-written anchor; sem.nim body edit: dceEmit 127 -> 1, self.editbody 2.83 -> 2.40 s wall, cpu 4.2 -> 2.4 s; 127 `.c.nif` byte-identical) | merged from jit/p0c |
 | B0 | done (macOS/arm64 27/27 tiers; results in bench/results/2026-09-06/native_status.md) | |
 | A1a | merged (`src/lib/ledger.nim`, `toolhash.nim`; fragments under `<dir>/.ledger/`, snapshot `<nimcache>/ledger.nif`; `--stats` per-phase table; overhead +0.78 %; nifmake spawn recording deferred to A1d) | merged from jit/a1a |
 | A1b | merged (`src/lib/artifactstore.nim`; `--vfs:disk\|memory\|memory+spill\|verify`, `--vfs-budget`, policy handed to children via `NIMONY_VFS` env; 36 direct call sites converted; `nifmake.runNodeRelay` tri-state seam; whole tree green under `--vfs:memory+spill`; verify mode 0 mismatches) | merged from jit/a1b |
