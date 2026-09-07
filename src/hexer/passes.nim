@@ -105,3 +105,51 @@ proc finishPass*(pass: var Pass) =
   when not defined(nimony):
     if passTimingEnabled:
       logPassTiming(pass.moduleSuffix, pass.passName, pass.passStart)
+
+# ── Stage timing for the parts of `expand` that are not pipeline passes ────
+#
+# The eleven passes above account for 153 ms of the 275 ms `hexer c` spends on
+# `src/nimony/sem.nim`; the rest is spread over the parse, `trToplevel`, the
+# two whole-module analyses (`funcsummary`, `intraModuleInline`), the
+# declaration digests, the serialize and the writes. B3b's question is which
+# of those a declaration-level lowering could skip, and that cannot be
+# answered without measuring them separately -- `notes/b3b.md` section 4 had
+# to do it with temporary probes that were then reverted, so the next attempt
+# started by rebuilding them. This is the same instrument, kept.
+#
+# It rides the `NIMONY_PASS_TIMING=<file>` channel the passes already use, and
+# prefixes every stage with `|` so a reader can tell a pipeline pass from a
+# stage of `expand`. Off unless that variable is set, and one `getMonoTime`
+# per stage per module when it is.
+
+type
+  StageTimer* = object
+    ## Threaded through `expand` explicitly rather than kept in a global, and
+    ## carried as a value so a nested run (`optimizeLengOutput`) can hold its
+    ## own without disturbing its caller's.
+    module*: string
+    when not defined(nimony):
+      start: MonoTime
+      on: bool
+
+proc startStages*(module: string): StageTimer =
+  ## Begin timing the stages of one module's lowering.
+  result = StageTimer(module: module)
+  when not defined(nimony):
+    ensurePassTimingInit()
+    result.on = passTimingEnabled
+    if result.on: result.start = getMonoTime()
+
+proc restart*(t: var StageTimer) =
+  ## Drop the elapsed time without logging it -- used after a nested run that
+  ## logged its own stages, so the next stage is not charged for it too.
+  when not defined(nimony):
+    if t.on: t.start = getMonoTime()
+
+proc note*(t: var StageTimer; stage: string) =
+  ## Log the time since the previous `note`/`startStages`/`restart` under
+  ## `stage`, then start the next stage.
+  when not defined(nimony):
+    if t.on:
+      logPassTiming(t.module, "|" & stage, t.start)
+      t.start = getMonoTime()

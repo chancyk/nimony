@@ -1,0 +1,360 @@
+Phase B3b (second attempt) -- symbol-granularity lowering, measured on the F1 tip
+================================================================================
+
+Machine: macOS 26.6.2 / Apple M5 (10 cores), Nim 2.2.10.
+Toolchain: worktree branch `jit/b3b`, forked from `fast-devloop` at cbf1fbe9
+(everything through F1).  nativenif from a private clone of the pin c3f27fc
+(/tmp/b3b2/nativenif, branch jit/b3b-native, UNMODIFIED -- see section 6).
+NIMONY_NATIVENIF=/tmp/b3b2/nativenif, XDG_CACHE_HOME=/tmp/b3b2_cache.
+
+Sources under measurement: a copy of /tmp/devloop_base/src (the fork-point
+compiler, 127 modules), built with
+  nimony n --silentMake --nimcache:/tmp/b3b2_meas/nc \
+            --out:/tmp/b3b2_meas/self_nimony src/nimony/nimony.nim
+i.e. the nimcache and the executable both outside the source tree.
+
+`src/nimony/sem.nim` is 5598 lines.  Its artifacts on this tip:
+  .s.nif    4.36 MB
+  .x.nif    7.58 MB   3550 children of the root (stmts ...)
+  .decls.nif  431 kB   1794 named top-level declarations (the F1 sidecar)
+  .c.nif    4.64 MB   1974 declarations
+  .asm.nif 10.24 MB   1949 declarations
+
+
+0. The three edits used, and why three
+--------------------------------------
+
+  editbody   `bench/devloop_bench.sh`'s self.editbody: append
+             `proc devloopBenchBody(): int = 1` to sem.nim.  This is the edit
+             the phase's gate is stated on.  The proc is PRIVATE and never
+             called, so `dce` removes it: nothing downstream of hexer sees it.
+             It also mints no temp and no hook.
+
+  live       one statement in an existing, exported, heavily called proc
+             (`semStmt`), changed IN PLACE and keeping the token count:
+             `if dest.len == <k>: quit 1` with `<k>` renumbered.  Survives DCE.
+
+  grow       the same statement ADDED to `semStmt`, so the module gains one
+             statement and one xelim temp.  This is what a developer's edit
+             normally is, and it is the only one of the three that moves
+             hexer's module-wide counters.
+
+`editbody` alone is not a representative measurement, and section 2 is the
+reason the other two exist.
+
+
+1. Per stage of a rebuild after each edit (`nimony n --profile`)
+---------------------------------------------------------------
+
+Medians of 3 consecutive runs, +-5 ms.  "rebuilt" counts artifacts whose
+mtime moved, i.e. what `OnlyIfChanged` actually let through.
+
+                       editbody      live        grow
+  nimsem                0.337       0.350       0.437
+  hexer                 0.272       0.269       0.282
+  dceEmit               0.045       0.045       0.047
+  dceLive               --          --          0.385
+  arkham                0.000       0.260       0.267   (3 invocations)
+  link (nifasm)         0.000       0.337       0.328
+  ------------------------------------------------------
+  wall                  0.710       1.280       1.760
+
+  rebuilt .s.nif            1           1           1
+  rebuilt .x.nif            1           1           1
+  rebuilt .dce.nif          0           0           1
+  rebuilt .c.nif            0           1           1
+  rebuilt .asm.nif          0           3           3
+  executable relinked      no         yes         yes
+
+The first column is the finding that reframes the whole phase:
+
+  ON THE GATE'S OWN BENCHMARK, ARKHAM AND THE LINKER ALREADY COST ZERO.
+
+`devloopBenchBody` is dead, `dce` drops it, sem's `.c.nif` comes out
+byte-identical, the arkham node is up to date and nifasm is never run.  The
+brief's premise ("hexer ~0.25, arkham ~0.2 on the one module") describes the
+pre-F1 tip; on this tip the 0.71 s is nimsem 0.34 + hexer 0.27 + dceEmit 0.05
++ 0.05 s of nimony's own dependency scan and graph emission.
+
+So the gate "hexer + arkham <= 0.1 s (from ~0.45 s)" reads, on this tip, as
+"hexer <= 0.1 s (from 0.27 s)".
+
+
+2. Where hexer's 0.27 s is (NIMONY_PASS_TIMING, `src/hexer/passes.nim`)
+-----------------------------------------------------------------------
+
+`hexer c` on sem, one run, the stage timers this branch adds (`StageTimer`)
+plus the eleven pipeline passes that were already logged:
+
+  loadParse             13.4 ms   parse the 4.36 MB .s.nif (setupProgram)
+  digestInput            2.9 ms   F1's per-declaration sem-input digests
+  transform            153.9 ms   the eleven passes
+  trToplevel+genInit    14.4 ms
+  makeOutput             0.0 ms
+  arcopt                13.3 ms   per proc already
+  funcsummary           11.2 ms   least fixpoint over the in-module call graph
+  intraModuleInline     22.5 ms   splices this module's small procs
+  digestOutput           6.1 ms
+  analyzeModule          7.1 ms   dce1, a disjoint union over declarations
+  serialize             20.9 ms   TokenBuf -> 7.58 MB of text
+  writeX                 7.0 ms
+  writeDce               3.9 ms
+  writeDecls             1.5 ms
+  --------------------------------
+  total                278.1 ms
+
+  the eleven passes, individually (of the 153.9 ms):
+    lambdalift  43.9   duplifier  38.6   cps      16.6   desugar     15.4
+    constparams 15.3   xelim_final 10.6  xelim_finalir 7.8  eraiser  7.6
+    xelim1       6.9   destroyer   6.8   vtables   5.8
+
+  Decomposable per declaration in principle:
+    transform 153.9 + trToplevel 14.4 + arcopt 13.3 + analyzeModule 7.1
+                                                              = 188.7 ms
+  Whole-module or whole-file by construction:
+    loadParse 13.4 + digests 9.0 + funcsummary 11.2 + intraModuleInline 22.5
+      + serialize 20.9 + writes 12.4                          =  89.4 ms
+
+A declaration-level hexer that skipped ALL of the first group would still pay
+the second, plus a re-parse of the previous 7.58 MB `.x.nif` to splice into.
+At `loadParse`'s measured 333 MB/s that re-parse is ~23 ms, so the floor is
+
+    89.4 + 23 = 112 ms, against a 100 ms gate, with zero declarations lowered.
+
+The gate is not reachable by step 1 as specified.  Section 3 is why it is not
+reachable by a wide margin rather than a narrow one.
+
+
+3. The premise of step 1, measured on the F1 sidecar
+----------------------------------------------------
+
+`<mod>.decls.nif` records, per named top-level declaration, a line-info-blind
+digest of its sem INPUT and one of its lowering OUTPUT.  That is exactly the
+pair a declaration-level hexer consults: "did this declaration's input
+change" decides what to re-lower, "did its output change" decides what may be
+spliced from the previous `.x.nif`.  sem has 1794 of them.
+
+  edit       sem-input digest changed   lowering-output digest changed
+  editbody        0  (+1 added)               0  (+1 added)
+  live            1  of 1794                  3  of 1794
+  grow            1  of 1794                890  of 1794
+
+Reproduced twice, identical both times.
+
+Cross-check, and a caveat for whoever re-measures.  The textual method the
+`decl-stability` scenario uses (`splitNifDecls`/`diffDecls`, split the root
+`(stmts ...)` into children and match by name) agrees with the sidecar on the
+`grow` edit -- 896 blind vs 890 -- but it OVERSTATES churn on any edit that
+adds a child, and the two must not be confused:
+
+  sem .x.nif: 3550 children, of which 1762 carry a `:SymbolDef` and
+              1788 are anonymous (1268 `(x`, 494 `(h`, ...)
+
+`declNameOf` collapses an anonymous child onto its TAG, and `diffDecls`
+matches repeated names positionally within that group, so ONE inserted
+anonymous node shifts the whole group and every later member reads as
+"changed".  That is why the same `editbody` edit reads 0 changed in the
+sidecar (which is keyed by symbol) and 945 in a textual `.x.nif` split.  The
+sidecar is the number to trust, and this is a concrete reason F1 was right to
+build it rather than diff bytes.
+
+F1 did its job: nimsem's output is declaration-local under all three edits.
+HEXER'S IS NOT.  One changed input declaration becomes 890 changed output
+declarations -- half the module -- as soon as the edit mints one extra temp.
+
+The same thing, seen at the next two artifacts (`grow`, blind = NIF line-info
+tokens stripped):
+
+  sem .c.nif  : 1974 decls | changed 638 (blind 420) added 11 removed 11
+  sem .asm.nif: 1949 decls | changed 467 (blind 467) added  0 removed  0
+
+and for the `live` edit, which mints no temp:
+
+  sem .c.nif  : 1974 decls | changed 1 | sem .asm.nif: 1949 decls | changed 1
+
+
+4. The cause, isolated
+----------------------
+
+Diff of `semGetSize`, a proc the edit does not touch, in sem's `.c.nif`
+before and after `grow` (line info stripped):
+
+    -   (var :`x.840 . xint.0.xincut4p51
+    +   (var :`x.841 . xint.0.xincut4p51
+    -   (asgn result.0`semGetSize`0 `x.840)
+    +   (asgn result.0`semGetSize`0 `x.841)
+
+and of `sameIdent`:
+
+    -    (var :t.0h65 .          +    (var :t.0h91 .
+    -     (var :idx.0h68 .       +     (var :idx.0h94 .
+    -       (var :`x.0h69 .      +       (var :`x.0h95 .
+    -        (var :s.0h72 .      +        (var :s.0h98 .
+    -         (lab :returnLabel.0h74)
+
+Two module-wide counters, both named in `notes/b3b.md` section 2:
+
+  `x.<n>`  -- `xelim.Context.counter`, carried across the pipeline as
+              `Pass.nextTemp` (`src/hexer/xelim.nim:102,635,1223,1521,1531`,
+              `src/hexer/passes.nim:21`)
+  `0h<n>`  -- `intramodinliner.InlinerCtx.counter`
+              (`src/hexer/intramodinliner.nim:400-417,1095-1097`)
+
+One extra temp in the edited proc shifts every later `x.N in the module by
+one, and the extra inlining it causes shifts the inliner's counter by 26.
+
+
+5. The prefix theorem is FALSE, and this is the important part
+--------------------------------------------------------------
+
+`notes/b3b.md` section 2 offered a fallback that needed no counter
+checkpointing at all:
+
+  "since every pass processes declarations in order, if declarations 1..k are
+   unchanged then after every pass the output prefix for 1..k is identical and
+   every counter is at the same value.  A prefix-preserving incremental hexer
+   is therefore sound without any counter checkpointing."
+
+It is not sound.  On `tests/incremental/b3b_lib.nim` (13 procs, `step1` first,
+`step10` last), adding `if s.len == 99 and acc > 0: acc = acc + 1` -- an `and`,
+which xelim binds to a bool temp -- to `step10`, the LAST declaration:
+
+  decls 23 | sem-input changed 1 | lowering-output changed 11 | added 0
+  changed: step1 step2 step3 step4 step5 step6 step7 step8 step9 step10 total
+
+and the diff of `step1`, the FIRST declaration of the module:
+
+    -   (var :`x.0 .     +   (var :`x.1 .
+    -     (add (i 64)acc.0`step1`0 `x.0))
+    +     (add (i 64)acc.0`step1`0 `x.1))
+
+An edit at the END of the module renumbers a temp at the BEGINNING.  The
+reason is that `pipeline.transform` runs eleven passes over the whole buffer
+and `lowerExprs` runs three of them (`xelim1`, `xelim_finalir`,
+`xelim_final`) sharing one monotone counter: the temps `step1` receives on
+the SECOND run depend on how many the FIRST run minted in `step10`.  The
+prefix theorem holds WITHIN one pass and fails for the pipeline.
+
+Consequence: there is no cheap sound splice.  Either the counters are scoped
+per declaration first, or every one of them (seven, `notes/b3b.md` section 2)
+plus `EContext.hoistedConsts`, `c.pending`, `c.strLits`, `c.newTypes`,
+`c.initBody` and `LiftingCtx`'s two hook tables has to be checkpointed and
+restored per declaration, in both directions.  A mistake in any of them is
+two declarations minting the same `x.N -- one `SymId` by
+`pool.syms.getOrIncl`, i.e. a miscompile, not a slow path.
+
+
+6. arkham and nifasm, measured before touching either
+-----------------------------------------------------
+
+The brief asks whether unchanged procs' asm-NIF is byte-identical after a body
+edit, and cites `notes/b3b.md` section 5's 135-of-974 "pure drift" (asm
+changed although the `.c.nif` declaration did not).
+
+  edit    .c.nif changed   .asm.nif changed   pure drift
+  live          1                 1                0
+  grow        638               467               28   of 1949
+
+Pure arkham drift is 28 declarations, and 0 when the edit does not move token
+positions.  The 467 changed asm declarations are inherited from the 420
+genuinely changed Leng declarations of section 3 -- i.e. from hexer's
+counters, not from arkham's.  F1 removed most of the drift the earlier note
+measured, because that drift was downstream of sem's module-wide local
+renumbering shifting the token positions arkham names its temps from.
+
+nifasm's own numbers for the whole-image link (NIFASM_PROFILE=1), identical
+for `live` and `grow`:
+
+  blobHits 3415   blobStale 18   blobRecorded 627
+  emitRoots 296-305 ms of a 324-335 ms link
+  per-module emit, top 2:  semygjvq21 187.8 ms / 867 syms
+                           semv1g3zm   24.2 ms / 107 syms
+
+18 stale, not the 540 the brief expected -- B3c already narrowed that.  What
+is left is `blobRecorded 627`: the cache's unit is the symbol but its validity
+check is per MODULE.  `blobcache.sameSource` (src/nifasm/blobcache.nim:449 at
+the pin c3f27fc) compares the module file's stamp and, failing that, a hash of
+the whole file; :752 applies it to the fragment's own module and :760 to every
+module the fragment depends on.  A two-line change to sem's `.asm.nif`
+therefore drops every fragment whose symbol lives in sem, and every fragment
+elsewhere that references one.
+Per-symbol validity would take 627 recorded down to
+
+    ~467 today          (saving ~55 ms of a 1.28 s loop, ~4 %)
+    ~2   once hexer's counters are scoped   (saving ~180 ms, ~14 %)
+
+which is why it was not built now: its value is gated on a change that is not
+in this phase's owner set of files, and landing it first buys 4 %.
+
+
+7. Verdict per step of the brief
+--------------------------------
+
+  step 1  declaration-level incremental hexer
+          NOT BUILT.  Floor 112 ms against a 100 ms gate even if every
+          decomposable stage went to zero (section 2), and its splice is
+          unsound today because 890 of 1794 unchanged-input declarations get
+          different lowering output (section 3), in both directions along the
+          module (section 5).  A version that fell back to full re-lowering
+          whenever a temp count moved would fall back on essentially every
+          real edit.
+
+  step 2  arkham per-symbol stability
+          NOT BUILT.  Its own premise measures at 28 of 1949 declarations
+          (section 6).  Scoping arkham's labels/rodata/temps costs every
+          `.asm.nif` golden in nativenif and a non-byte-identical refactor
+          gate, and fixes 28 of the 467 that actually change.
+
+  step 3  nifasm per-symbol blob validity
+          NOT BUILT.  Real (627 recorded vs 467 changed) but worth ~4 % until
+          step 0 below lands, and ~14 % after it.
+
+  step 0  (new, and the measurement's own recommendation)
+          scope `Pass.nextTemp` and `InlinerCtx.counter` -- and then the other
+          five of `notes/b3b.md` section 2 -- per top-level declaration, the
+          way F1 scoped `sembasics.makeLocalSym` per routine.  Nothing in
+          steps 1-3 pays before it.
+
+
+8. A/B against the fork point (bench/devloop_ab.sh, interleaved, median of 5)
+-----------------------------------------------------------------------------
+
+This branch changes no lowering decision; the only compiled-in change is the
+`StageTimer`, which is off unless NIMONY_PASS_TIMING is set.  The A/B is here
+to show that, not to claim a win: everything below is F1's (editbody) and
+A2b's (the cold build's resident size), re-confirmed.
+
+A = /tmp/devloop_base (fork point f69b8afc), B = this worktree.
+Load 3.4-6.0 decaying from the test runs.
+
+  self.editbody, 5 rounds
+    round 0  A wall 2.709  cpu 3.903  rss 116MB | B wall 0.700  cpu 0.694  rss 105MB
+    round 1  A wall 2.698  cpu 3.891  rss 116MB | B wall 0.697  cpu 0.691  rss 104MB
+    round 2  A wall 2.719  cpu 3.903  rss 116MB | B wall 0.696  cpu 0.690  rss 105MB
+    round 3  A wall 2.700  cpu 3.892  rss 116MB | B wall 0.700  cpu 0.692  rss 105MB
+    round 4  A wall 2.704  cpu 3.897  rss 116MB | B wall 0.701  cpu 0.694  rss 105MB
+    A wall median 2.704 min 2.698 | cpu median 3.897 min 3.891 | peak rss 116 MB
+    B wall median 0.700 min 0.696 | cpu median 0.692 min 0.690 | peak rss 105 MB
+    B/A cpu (median) 0.178   (min) 0.177   peak rss 0.91
+
+  self.cold, 3 rounds
+    round 0  A wall 5.351  cpu 13.754 rss 116MB | B wall 5.938  cpu 13.224 rss 218MB
+    round 1  A wall 7.048  cpu 15.589 rss 116MB | B wall 7.864  cpu 15.380 rss 218MB
+    round 2  A wall 6.891  cpu 15.772 rss 116MB | B wall 6.456  cpu 14.130 rss 218MB
+    A wall median 6.891 min 5.351 | cpu median 15.589 min 13.754 | peak rss 116 MB
+    B wall median 6.456 min 5.938 | cpu median 14.130 min 13.224 | peak rss 218 MB
+    B/A cpu (median) 0.906   (min) 0.961   peak rss 1.88
+
+Both rows reproduce progress.md run 11 within noise (that run read 0.766 /
+0.748 for editbody on a busier machine).  The cold build's 218 MB is A2b's
+in-process driver, unchanged here and already attributed in run 10.
+
+
+9. Byte identity of the stage timers
+------------------------------------
+
+The same 127-module compiler compiled twice from a fresh nimcache, once with
+NIMONY_PASS_TIMING set and once without:
+
+  probe byte-identity: 381 artifacts compared, 0 differ
+  (127 .x.nif + 127 .dce.nif + 127 .decls.nif)

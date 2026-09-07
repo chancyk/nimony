@@ -1157,6 +1157,18 @@ proc incrementalDeclStabilityTests*() =
   ##       shifts every following line. Ignoring line info must recover
   ##       declaration locality -- the fact prerequisite 2 (a line-info-blind
   ##       digest plus an info rebase for spliced fragments) rests on.
+  ##   (d) tempadd: one statement inserted into the LAST proc that mints an
+  ##       extra hexer temp (an `and`, which `xelim` binds to a bool temp).
+  ##       This is the edit the other three miss, and the only one that asks
+  ##       about hexer's LOWERING OUTPUT rather than nimsem's input: the
+  ##       sidecar records both digests and until now only the input one was
+  ##       checked. F1 made the input side declaration-local and it stays 1
+  ##       here; the output side does not, because `xelim`'s temp counter
+  ##       (`Pass.nextTemp`) and the intra-module inliner's counter are
+  ##       MODULE-wide and are threaded ACROSS the eleven passes, so one extra
+  ##       temp anywhere renumbers temps everywhere -- including in
+  ##       declarations that PRECEDE the edit, which is why a
+  ##       prefix-preserving splice is not sound either (`notes/b3b.md` 11).
   let t0 = epochTime()
   let lib = "tests/incremental/b3b_lib.nim"
   let src = "tests/incremental/b3b_main.nim"
@@ -1215,10 +1227,18 @@ proc incrementalDeclStabilityTests*() =
          " added / " & $sInplace.removed & " removed declarations in the " &
          ".s.nif; a same-length literal edit inside one proc must touch " &
          "exactly one declaration or symbol-granularity lowering has no premise"
-  let dInplace = digestChanges(dBase, readDeclDigests(dNif), true)
+  let dInplaceSidecar = readDeclDigests(dNif)
+  let dInplace = digestChanges(dBase, dInplaceSidecar, true)
   expect dInplace == 1,
          "in-place: " & $dInplace & " declarations changed by the .decls.nif " &
          "sem-input digest (expected exactly 1)"
+  # The other half of the sidecar: what hexer LOWERED that declaration to. An
+  # edit that mints no new temp keeps this local too, so the bound is the same.
+  let dInplaceOut = digestChanges(dBase, dInplaceSidecar, false)
+  expect dInplaceOut <= 1,
+         "in-place: " & $dInplaceOut & " declarations changed by the " &
+         ".decls.nif lowering-output digest (expected at most 1); a " &
+         "same-length literal edit must not re-lower another declaration"
   var xInplaceChanged = -1
   if xBase.len > 0 and fileExists(xNif):
     let d = diffDecls(xBase, splitNifDecls(xNif), false)
@@ -1291,12 +1311,58 @@ proc incrementalDeclStabilityTests*() =
   # textual strip above and hexer's token-stream digest are computed by
   # completely different code over completely different representations, so
   # their agreement is the cross-check that neither is lying.
-  let dStmt = digestChanges(dBase, readDeclDigests(dNif), true)
+  let dStmtSidecar = readDeclDigests(dNif)
+  let dStmtOut = digestChanges(dBase, dStmtSidecar, false)
+  expect dStmtOut <= 1,
+         "stmtadd: " & $dStmtOut & " declarations changed by the .decls.nif " &
+         "lowering-output digest (expected at most 1); `acc = acc + 0` mints " &
+         "no temp, so hexer's module-wide counters must not move"
+  let dStmt = digestChanges(dBase, dStmtSidecar, true)
   expect dStmt <= 1,
          "stmtadd: " & $dStmt & " declarations changed by the .decls.nif " &
          "sem-input digest (expected at most 1); the sidecar is what B3b " &
          "consults, so this is the number that decides whether a " &
          "declaration-level lowering can skip work"
+
+  # (d) one statement inserted into the LAST proc that mints an extra hexer
+  # temp. `s.len == 99 and acc > 0` is an `and`, which `xelim` lowers to a
+  # bool temp -- one more `\`x.<n>` than before. The edit goes into `step10`,
+  # the last proc of the fixture, on purpose: the counter it moves is threaded
+  # ACROSS the eleven passes of `pipeline.transform` and `lowerExprs` runs
+  # three times over the whole module, so the temps `step1` receives on the
+  # SECOND run depend on how many the FIRST run minted in `step10`. An edit at
+  # the end therefore renumbers the beginning, and `notes/b3b.md` section 2's
+  # "prefix theorem" -- unchanged declarations 1..k keep an identical output
+  # prefix -- is false for the pipeline even though it holds for one pass.
+  inc phases
+  writeFile(lib, editOnce(originalLib, "  let s = \"b3b step ten\"\n",
+    "  let s = \"b3b step ten\"\n  if s.len == 99 and acc > 0: acc = acc + 1\n",
+    "tempadd"))
+  build("tempadd")
+  let dTempSidecar = readDeclDigests(dNif)
+  let dTempIn = digestChanges(dBase, dTempSidecar, true)
+  let dTempOut = digestChanges(dBase, dTempSidecar, false)
+  # nimsem's side is declaration-local and F1 is what makes it so; if this
+  # stops being 1 the frontend regressed, not hexer.
+  expect dTempIn == 1,
+         "tempadd: " & $dTempIn & " declarations changed by the .decls.nif " &
+         "sem-input digest (expected exactly 1); F1's per-routine local " &
+         "numbering regressed"
+  # hexer's side is NOT, and this is the number B3b's step 1 would have to
+  # splice on. It is the whole module today. The bound is a ceiling that
+  # catches a regression; scoping `Pass.nextTemp` and `InlinerCtx.counter` per
+  # declaration takes it to 1 and the ceiling should then be tightened.
+  expect dTempOut > dTempIn,
+         "tempadd: the lowering-output digest changed " & $dTempOut &
+         " declarations and the sem-input digest " & $dTempIn &
+         "; if hexer's counters were scoped per declaration this test has " &
+         "served its purpose -- tighten the bound below to 1 and delete this"
+  # 11 of 23 on this fixture (every `stepN` plus `total`). A ceiling, so a
+  # change that makes hexer's numbering MORE position-dependent fails here.
+  expect dTempOut <= 11,
+         "tempadd: " & $dTempOut & " of " & $dBase.len & " declarations " &
+         "changed by the .decls.nif lowering-output digest (expected at most " &
+         "11); hexer's lowering became more position-dependent, not less"
 
   restoreSources()
   build("restore")
@@ -1306,8 +1372,10 @@ proc incrementalDeclStabilityTests*() =
        " (blind ", sInsertBlind.changed, ", added ", sInsertRaw.added,
        ") | stmtadd changed ", sStmtRaw.changed, " (blind ",
        sStmtBlind.changed, ")",
-       " | decls digest ", dBase.len, " syms, changed ", dInplace, "/",
-       dInsert, "/", dStmt,
+       " | decls digest ", dBase.len, " syms, sem-input changed ", dInplace,
+       "/", dInsert, "/", dStmt, "/", dTempIn,
+       " | lowering-output changed ", dInplaceOut, "/-/", dStmtOut, "/",
+       dTempOut,
        (if xInplaceChanged >= 0: " | .x.nif in-place changed " &
                                  $xInplaceChanged else: "")
 

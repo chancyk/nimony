@@ -14,15 +14,21 @@
 ## - each proc owns a distinct string literal, so an in-place edit of one
 ##   literal is a change to exactly one declaration and nothing else;
 ## - `step5` sits in the middle, which is where the line-shifting edit goes,
-##   and the inserted proc goes in just after it, before `step6`.
+##   and the inserted proc goes in just after it, before `step6`;
+## - `step10` is LAST, and the temp-minting edit goes there on purpose. The
+##   counter that edit moves (`xelim`'s, carried module-wide in
+##   `Pass.nextTemp`) is threaded across the eleven passes of
+##   `pipeline.transform`, and `lowerExprs` runs three times over the whole
+##   module, so an extra temp in the last proc renumbers the temps of the
+##   FIRST one. Putting the edit at the end is what makes that visible.
 ##
 ## Do not renumber or reorder these procs casually: the scenario finds its
-## three edit sites by plain string replacement over this file -- step5's
-## string literal, step5's first statement, and step6's signature -- and
-## asserts bounds that depend on there being a dozen procs. For the same
-## reason nothing here, comments included, may repeat one of those three
-## strings: the first match wins, and a comment that quotes an edit site
-## would be edited instead of the code.
+## four edit sites by plain string replacement over this file -- step5's
+## string literal, step5's first statement, step6's signature, and step10's
+## `let s` line -- and asserts bounds that depend on there being a dozen
+## procs. For the same reason nothing here, comments included, may repeat one
+## of those four strings: the first match wins, and a comment that quotes an
+## edit site would be edited instead of the code.
 
 proc step1*(x: int): int =
   var acc = x + 1
