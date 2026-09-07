@@ -1,0 +1,142 @@
+Phase B3e -- arkham splices the unchanged procs of a module
+===========================================================
+
+Machine: macOS 26.6.2 / Apple M5 (10 cores), Nim 2.2.10.  Not an idle machine;
+every table below was taken back to back with only bin/arkham swapped, and the
+per-module numbers are the best of two or three runs.
+
+Toolchain: nimony clone /tmp/b3e/nimony_clone, branch jit/b3e, forked from
+fast-devloop at 55c0521e (everything through B3d).  nativenif a private clone
+of the pin 7b838ec (/tmp/b3e/nativenif, branch jit/b3e-native), commits
+d18585f, ee3df63, b0fc878, 778fd40, 5f6f011.  NIMONY_NATIVENIF=/tmp/b3e/nativenif,
+XDG_CACHE_HOME=/tmp/b3e_cache.
+
+Sources under measurement: a copy of /tmp/devloop_base/src (the fork-point
+compiler, 127 modules), built with
+  nimony n --silentMake --nimcache:<out>/nc --out:<out>/self src/nimony/nimony.nim
+The edit is bench/devloop_bench.sh's `self.editbody`: one statement inserted
+into the body of `semStmt` in src/nimony/sem.nim.
+
+  sem.nim artifacts on this tip:
+    semygjvq21.c.nif     4.41 MB   526 procs, 974 indexed declarations
+    semygjvq21.asm.nif  10.70 MB   974 declarations
+    semygjvq21.arkham.nif 134 KB   the sidecar
+  whole corpus: 127 modules; the sidecars total 1.1 MB
+
+
+1. Where arkham's 196 ms on sem.nim goes (-d:arkhamStageProbe, reverted)
+-----------------------------------------------------------------------
+
+Median of three, release builds, milliseconds.  "before" is bin/arkham at the
+pin 7b838ec; the other three columns are this branch with --asmcache: on.
+
+                                  before   cold    warm   live edit
+  parse the 4.41 MB .c.nif         14.3    14.2    14.4    19.0
+  collect (program model)           1.1     1.1     1.1     1.1
+  module level                      0.5    17.6    21.6    22.0
+  per-proc emission (526)         141.4   129.3     3.3     4.3
+  rodata tail                       0.3     0.2     0.0     0.0
+  serialize + index                35.0    34.1     8.4     9.2
+  write the file                    1.2     1.1     1.0     1.0
+  ------------------------------------------------------------------
+  process wall                    0.20 s  0.20 s  0.05 s  0.063 s
+
+"module level" carries this phase's own cost: the context digest, and on a warm
+run reading the previous 10.7 MB .asm.nif back and hashing it.  "serialize" on a
+warm run is the splice (one memcpy per declaration), the rebuilt index and the
+sidecar write.
+
+Cache report on the live edit:
+  [arkham cache] spliced 523 lowered 3 stale 3
+which is F2's three changed lowering-output declarations, exactly.
+
+
+2. Per-stage table of a live-edit rebuild
+-----------------------------------------
+
+`nimony n --profile` + NIFASM_PROFILE=1, three consecutive rounds; each round
+inserts one more statement into semStmt.  Round 1 is the first edit after a cold
+build (the only one where the whole-program live set moves, so dceLive runs).
+The two blocks are the SAME toolchain with NIMONY_ARKHAMCACHE=off and on, so
+nothing but arkham's cache differs.
+
+                        cache off                 cache on
+                     r1     r2     r3          r1     r2     r3
+  nimsem              --    0.329  0.329        --    0.328  0.331
+  hexer             0.263  0.263  0.265       0.266  0.263  0.268
+  dceEmit           0.043  0.044  0.044       0.043  0.042  0.044
+  dceLive           0.366   --     --         0.352   --     --
+  arkham (3 inv.)   0.259  0.256  0.261       0.092  0.089  0.088
+  link (nifasm)     0.125  0.125  0.125       0.125  0.126  0.126
+  nifasm --profile  117.8  116.8  116.5       117.4  118.7  118.2
+
+(nimsem runs in-process at a depth of its own, so --profile lists it in a
+separate block and round 1 folds it into the cold build above it.)
+
+The three arkham invocations are the edited module and the two that import it
+(the build graph lists an imported module's .c.nif as an input of arkham's
+node).  With ARKHAM_CACHE_STATS=1 they report
+
+  [arkham cache] spliced 8 lowered 1 stale 1        <- the main module
+  [arkham cache] spliced 76 lowered 2 stale 2       <- semv1g3zm
+  [arkham cache] spliced 523 lowered 3 stale 3      <- semygjvq21
+
+The middle line is what the two dependency refinements bought: it read
+0 spliced / 78 lowered when a dependency was validated by its file stamp, and
+still 0 / 78 when one changed declaration dropped the whole module's cache.
+
+
+2b. Interleaved A/B against the fork point
+------------------------------------------
+
+  bench/devloop_ab.sh /tmp/devloop_base /tmp/b3e/nimony_clone self.editbody 5
+
+  self.editbody: A wall median 2.612  cpu 3.804  peak rss 117 MB
+  self.editbody: B wall median 0.919  cpu 0.933  peak rss 107 MB
+
+  bench/devloop_ab.sh /tmp/devloop_base /tmp/b3e/nimony_clone self.cold 3
+
+  self.cold:     A wall median 5.279  cpu 13.62  peak rss 116 MB
+  self.cold:     B wall median 5.216  cpu 13.45  peak rss 147 MB
+
+
+3. Cost when the cache is cold
+------------------------------
+
+The 127 modules driven through arkham by hand in build order, release build,
+same corpus, three rounds (the FIRST round of the first attempt read +53 % and
+was entirely cold page cache -- the numbers below are from a warm file cache):
+
+                    no cache   cold cache        warm cache
+  round 1            1.453 s   1.372 s (-5.5%)   0.612 s (-57.9%)
+  round 2            1.534 s   1.529 s (-0.3%)   0.783 s (-49.0%)
+  round 3            1.408 s   1.380 s (-2.0%)   0.621 s (-55.9%)
+
+Measured per module instead (each module timed back to back in both modes, all
+127 summed): +59 ms of +2187 ms, i.e. +2.7 %, of which +3 ms is sem.nim.
+Gate: <= +10 %.
+
+
+4. Byte identity
+----------------
+
+  tests/arkhamsplice_selftest, eight states per fixture:
+    237 / 237  arkham/arm64        239 / 239  arkham/x64
+    130 / 130  arkham_m/cortex_m    25 / 25   arkham_rv32/riscv32
+     20 / 20   arkham_avr/avr
+
+  the 127-module compiler corpus, cached vs uncached: 0 modules differ
+  the same corpus with the cache populated BEFORE the live edit and every
+    module re-lowered after it: 0 of 127 differ, 4045 procs spliced, 6 lowered,
+    0 modules cold
+  the compiler built by itself, NIMONY_ARKHAMCACHE=off vs on:
+    0 of 127 .asm.nif differ
+    linked executable identical in both (26796e3eed808512) (ONE output path -- a Mach-O's
+    ad-hoc signature carries the basename it was signed at)
+
+  tools/refactor_gate.sh vs the 7b838ec baseline:
+    2583 artifacts, 774 listings, byte-identical after every commit
+
+  nim r tests/tester.nim: green
+  hastur tests/nimony: 794 / 794
+  hastur boot --boot-backend:native: stages 1 == 2 == 3 (47.2 s)

@@ -1208,6 +1208,35 @@ proc blobCacheDir*(config: NifConfig): string =
   ## nimcache do not collide either.
   config.nifcachePath / "blobcache"
 
+proc arkhamCacheDir*(backendDir: string): string =
+  ## arkham's per-PROC lowering cache (nativenif's `arkham/core/asmcache.nim`,
+  ## JIT_IMPL.md B3e): one `<module>.arkham.nif` sidecar per module, recording
+  ## the key of every proc it lowered and where that proc's text landed in the
+  ## `.asm.nif` beside it.
+  ##
+  ## Inside the module's OWN backend directory, not beside `blobcache/`: the
+  ## sidecar is only meaningful next to the exact `.asm.nif` it describes (whose
+  ## content hash it records), and a CTFE sub-build's backend directory holds a
+  ## different `.asm.nif` for the very same module name. One shared directory
+  ## would give the two entries one name, and every build would evict the
+  ## other's — correct, because the hash check catches it, but never warm.
+  ##
+  ## No `NifConfig` parameter, unlike `blobCacheDir` above: the answer is a
+  ## function of the node, not of the build.
+  backendDir / "arkhamcache"
+
+proc arkhamCacheEnabled*(): bool =
+  ## `NIMONY_ARKHAMCACHE=off` turns the per-proc cache off, for the same reason
+  ## `NIMONY_BLOBCACHE=off` exists: an A/B measurement needs both arms, and a
+  ## byte-identity check wants to compare a cached build against an uncached
+  ## one. Like the blobcache flag it DOES change the `*.build.nif`, because the
+  ## flag is part of the node's command line and a build file that claimed a
+  ## cache arkham was not given would be a lie about what ran.
+  when defined(nimony):
+    true
+  else:
+    getEnv("NIMONY_ARKHAMCACHE") != "off"
+
 proc blobCacheEnabled*(config: NifConfig): bool =
   ## `--no-blobcache` (`config.blobCache`) or `NIMONY_BLOBCACHE=off`.
   ##
@@ -1554,6 +1583,9 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
         # description rather than reading the file a second time.
         if c.config.layoutFile.len > 0:
           b.addStrLit "--layout:" & c.config.layoutFile
+        # `--asmcache:<dir>` (JIT_IMPL.md B3e), filled in per node because the
+        # directory is the module's OWN backend directory -- see the `do` below.
+        b.addKeyw "args"
         b.withTree "output":
           b.addStrLit "-o:"
         b.addKeyw "input"
@@ -2051,6 +2083,9 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string;
           # reaches arkham's command line (the `arkham` cmd uses `(input)`).
           b.withTree "do":
             b.addIdent "arkham"
+            if arkhamCacheEnabled():
+              b.withTree "args":
+                b.addStrLit "--asmcache:" & arkhamCacheDir(backendDir)
             b.withTree "input":
               b.addStrLit lengcInput
             addInlineSourceInputs(b, c, v, backend)
