@@ -310,6 +310,143 @@ block consolidation:
   expect snap.entries.len == 3,
     "the snapshot holds both directory levels, got " & $snap.entries.len
 
+# --- 5d. memory: the rss bucket (M1) ---------------------------------------
+#
+# `rss` is the peak resident size of the PROCESS that took the sample, and it
+# is the one bucket whose meaning depends on which process that was. A spawned
+# tool's peak is the phase's footprint; the driver's peak while an in-process
+# node ran is the whole driver's high-water mark. They are two averages, and
+# `estimate` prefers the first.
+
+proc rssSample(rss: int64; inproc: bool): LedgerSample =
+  result = default(LedgerSample)
+  result.produceNs = 1_000_000
+  result.rssBytes = rss
+  result.rssInproc = inproc
+
+block rssArithmetic:
+  var l = Ledger(path: scratch / "rss.nif", entries: @[], current: HashA)
+  let k = key("hexer", "m1")
+
+  # A first observation seeds the average rather than blending against 0. A
+  # build asks the ledger a handful of questions; a cold start a factor of
+  # three low would never wash out.
+  record(l, k, rssSample(100_000_000, false), HashA)
+  expect l.entries[0].ewma.rssBytes == 100_000_000,
+    "the first spawned peak seeds the average, got " & $l.entries[0].ewma.rssBytes
+  expect l.entries[0].rssInprocBytes == 0,
+    "and says nothing about the in-process average"
+
+  # (7*100 + 3*200) / 10 = 130
+  record(l, k, rssSample(200_000_000, false), HashA)
+  expect l.entries[0].ewma.rssBytes == 130_000_000,
+    "spawned peaks blend at alpha 0.3, got " & $l.entries[0].ewma.rssBytes
+
+  # An in-process sample goes into the OTHER average and leaves the first one
+  # alone: it is a measurement of a different thing.
+  record(l, k, rssSample(900_000_000, true), HashA)
+  expect l.entries[0].ewma.rssBytes == 130_000_000,
+    "an in-process peak must not move the spawned average, got " &
+      $l.entries[0].ewma.rssBytes
+  expect l.entries[0].rssInprocBytes == 900_000_000,
+    "it seeds the in-process average instead, got " &
+      $l.entries[0].rssInprocBytes
+
+  # ... and `estimate` answers with the spawned one, because that is the
+  # phase's own footprint rather than the driver's.
+  let est = estimate(l, k, HashA)
+  expect est.rssBytes == 130_000_000,
+    "estimate prefers the spawned peak, got " & $est.rssBytes
+  expect not est.rssInproc, "and says so"
+
+block rssInprocFallback:
+  # A phase that has ONLY ever run in-process has no footprint of its own, and
+  # the driver's peak is what there is. Falling back to it rather than to
+  # nothing is the conservative direction on purpose: the memory rule then
+  # keeps the phase out of the driver until a real measurement exists.
+  var l = Ledger(path: scratch / "rssin.nif", entries: @[], current: HashA)
+  let k = key("dceEmit", "m1")
+  record(l, k, rssSample(300_000_000, true), HashA)
+  let est = estimate(l, k, HashA)
+  expect est.rssBytes == 300_000_000,
+    "the in-process peak is the fallback, got " & $est.rssBytes
+  expect est.rssInproc, "and is reported as a driver peak"
+
+  # The moment the phase runs in a process of its own, that measurement wins,
+  # however much smaller it is.
+  record(l, k, rssSample(40_000_000, false), HashA)
+  let est2 = estimate(l, k, HashA)
+  expect est2.rssBytes == 40_000_000,
+    "one spawned sample outranks any number of driver peaks, got " &
+      $est2.rssBytes
+  expect not est2.rssInproc, "and is reported as the phase's own"
+
+block rssPhaseFallback:
+  # Across a phase, `rss` is the MAXIMUM and not the mean: the question is
+  # "will this fit", so an unmeasured module is assumed to be as big as the
+  # biggest measured one.
+  var l = Ledger(path: scratch / "rssmax.nif", entries: @[], current: HashA)
+  record(l, key("lengc", "m1"), rssSample(20_000_000, false), HashA)
+  record(l, key("lengc", "m2"), rssSample(80_000_000, false), HashA)
+  expect estimate(l, key("lengc", "m3"), HashA).rssBytes == 80_000_000,
+    "an unmeasured module of a phase gets the phase's largest peak, got " &
+      $estimate(l, key("lengc", "m3"), HashA).rssBytes
+  # And a phase nothing has ever been measured for gets the default table,
+  # which is deliberately generous rather than zero.
+  expect estimate(l, key("nimsem", "zz"), HashA).rssBytes > 0,
+    "an unmeasured phase must not estimate at zero bytes"
+
+block rssRoundTrip:
+  var l = Ledger(path: scratch / "rssrt" / "ledger.nif", entries: @[],
+                 current: HashA)
+  record(l, key("hexer", "aaa"), rssSample(123_456_789, false), HashA)
+  record(l, key("hexer", "aaa"), rssSample(700_000_000, true), HashA)
+  record(l, key("nimsem", "bbb"), rssSample(55_000_000, true), HashA)
+  saveLedger l
+  let text = readFile(l.path)
+  expect text.contains("(rss bytes "),
+    "the NIF form names the bucket and its unit:\n" & text
+  expect text.contains("(rssinproc bytes "),
+    "and keeps the driver peak in its own field:\n" & text
+
+  let back = openLedger(l.path)
+  expect back.entries.len == 2, "two keys survive, got " & $back.entries.len
+  for i in 0 ..< min(back.entries.len, l.entries.len):
+    expect back.entries[i].ewma.rssBytes == l.entries[i].ewma.rssBytes,
+      "rss of " & back.entries[i].key.phase & " survives exactly"
+    expect back.entries[i].rssInprocBytes == l.entries[i].rssInprocBytes,
+      "the driver peak of " & back.entries[i].key.phase & " survives exactly"
+
+block rssFragmentFold:
+  # A fragment written by a tool carries the spawned peak; a later in-process
+  # run of the same phase adds the driver peak to the same fragment, and
+  # neither is lost when `openLedger` folds it over the snapshot.
+  let dir = scratch / "rssfrag"
+  createDir dir
+  writeFragment(dir, key("hexer", "m1"), rssSample(60_000_000, false), HashA)
+  writeFragment(dir, key("hexer", "m1"), rssSample(500_000_000, true), HashA)
+  let l = openLedger(dir / "ledger.nif")
+  expect l.entries.len == 1, "one key, got " & $l.entries.len
+  if l.entries.len == 1:
+    expect l.entries[0].ewma.rssBytes == 60_000_000,
+      "the spawned peak survives the fold, got " & $l.entries[0].ewma.rssBytes
+    expect l.entries[0].rssInprocBytes == 500_000_000,
+      "so does the driver peak, got " & $l.entries[0].rssInprocBytes
+
+block rssOfThisProcess:
+  # The primitive itself. It is a peak, so it is monotone and never zero on a
+  # platform that answers at all; the whole rule rests on both.
+  let a = peakRssBytes()
+  expect a > 0, "this process must report a peak resident size"
+  var acc: seq[string] = @[]
+  for i in 0 ..< 200_000: acc.add "x"
+  let b = peakRssBytes()
+  expect b >= a, "a peak never falls: " & $a & " then " & $b
+  expect acc.len == 200_000, "keep the allocation alive"
+  expect formatMB(0) == "0.0", "formatMB(0)"
+  expect formatMB(MB) == "1.0", "formatMB(1 MiB)"
+  expect formatMB(3 * MB + MB div 2) == "3.5", "formatMB rounds to a tenth"
+
 # --- 6. the report ---------------------------------------------------------
 
 block statsRendering:
@@ -328,6 +465,23 @@ block statsRendering:
   expect t.contains("4.4"), "and prints the spawn average in it:\n" & t
   expect formatMs(0) == "0.0", "formatMs(0)"
   expect formatMs(1_234_567) == "1.2", "formatMs rounds to a tenth of a ms"
+
+block statsMemoryColumn:
+  # M1's column, and the marker that says which kind of peak a row holds.
+  var l = Ledger(path: scratch / "repmem.nif", entries: @[], current: HashA)
+  record(l, key("hexer", "a"), rssSample(100 * MB, false), HashA)
+  record(l, key("hexer", "b"), rssSample(150 * MB, false), HashA)
+  record(l, key("dceEmit", "a"), rssSample(210 * MB, true), HashA)
+  let t = statsTable(l)
+  expect t.contains("peak MB"), "the table has a peak column:\n" & t
+  expect t.contains("150.0"),
+    "a phase's row shows its LARGEST module, not their mean:\n" & t
+  expect t.contains("210.0*"),
+    "a driver peak is marked, because it is not the phase's footprint:\n" & t
+  expect not t.contains("150.0*"),
+    "a measured phase footprint is not marked:\n" & t
+  expect t.contains("[stats] driver peak "),
+    "the table ends with the driver's own peak:\n" & t
 
 # --- 7. integration: a real build fills the ledger --------------------------
 
@@ -362,6 +516,25 @@ else:
             phase & "/" & l.entries[i].key.module & " must have output bytes"
           expect l.entries[i].toolhash.len == 40,
             phase & " must be stamped with a toolhash"
+          # M1: whatever process the phase ran in, it reported what it cost
+          # that process. A zero here means the tool never called
+          # `peakRssBytes` (or the platform stopped answering), and the
+          # scheduler's memory rule would then be deciding on the default
+          # table forever.
+          var rss = 0'i64
+          var rssInproc = false
+          if l.entries[i].ewma.rssBytes > 0:
+            rss = l.entries[i].ewma.rssBytes
+          else:
+            rss = l.entries[i].rssInprocBytes
+            rssInproc = true
+          expect rss > 0,
+            phase & "/" & l.entries[i].key.module &
+            " must report a peak resident size"
+          expect rss < 64'i64 * 1024 * MB,
+            phase & "/" & l.entries[i].key.module & " reports " & $rss &
+            " bytes of peak, which is not a resident size but a unit bug" &
+            (if rssInproc: " (driver peak)" else: "")
       expect found, "the build must leave a " & phase & " sample behind"
 
     # Every command nifmake ran as a process cost one, and it measured what
@@ -403,6 +576,10 @@ else:
         "--stats prints the ledger table header:\n" & statsOut
       expect statsOut.contains("spawn ms"),
         "--stats prints the spawn column (A1d):\n" & statsOut
+      expect statsOut.contains("peak MB"),
+        "--stats prints the peak resident size column (M1):\n" & statsOut
+      expect statsOut.contains("[stats] driver peak "),
+        "--stats prints the driver's own peak (M1):\n" & statsOut
       expect statsOut.contains("nimsem"),
         "--stats names the phases:\n" & statsOut
       expect statsOut.contains("[store] policy="),

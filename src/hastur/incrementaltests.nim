@@ -758,6 +758,165 @@ proc incrementalInprocTests*() =
   echo "inproc: ", phases, " / ", phases, " phases successful in ",
        formatFloat(dt, ffDecimal, precision=2), "s."
 
+# ---- The memory gate (JIT_IMPL.md M1) -------------------------------------
+# The scheduler declines in-process work once the driver's peak resident size
+# plus the next node's estimated peak would pass `--inproc-mem-budget`. Two
+# things have to hold, and they are opposite ends of the same rule:
+#
+# 1. A budget nothing can fit under sends EVERY node to a process. `1` MB is
+#    below the driver's own peak before it has done anything at all, so the
+#    rule declines without even consulting the ledger -- which makes this the
+#    exact assertion that the gate is reached from every path the relay has,
+#    the single-node depths included (those short-circuit the wall-time rule).
+#    It is also `--spawn:always` reached by a different road, so the artifacts
+#    must still be the artifacts.
+# 2. The default budget must not disturb the edit loop. The one-module edit
+#    that A2b's own scenario keeps spawn-free before `cc` has to stay that way,
+#    or the gate is not a safety valve but a regression.
+
+proc incrementalMemBudgetTests*() =
+  ## `--inproc-mem-budget`: the impossible budget spawns everything, the
+  ## default budget changes nothing about a hello-world edit.
+  let t0 = epochTime()
+  let src = "tests/incremental/sample.nim"
+  let nimony = "bin" / "nimony".addFileExt(ExeExt)
+  if not fileExists(src):
+    quit "membudget: " & src & " missing"
+  if not fileExists(nimony):
+    quit "membudget: " & nimony & " not found; run `hastur build nimony` first"
+  var failures: seq[string] = @[]
+  template expect(cond: bool; msg: string) =
+    if not cond: failures.add msg
+  var phases = 0
+
+  let originalSrc = readFile(src)
+  proc restoreSources() = writeFile(src, originalSrc)
+
+  proc compile(cache, extra: string): seq[seq[ReportEntry]] =
+    let cmd = nimony.quoteShell & " c --silentMake --report" & extra &
+              " --nimcache:" & cache.quoteShell & " " & src.quoteShell
+    let (output, ec) = execCmdEx(cmd)
+    if ec != 0:
+      stdout.write output
+      restoreSources()
+      quit "membudget: `" & cmd & "` failed"
+    result = parseNifmakeReports(output)
+
+  # Phase 1: a budget of one megabyte. Nothing registered may run here, in
+  # either build graph, cold or after an edit.
+  block:
+    inc phases
+    let cache = "nimcache" / "membudget-tight"
+    removeDir cache
+    let cold = compile(cache, " --inproc-mem-budget:1")
+    expect cold.len == 2, "tight: expected 2 build graphs, got " & $cold.len
+    for i in 0 ..< cold.len:
+      expect reportField(cold[i], "inproc") == 0,
+             "tight: graph " & $i & " ran " & $reportField(cold[i], "inproc") &
+             " node(s) in-process under a 1 MB budget"
+      expect reportField(cold[i], "total") > 0,
+             "tight: graph " & $i & " ran nothing, so it proves nothing"
+    writeFile(src, originalSrc & "\necho \"membudget-edit\"\n")
+    let edit = compile(cache, " --inproc-mem-budget:1")
+    for i in 0 ..< edit.len:
+      expect reportField(edit[i], "inproc") == 0,
+             "tight: after an edit, graph " & $i & " ran " &
+             $reportField(edit[i], "inproc") & " node(s) in-process"
+    restoreSources()
+
+  # Phase 2: the same budget reached through the environment instead of the
+  # command line. That is the road a nested `nimony s` takes (the flag is never
+  # forwarded in `c.commandLineArgs`, so that two settings emit byte-identical
+  # `.build.nif` files), and a setting that only works one way is a setting the
+  # compile-time-evaluation sub-build does not have.
+  block:
+    inc phases
+    let cache = "nimcache" / "membudget-env"
+    removeDir cache
+    putEnv("NIMONY_INPROC_MEM_BUDGET", "1")
+    let r = compile(cache, "")
+    delEnv("NIMONY_INPROC_MEM_BUDGET")
+    for i in 0 ..< r.len:
+      expect reportField(r[i], "inproc") == 0,
+             "env: graph " & $i & " ran " & $reportField(r[i], "inproc") &
+             " node(s) in-process under NIMONY_INPROC_MEM_BUDGET=1"
+
+  # Phase 3: the tight budget is `--spawn:always` reached by another road, so
+  # it has to produce the same bytes. A scheduler that declined a node by
+  # *skipping* it would pass phase 1 and fail here.
+  block:
+    inc phases
+    let cacheA = "nimcache" / "membudget-ident-tight"
+    let cacheB = "nimcache" / "membudget-ident-spawn"
+    removeDir cacheA
+    removeDir cacheB
+    discard compile(cacheA, " --inproc-mem-budget:1")
+    discard compile(cacheB, " --spawn:always")
+    let a = buildArtifacts(cacheA)
+    let b = buildArtifacts(cacheB)
+    expect a.len > 0, "identity: no artifacts under " & cacheA
+    expect a == b,
+           "identity: the two modes produced different artifact SETS (" &
+           $a.len & " vs " & $b.len & ")"
+    var differing: seq[string] = @[]
+    for rel in a:
+      if rel notin b: continue
+      if normalizedArtifact(cacheA, rel) != normalizedArtifact(cacheB, rel):
+        differing.add rel
+    expect differing.len == 0,
+           "identity: " & $differing.len & " artifact(s) differ between a 1 MB " &
+           "budget and --spawn:always: " & differing.join(", ")
+
+  # Phase 4: the default budget leaves the edit loop alone. Same assertion as
+  # `incrementalInprocTests`' phase 2, made again here because it is what the
+  # gate must NOT break: everything before `cc` stays in this process.
+  block:
+    inc phases
+    let cache = "nimcache" / "membudget-default"
+    removeDir cache
+    discard compile(cache, "")
+    writeFile(src, originalSrc & "\necho \"membudget-default-edit\"\n")
+    let r = compile(cache, "")
+    expect r.len == 2, "default: expected 2 build graphs, got " & $r.len
+    if r.len == 2:
+      # `nifler` is subtracted for the reason A2b's scenario gives: it is the
+      # one frontend phase that is still a process of its own.
+      let feSpawned = reportField(r[0], "total") - reportField(r[0], "inproc") -
+                      reportField(r[0], "nifler")
+      expect feSpawned == 0,
+             "default: the frontend graph spawned " & $feSpawned &
+             " node(s) that are not nifler, so the default budget is biting " &
+             "on a hello-world edit"
+      let beSpawned = reportField(r[1], "total") - reportField(r[1], "inproc")
+      let spawnable = reportField(r[1], "cc") + reportField(r[1], "link")
+      expect beSpawned == spawnable,
+             "default: the backend graph spawned " & $beSpawned &
+             " node(s) but only " & $spawnable & " are cc/link"
+      expect reportField(r[1], "inproc") >= 3,
+             "default: only " & $reportField(r[1], "inproc") &
+             " backend node(s) ran in-process"
+    restoreSources()
+
+  # Phase 5: `0` turns the rule off rather than meaning "no memory at all".
+  block:
+    inc phases
+    let cache = "nimcache" / "membudget-off"
+    removeDir cache
+    let r = compile(cache, " --inproc-mem-budget:0")
+    var inproc = 0
+    for i in 0 ..< r.len: inproc += reportField(r[i], "inproc")
+    expect inproc > 0,
+           "off: --inproc-mem-budget:0 must disable the rule, not forbid " &
+           "every node; got inproc=" & $inproc
+
+  restoreSources()
+  let dt = epochTime() - t0
+  if failures.len > 0:
+    for f in failures: stderr.writeLine "membudget: " & f
+    quit "FAILURE: " & $failures.len & " membudget phase(s) failed."
+  echo "membudget: ", phases, " / ", phases, " phases successful in ",
+       formatFloat(dt, ffDecimal, precision=2), "s."
+
 # ---- Per-module DCE live sets (JIT_IMPL.md P0c) ----------------------------
 # `dceLive` used to write ONE whole-program `.live.nif` that every `dceEmit`
 # node read, and it serialised `HashSet[SymId]` in hash order of a pool index

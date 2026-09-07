@@ -118,6 +118,11 @@ Options:
                             --jobs:1 also runs the graph node by node
   --inproc-k:N              a phase runs in this process while its estimated
                             cost is under N spawn costs (default 3)
+  --inproc-mem-budget:MB    stop running phases in this process once its peak
+                            resident size plus the next node's estimated peak
+                            would exceed MB; 0 turns the rule off. The default
+                            is physical memory / (32 * cores), clamped to
+                            [128, 1024] MB
   --no-blobcache            native backend: assemble every reachable proc from
                             scratch instead of reusing nifasm's per-symbol code
                             cache under <nimcache>/blobcache. The cache is on by
@@ -441,6 +446,22 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
             let n = parsePositiveInt(val)
             if n < 1: quit "invalid value for --inproc-k; expected a number >= 1"
             rememberForChildren("NIMONY_INPROC_K", $n)
+            forwardArg = false
+          of "inproc-mem-budget", "inprocmembudget":
+            # M1's memory gate. In the environment beside `--spawn` and
+            # `--inproc-k` for the same reason: the setting must reach the
+            # nested `nimony s` of a compile-time evaluation without changing
+            # a byte of any `.build.nif`.
+            #
+            # `0` is a value, not an absence -- it turns the rule off -- so it
+            # is checked before `parsePositiveInt`'s "0 means unparseable".
+            if val == "0":
+              rememberForChildren("NIMONY_INPROC_MEM_BUDGET", "0")
+            else:
+              let mb = parsePositiveInt(val)
+              if mb < 1:
+                quit "invalid value for --inproc-mem-budget; expected megabytes >= 1, or 0 to disable"
+              rememberForChildren("NIMONY_INPROC_MEM_BUDGET", $mb)
             forwardArg = false
           of "profile":
             c.buildFlags.incl Profile

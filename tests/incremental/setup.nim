@@ -38,6 +38,10 @@ incrementalToolShadowTests("--spawn:always")
 # ... and the scheduler's own assertions: the `inproc` field, byte identity
 # against `--spawn:always`, and a spawn-free compile-time evaluation.
 incrementalInprocTests()
+# M1: the scheduler's memory gate. A budget nothing fits under spawns
+# everything (and still produces the same bytes); the default budget leaves
+# the edit loop exactly as the scenario above found it.
+incrementalMemBudgetTests()
 # P0c: per-module DCE live sets. A three-module chain small enough that every
 # expected `dceEmit`/`cc` count can be named exactly, once per scheduler mode
 # (the counts are per PHASE, so they must not depend on who ran the phase).
