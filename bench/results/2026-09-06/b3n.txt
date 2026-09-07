@@ -1,0 +1,300 @@
+B3 (nimony half) -- nifasm's per-symbol code cache wired into both native
+paths: `--blobcache:<nimcache>/blobcache` on the `link` node of the build graph
+and `AsmSession.useBlobCache` on `engine.runWholeProgram`.  JIT_IMPL.md phase
+B3, JIT.md 7.3.
+
+Branch jit/b3-nimony, forked from fast-devloop at eba4333a.
+nativenif: private clone of jit/b3 (713c819) + one fix, branch jit/b3-fixes,
+head f8d2676 -- which is what `src/nativenif.commit` now pins (was 736b491).
+Host: macOS 26.6.2, Apple M5 (10 cores), Nim 2.2.10, NIMONY_VFS=disk,
+XDG_CACHE_HOME=/tmp/b3n_cache_25830.
+Toolchain: this worktree, `hastur build all` with NIMONY_NATIVENIF pointing at
+the private clone (/tmp/b3n/nativenif, with /tmp/b3n/nimony symlinked to this
+worktree so nativenif's sibling-relative `nim.cfg` paths resolve).
+
+The machine was reasonably quiet -- no other agent was building -- but it is a
+laptop, so read the pairs against each other rather than the absolutes.
+
+  uptime before: 23:08  up 17 days, 23:04, 2 users, load averages: 2.18 4.13 4.32
+  uptime after:  23:15  up 17 days, 23:11, 2 users, load averages: 3.33 3.82 4.10
+
+
+== bench/devloop_bench.sh, three arms, median of 3 =========================
+
+The third arm is the one that isolates THIS phase: the same head toolchain with
+`EXTRA=--no-blobcache`, i.e. the cache turned off and nothing else changed.
+`base` is the fork point (f69b8afc), which has no `nimony r` and so no `*.run`
+rows.
+
+                    base        head-nocache   head
+scenario            (f69b8afc)  (cache off)    (cache on)
+                    wall   cpu   wall   cpu     wall   cpu
+hello.forced        0.335  0.475  0.320  0.455  0.316  0.450
+hello.nochange      0.014  0.012  0.006  0.005  0.005  0.005
+hello.edit          0.048  0.041  0.034  0.030  0.031  0.027
+hello.nrun            --     --   0.268  0.041  0.265  0.039
+hello.run             --     --   0.023  0.021  0.020  0.018
+ctfe.cold           2.457  3.515  0.752  1.183  0.749  1.176
+ctfe.warm           0.011  0.010  0.007  0.006  0.007  0.007
+ctfe.edit           0.156  0.135  0.041  0.037  0.037  0.032
+ctfe.forced         3.592  5.214  0.735  1.156  0.733  1.152
+bench.cold          5.957  9.115  1.103  1.571  1.097  1.554
+bench.edit          0.386  0.355  0.056  0.052  0.054  0.049
+stdlib.cold         5.220 29.636  5.217 28.463  5.172 27.216
+stdlib.forced       1.937  9.329  2.050  9.521  2.046  9.376
+stdlib.edit         0.437  1.292  0.376  0.711  0.388  0.733
+self.cold           5.439 14.396  5.327 12.863  5.318 12.511
+self.nochange       0.094  0.091  0.100  0.099  0.100  0.098
+self.editbody       2.263  3.547  1.805  1.846  1.381  1.423
+self.nrun             --     --   1.994  1.840  1.587  1.441
+self.run              --     --   1.785  1.829  1.364  1.407
+self.edit           2.368  3.727  1.885  2.004  1.470  1.590
+self.forced         5.567 14.275  5.073 13.273  5.148 13.121
+
+Raw runs, head (cache on):
+
+hello.forced    wall   0.316  cpu   0.450   raw wall: 0.316 0.311 0.316  cpu: 0.450 0.463 0.450
+hello.nochange  wall   0.005  cpu   0.005   raw wall: 0.006 0.005 0.005  cpu: 0.005 0.005 0.005
+hello.edit      wall   0.031  cpu   0.027   raw wall: 0.031 0.031 0.031  cpu: 0.027 0.026 0.027
+hello.nrun      wall   0.265  cpu   0.039   raw wall: 0.265 0.301 0.250  cpu: 0.034 0.050 0.039
+hello.run       wall   0.020  cpu   0.018   raw wall: 0.024 0.020 0.020  cpu: 0.022 0.018 0.018
+ctfe.cold       wall   0.749  cpu   1.176   raw wall: 0.749 0.742 0.752  cpu: 1.176 1.167 1.190
+ctfe.warm       wall   0.007  cpu   0.007   raw wall: 0.007 0.008 0.007  cpu: 0.007 0.006 0.007
+ctfe.edit       wall   0.037  cpu   0.032   raw wall: 0.046 0.037 0.036  cpu: 0.035 0.032 0.032
+ctfe.forced     wall   0.733  cpu   1.152   raw wall: 0.687 0.733 0.733  cpu: 1.108 1.152 1.153
+bench.cold      wall   1.097  cpu   1.554   raw wall: 1.097 1.092 1.099  cpu: 1.554 1.541 1.555
+bench.edit      wall   0.054  cpu   0.049   raw wall: 0.066 0.054 0.053  cpu: 0.069 0.049 0.049
+stdlib.cold     wall   5.172  cpu  27.216   raw wall: 5.346 5.100 5.172  cpu: 26.558 27.216 27.609
+stdlib.forced   wall   2.046  cpu   9.376   raw wall: 1.995 2.046 2.077  cpu: 9.153 9.376 9.522
+stdlib.edit     wall   0.388  cpu   0.733   raw wall: 0.388 0.375 0.393  cpu: 0.733 0.724 0.767
+self.cold       wall   5.318  cpu  12.511   raw wall: 5.536 5.318 5.307  cpu: 13.322 12.511 12.438
+self.nochange   wall   0.100  cpu   0.098   raw wall: 0.099 0.100 0.100  cpu: 0.098 0.098 0.098
+self.editbody   wall   1.381  cpu   1.423   raw wall: 1.381 1.367 1.402  cpu: 1.423 1.408 1.444
+self.nrun       wall   1.587  cpu   1.441   raw wall: 1.700 1.587 1.585  cpu: 1.441 1.438 1.441
+self.run        wall   1.364  cpu   1.407   raw wall: 1.882 1.364 1.359  cpu: 1.926 1.407 1.403
+self.edit       wall   1.470  cpu   1.590   raw wall: 1.470 1.467 1.487  cpu: 1.590 1.586 1.607
+self.forced     wall   5.148  cpu  13.121   raw wall: 5.102 5.148 5.176  cpu: 13.000 13.121 13.234
+
+label: head   toolchain: <this worktree>   runs: 3 (median)   backend=n (stdlib.* on c)   NIMONY_VFS=disk   EXTRA=
+
+Raw runs, head-nocache (`EXTRA=--no-blobcache`):
+
+hello.forced    wall   0.320  cpu   0.455   raw wall: 0.320 0.315 0.322  cpu: 0.452 0.472 0.455
+hello.nochange  wall   0.006  cpu   0.005   raw wall: 0.006 0.006 0.005  cpu: 0.005 0.005 0.005
+hello.edit      wall   0.034  cpu   0.030   raw wall: 0.034 0.034 0.034  cpu: 0.030 0.030 0.030
+hello.nrun      wall   0.268  cpu   0.041   raw wall: 0.272 0.268 0.258  cpu: 0.035 0.051 0.041
+hello.run       wall   0.023  cpu   0.021   raw wall: 0.023 0.023 0.023  cpu: 0.021 0.021 0.021
+ctfe.cold       wall   0.752  cpu   1.183   raw wall: 0.750 0.781 0.752  cpu: 1.183 1.231 1.180
+ctfe.warm       wall   0.007  cpu   0.006   raw wall: 0.007 0.007 0.007  cpu: 0.006 0.006 0.006
+ctfe.edit       wall   0.041  cpu   0.037   raw wall: 0.040 0.041 0.041  cpu: 0.036 0.037 0.037
+ctfe.forced     wall   0.735  cpu   1.156   raw wall: 0.690 0.736 0.735  cpu: 1.107 1.156 1.162
+bench.cold      wall   1.103  cpu   1.571   raw wall: 1.103 1.107 1.103  cpu: 1.571 1.579 1.555
+bench.edit      wall   0.056  cpu   0.052   raw wall: 0.068 0.056 0.056  cpu: 0.071 0.052 0.052
+stdlib.cold     wall   5.217  cpu  28.463   raw wall: 5.088 5.217 5.360  cpu: 27.614 28.463 28.561
+stdlib.forced   wall   2.050  cpu   9.521   raw wall: 2.036 2.050 2.056  cpu: 9.508 9.599 9.521
+stdlib.edit     wall   0.376  cpu   0.711   raw wall: 0.386 0.375 0.376  cpu: 0.711 0.712 0.703
+self.cold       wall   5.327  cpu  12.863   raw wall: 5.414 5.327 5.264  cpu: 12.999 12.863 12.828
+self.nochange   wall   0.100  cpu   0.099   raw wall: 0.101 0.100 0.100  cpu: 0.100 0.099 0.099
+self.editbody   wall   1.805  cpu   1.846   raw wall: 1.806 1.792 1.805  cpu: 1.847 1.834 1.846
+self.nrun       wall   1.994  cpu   1.840   raw wall: 2.067 1.983 1.994  cpu: 1.837 1.840 1.852
+self.run        wall   1.785  cpu   1.829   raw wall: 1.785 1.781 1.802  cpu: 1.829 1.825 1.846
+self.edit       wall   1.885  cpu   2.004   raw wall: 1.897 1.885 1.878  cpu: 2.017 2.004 1.999
+self.forced     wall   5.073  cpu  13.273   raw wall: 5.028 5.073 5.084  cpu: 13.020 13.273 13.376
+
+label: head-nocache   toolchain: <this worktree>   runs: 3 (median)   backend=n (stdlib.* on c)   NIMONY_VFS=disk   EXTRA=--no-blobcache
+
+Raw runs, base (/tmp/devloop_base, f69b8afc):
+
+hello.forced    wall   0.335  cpu   0.475   raw wall: 0.335 0.335 0.344  cpu: 0.475 0.472 0.484
+hello.nochange  wall   0.014  cpu   0.012   raw wall: 0.015 0.014 0.014  cpu: 0.012 0.012 0.012
+hello.edit      wall   0.048  cpu   0.041   raw wall: 0.048 0.049 0.048  cpu: 0.041 0.042 0.041
+ctfe.cold       wall   2.457  cpu   3.515   raw wall: 2.816 2.457 2.438  cpu: 3.575 3.515 3.474
+ctfe.warm       wall   0.011  cpu   0.010   raw wall: 0.011 0.012 0.011  cpu: 0.010 0.010 0.010
+ctfe.edit       wall   0.156  cpu   0.135   raw wall: 0.156 0.157 0.156  cpu: 0.135 0.136 0.135
+ctfe.forced     wall   3.592  cpu   5.214   raw wall: 3.645 3.592 3.573  cpu: 5.214 5.223 5.154
+bench.cold      wall   5.957  cpu   9.115   raw wall: 6.856 5.937 5.957  cpu: 9.210 9.068 9.115
+bench.edit      wall   0.386  cpu   0.355   raw wall: 0.396 0.386 0.384  cpu: 0.377 0.355 0.352
+stdlib.cold     wall   5.220  cpu  29.636   raw wall: 5.059 5.220 5.322  cpu: 28.505 29.636 29.749
+stdlib.forced   wall   1.937  cpu   9.329   raw wall: 1.930 1.937 1.963  cpu: 9.329 9.308 9.354
+stdlib.edit     wall   0.437  cpu   1.292   raw wall: 0.437 0.437 0.437  cpu: 1.294 1.282 1.292
+self.cold       wall   5.439  cpu  14.396   raw wall: 5.860 5.421 5.439  cpu: 14.777 14.230 14.396
+self.nochange   wall   0.094  cpu   0.091   raw wall: 0.093 0.094 0.094  cpu: 0.091 0.091 0.091
+self.editbody   wall   2.263  cpu   3.547   raw wall: 2.263 2.258 2.279  cpu: 3.537 3.547 3.578
+self.edit       wall   2.368  cpu   3.727   raw wall: 2.368 2.355 2.390  cpu: 3.724 3.727 3.741
+self.forced     wall   5.567  cpu  14.275   raw wall: 5.551 5.567 5.582  cpu: 14.230 14.275 14.403
+
+label: base   toolchain: /tmp/devloop_base   runs: 3 (median)   backend=n (stdlib.* on c)   NIMONY_VFS=disk   EXTRA=
+
+
+== the pair the phase is judged on, INTERLEAVED ==============================
+
+`bench/devloop_ab.sh` alternates two TOOLCHAINS and does not carry the `self.*`
+scenarios, so this was done by hand (`/tmp/b3n/self_ab.sh`, kept with these
+results): one toolchain, two arms that differ only in `--no-blobcache`, each
+with its own copy of the fork-point sources and its own nimcache, a priming
+build before the loop, and the arms alternating INSIDE one round so a load
+spike lands on both.  Five rounds, cache warm, median.
+
+self.editbody  cache=on   wall 1.551  cpu 1.600   raw wall: 1.409 1.846 1.551 1.594 1.494  cpu: 1.450 1.714 1.600 1.633 1.539
+self.editbody  cache=off  wall 2.067  cpu 2.050   raw wall: 2.067 1.939 2.200 2.074 1.943  cpu: 2.100 1.981 2.204 2.050 1.988
+self.run       cache=on   wall 1.508  cpu 1.556   raw wall: 2.128 1.548 1.475 1.479 1.508  cpu: 2.119 1.574 1.522 1.525 1.556
+self.run       cache=off  wall 1.970  cpu 2.018   raw wall: 1.922 1.970 2.028 2.020 1.949  cpu: 1.968 2.018 2.079 2.057 1.997
+
+The interleaved medians are 0.15-0.2 s slower than the `devloop_bench.sh` ones
+for both arms, which is what alternating two full compiler builds in one loop
+costs in cache pressure; the RATIO is the number, and it agrees: 1.33x on
+`editbody`, 1.31x on `run`.
+
+Against the phase brief's expectation (`self.editbody` ~2.17 -> ~1.3-1.5 s):
+
+| scenario      | B1 (b1r.txt) | cache off | cache on | brief |
+|---------------|--------------|-----------|----------|-------|
+| self.editbody | 1.911 s      | 1.805 s   | 1.381 s  | 1.3-1.5 |
+| self.run      | 1.929 s      | 1.785 s   | 1.364 s  | same    |
+| hello.run     | 0.033 s      | 0.023 s   | 0.020 s  | --      |
+
+(b1r.txt was taken while a second agent was building in the neighbouring
+checkout, which is most of the 0.1 s between its numbers and this run's
+cache-off arm; the cache-off arm here is the honest "before".)
+
+
+== the per-stage line for the compiler-sized program ========================
+
+`nimony r --verbose`, 127 modules, 2.35 MB of code, after a private proc was
+appended to `src/nimony/sem.nim` (the `self.editbody` edit), warm nimcache.
+The three states, on the same image:
+
+  cache off                 assemble=849.91ms emitRoots=848.31ms lay=5.29ms bind=0.18ms code=2347568B data=33488B ext=37 blobcache=off
+  sem.nim edited, warm      assemble=484.11ms emitRoots=477.96ms lay=5.37ms bind=0.19ms code=2347568B data=33488B ext=37 blobcache=on hits=3415 stale=18 recorded=627
+  nothing edited, all hits  assemble=245.10ms emitRoots=241.96ms lay=5.02ms bind=0.18ms code=2347568B data=33488B ext=37 blobcache=on hits=4027 stale=15 recorded=15
+
+`code=2347568B` in all three: the arena holds the same number of bytes whether
+the fragments were replayed or selected, which is the cheap half of the byte
+identity nativenif's `blobcache_selftest` proves properly.
+
+627 recorded for a `sem.nim` edit is `sem.nim`'s own 609 procs plus the 18
+fragments elsewhere that had read one of its declarations and were rejected as
+`stale` -- the number `notes/b3.md` §5.3 predicts (565 there, on a slightly
+older corpus).
+
+nifasm's own `--profile` table for the middle row, the interesting rows only:
+
+  stage                     ms      count           n
+  parse                     1.64          1       32713
+  declare                   0.08          1           0
+  emitTopLevel              0.14          1           0
+    blobRead               15.07        127           0
+    blobRecord              8.33        627       19563
+    blobResolve           155.37       4897        4897
+    blobRefs              162.68       3415       56183
+    blobSplice              6.38       3415     1714384
+  getDecl                   0.27       2764           0
+  emitRoots               477.96          1           0
+  blobWrite                 4.28          1           7
+  blobHits                  0.00          1        3415
+  blobStale                 0.00          1          18
+  blobRecorded              0.00          1         627
+  TOTAL                   484.36
+  per-module emit, 127 modules, top 15:
+    semygjvq21                 215.22      867 syms
+    semv1g3zm                   31.14      107 syms
+                                 8.67       43 syms
+    sigruew971                   4.33       88 syms
+    typ6owi9i1                   2.62       26 syms
+
+`blobResolve` + `blobRefs` = 318 ms of the 478, i.e. following names into
+foreign modules and validating the layout stamps of what they resolve to. That
+is `notes/b3.md` §5.2's 0.07 s shortfall seen from the nimony side and at full
+size: the remaining cost of a warm link is a SYMBOL-TABLE cost, not a code
+one, and it is B4's (`.x.nif` feed with a cached resolve step, JIT.md 7.3).
+
+The same edit through the SPAWNED linker (`nimony n`, `NIFASM_PROFILE=1`), for
+the like-for-like comparison B1 recorded:
+
+  emitRoots               425.00          1           0
+    codesign               11.40          1           0
+  writeImage               19.33          1           0
+  blobHits                  0.00          1        3415
+  blobStale                 0.00          1          18
+  blobRecorded              0.00          1         627
+  TOTAL                   450.02
+
+Same hits, same stale, same recorded: the two paths do the same work over the
+same fragments, and `nimony n` pays the 19 ms of Mach-O write and ad-hoc
+signature that `nimony r` does not.  (They do NOT share each other's fragments,
+and must not: a blob is keyed on target + FLAGS + tool build id + module name,
+and `nimony r` assembles `--dev-single-thread` with no debug info while a
+linked executable has threads and debug info.  What they share is the
+DIRECTORY -- one store per nimcache, scoped by `--nimcache`, swept by
+`hastur clean`.)
+
+Blob store for the compiler, after both commands had run over one nimcache:
+254 files, 15 MB -- 127 modules under each of the two flag keys, which is what
+"one directory, two keyed sets" looks like on disk.  It sits inside the
+nimcache, so `--nimcache:<dir>` scopes it and `hastur clean` evicts it.
+
+
+== correctness ==============================================================
+
+    bin/hastur test tests/nimony_r      all checks passed (24 checks)
+    bin/hastur test tests/ctfe_engine   all checks passed
+    bin/hastur test tests/ctfe_diff     19 file(s), 50 artifact(s), 79 .s.nif,
+                                        0 difference(s)
+    bin/hastur test tests/incremental   SUCCESS (16+2+16+2+16+2+4+5+5 phases)
+    bin/hastur tests/nimony             794 / 794 in 150.55s
+    bin/hastur native                   111 / 117 (the 6 tests/nimony/threads
+                                        cases; `std/rawthreads` is a `{.error.}`
+                                        on nimNoLibc/arm64 -- the known B0 gap,
+                                        unchanged)
+    bin/hastur boot --boot-backend:native
+                                        cache ON:  stages 1/2 byte-identical,
+                                                   2/3 byte-identical, 46.37s
+                                        cache OFF: stages 1/2 byte-identical,
+                                                   2/3 byte-identical, 47.29s
+                                        and stage 3's nimony/nimsem/hexer are
+                                        byte-identical BETWEEN the two states
+                                        (sha256, all three)
+
+    tests/nativecg                      0 / 1 -- unchanged: the suite's golden
+                                        is per-target and only
+                                        `tinlinecond.x64.asm.nif` is checked
+                                        in, so on macOS/arm64 it fails as a
+                                        missing file.  Verified the same
+                                        failure on /tmp/devloop_base
+                                        (f69b8afc), i.e. pre-existing and not
+                                        this phase's.  What the cache could
+                                        have changed was checked directly
+                                        instead: `nimony n --opt:speed` of
+                                        `tinlinecond.nim` with the cache on and
+                                        with `--no-blobcache` produces the same
+                                        sha256 for all four `.asm.nif` modules
+                                        AND for the executable.
+
+    nativenif tests/tester.nim          green, including
+                                        234/234 memory-image byte-identity (mach-o)
+                                        233/233 memory-image byte-identity (elf)
+                                        234/234 blob-cache byte-identity (macho)
+                                        237/237 blob-cache byte-identity (elf)
+                                         87/87  blob-cache byte-identity (raw)
+                                        230/230 arkham tests
+                                        230/230 in-memory (nifrun) tests
+                                        hostsyms self-test: all checks passed
+    nativenif tools/refactor_gate.sh    byte-identical to the 713c819 baseline:
+                                        2583 artifacts, 774 listings, both
+                                        diffs empty
+
+
+== what changed, in one paragraph ==========================================
+
+`deps.blobCacheDir(config)` is `<nimcache>/blobcache`, beside `ocache/` and
+`ccache/`.  The native `link` node passes it to nifasm as `--blobcache:<dir>`
+and `nimony.runProject` hands the same string to `engine.runWholeProgram`,
+which calls `AsmSession.useBlobCache` before `declare` and `saveBlobCache`
+after `finishCode` -- before the guest runs, because a guest is free never to
+return.  `--no-blobcache` and `NIMONY_BLOBCACHE=off` clear it; unlike
+`NIMONY_CCACHE` this one does change the `*.build.nif`, because the flag it
+suppresses is part of the `link` node's command line.  `--verbose` adds
+`emitRoots=` and `blobcache=on hits=/stale=/recorded=` to the `[run-engine]`
+line; `--profile` (and `--verbose`) additionally turns on nifasm's own
+per-stage table.  The `intercept("__exit")` workaround B1 carried in
+`engine.nim` is gone: the bug is fixed upstream in nativenif f8d2676.

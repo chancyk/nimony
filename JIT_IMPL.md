@@ -643,6 +643,34 @@ ledger.
 Gate: cold `nimony r` of the stdlib-wide test loads cached modules in ≤ 20
 ms; a one-line edit runs in ≤ 40 ms end to end.
 
+Status (see the table at the end): the code cache half is done, in nativenif
+(`jit/b3`) and wired into both native paths here (`jit/b3-nimony`,
+`notes/b3-nimony.md`, `bench/results/2026-09-06/b3n.txt`). Three items of the
+paragraph above are NOT done and are carried into B4, because measurement
+moved them there:
+
+* **the `nimrun` out-of-process guest.** Nothing in the numbers asks for it
+  yet: a `nimony r` process runs one program and exits, so the parked thread
+  B1 accepted still costs milliseconds. It becomes necessary when a program is
+  re-run without a fresh compiler process, i.e. with `nimony dev`.
+* **the `.x.nif` feed with the cached resolve step.** This is where the
+  remaining time is, and both halves of the phase found it independently:
+  318 ms of a warm 484 ms compiler link is `blobResolve` + `blobRefs`,
+  following foreign names into their modules and validating layout stamps.
+  A code cache cannot reach it; a resolved-scope cache is its own piece of
+  work.
+* **the frozen-vs-reloadable slot policy.** Every call a replayed fragment
+  makes is still a direct branch patched from the final label table ("frozen
+  module → load-time direct patch", JIT.md 7.3). The indirection a reloadable
+  module needs is B4's by definition.
+
+The cache key is also not literally the SHA-1 of the `.x.nif`: nifasm keys a
+blob on target + flags + tool build id + module NAME and validates it with a
+file stamp first and a content hash second, because hashing a 50 MB corpus
+costs a third of the budget the whole incremental link has. `--blobcache-hash`
+restores the letter of the paragraph at that price. `notes/b3.md` §3.2 in
+nativenif argues it.
+
 ## Phase B3b — symbol-granularity lowering for the edited module
 
 Goal: after B3, a body edit in the compiler's largest module still re-lowers
@@ -765,7 +793,7 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B1 (nativenif half) | done on `../nativenif` branch `jit/b1` (10 commits from pin d0781a48): `generateAsmBuf`, `AsmSession`/`emitRoots`, `AsmError`, `image/memory.nim` + `hostfixup.nim`, `core/hostsyms.nim`, `hostrun.nim` + `tools/nifrun`, `--dev-single-thread`; refactor gate byte-identical; 234/234 memory-vs-file code hash checks; CTFE sub-program runs from memory in ~8 ms with byte-identical `.out.nif` (reproduced by the integrator). Not yet: x64 `&threadvar` lowering (arkham side), Windows `runImage`, the nimony-side `nimony r`, re-pin of `src/nativenif.commit` | nativenif e368478 |
 | B2 | merged (`src/nimony/engine.nim` behind `-d:nimonyEngine`, `--ctfe:subprocess\|engine` (default subprocess), `--ctfe-budget`, `NIMONY_CTFE_ENGINE=off`; `--ctfe-analysis-only` stops the sub-compile after `.c.nif`; `<nimcache>/asmcache/`; median 12 ms per new evaluation; 47/47 corpus evaluations through the engine, 0 fallbacks, 0 differences; pin `src/nativenif.commit` -> 3d20d5c (jit/b1 + path fix + `runImage` budget). The `bitabs` assertion was an out-of-bounds token read in nifasm's foreign-decl parser (fixed in nativenif 736b491, regression test, gate byte-identical; pin re-pointed). `--ctfe:auto` is now the default: the engine on macOS/arm64, the subprocess elsewhere until linux/x64 is exercised. Not done: per-proc code cache, `emitRoots` closure) | merged from jit/b2, jit/b2-fix |
 | B1 (nimony half) | merged (`nimony r`: whole native graph minus the link node, `engine.runWholeProgram` assembles in-process and calls `main` from the arena; hello edit-to-run 0.320 -> 0.033 s; the compiler runs itself from memory; found nativenif's `_exit` intercept mis-keyed (`hostsyms.cName` strips on registration) -- worked around by registering `__exit`, fix belongs upstream; `bench/devloop_bench.sh` gained `hello.nrun/run`, `self.nrun/run` and an absolutised root) | merged from jit/b1-nimony |
-| B3 (nativenif half) | done on `../nativenif` branch `jit/b3` (head 713c819): per-SYMBOL code cache in `src/nifasm/blobcache.nim`, `--blobcache:<dir>` / `AsmSession.useBlobCache`, validity = module stamp + read-from modules + per-reference type-layout stamps; 127-module link 0.84 s -> 0.25 s warm (0.43 s when `sem.nim` changed), byte-identical sections, cold +9.5 %; the 0.07 s above the 0.2 s target is foreign-symbol lookup (a symbol-table cache is the next item); gate byte-identical (verified by the integrator) | nativenif 713c819 |
-| B3 (nimony half) | running (`jit/b3-nimony`: re-pin, `--blobcache` on the link node and in `runWholeProgram`, upstream fix for the `_exit` intercept) | |
+| B3 (nativenif half) | done on `../nativenif` branch `jit/b3` (from pin 736b491): the cache unit is the SYMBOL and the cache file is the module, so the reachability worklist is untouched and the image is byte-identical to a scratch link; `--blobcache:DIR`, `--incremental`, `--blobcache-ro`, `--blobcache-hash`, `AsmSession.useBlobCache`/`saveBlobCache`, `core/asmprofile.nim` (`--profile`, `NIFASM_PROFILE=1`); 234/234 + 237/237 + 87/87 byte-identity checks over macho/elf/raw in four cache states. The 127-module compiler image: 841 ms from scratch, 928 ms cold, 335 ms warm. 0.07 s short of the ≤ 0.20 s gate, and the shortfall has one name — 212 ms of the warm link is `lookupWithAutoImport` following foreign names for the first time, i.e. a SYMBOL-TABLE cost, which is JIT.md 7.3's "`.x.nif` feed with the cached resolve step" and belongs to B4 | nativenif 713c819 |
+| B3 (nimony half) | merged (`deps.blobCacheDir` = `<nimcache>/blobcache`, beside `ocache/`/`ccache/`; the native `link` node passes `--blobcache:<dir>` and `engine.runWholeProgram` calls `useBlobCache` on the same string, so both native paths share one store — one directory, two flag keys, because `nimony r` assembles `--dev-single-thread` without debug info and a linked executable does neither; `--no-blobcache` / `NIMONY_BLOBCACHE=off`, documented in `--help`; `--verbose`'s `[run-engine]` line gained `emitRoots=` and `blobcache=on hits=/stale=/recorded=`, `--profile` turns on nifasm's own per-stage table; pin `src/nativenif.commit` -> f8d2676. self.editbody 1.805 -> 1.381 s and self.run 1.785 -> 1.364 s (cache off vs on, same toolchain; 2.263 s at the fork point), compiler assemble 849.91 -> 484.11 ms after a `sem.nim` body edit (hits 3415, stale 18, recorded 627) and 245.10 ms with nothing edited. Byte identity checked three ways: `--no-blobcache` vs cached executables, `tests/nativecg`'s asm-NIF and exe, and `hastur boot --boot-backend:native` run in both states with stage 3 identical between them. Also upstreamed B1's `_exit` workaround as a real fix and dropped it here. What is left of a warm link is 318 ms of `blobResolve`+`blobRefs`, a symbol-table cost that is B4's) | merged from jit/b3-nimony, nativenif jit/b3-fixes f8d2676 |
 | B3b | planned: symbol-granularity lowering — hexer and arkham re-lower only the procs whose Leng changed, so a body edit in a 7k-line module costs one proc; pulled forward from B4 because the compiler's edit loop after B3 is ~0.45 s nimsem + 0.36 s hexer + 0.41 s arkham on ONE module (progress.md run 6) | |
 | B4, B5 | planned | |

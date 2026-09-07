@@ -68,6 +68,45 @@ proc nimonyR(src: string; cache: string; args = ""; extra = ""): Run =
          " --nimcache:" & cache.quoteShell & " " & src.quoteShell &
          (if args.len > 0: " " & args else: ""))
 
+proc runEngineLine(r: Run): string =
+  ## The `[run-engine] …` line `--verbose` writes to stderr, or "" if there is
+  ## none. `execCmdEx` merged the streams, so it has to be found rather than
+  ## assumed to be first: a program that prints is free to print before it.
+  for line in r.output.splitLines:
+    if line.startsWith("[run-engine] "): return line
+  result = ""
+
+proc field(line, key: string): string =
+  ## `key=value` out of the timing line, "" when absent. The line is a flat
+  ## space-separated list on purpose, so that a test can read one number out of
+  ## it without a parser and without pinning the order of the rest.
+  let at = line.find(" " & key & "=")
+  if at < 0: return ""
+  var i = at + key.len + 2
+  while i < line.len and line[i] != ' ':
+    result.add line[i]
+    inc i
+
+proc intField(line, key: string): int =
+  ## `field` as a number; -1 when the field is missing or is not one. Digits by
+  ## hand: a malformed line must be a FAILED check, not an exception that ends
+  ## the runner before the later cases run.
+  let s = field(line, key)
+  if s.len == 0: return -1
+  result = 0
+  for ch in s:
+    if ch notin {'0'..'9'}: return -1
+    result = result * 10 + (ord(ch) - ord('0'))
+
+proc msField(line, key: string): float =
+  ## `key=123.45ms` as a float; -1.0 when absent or malformed.
+  let s = field(line, key)
+  if s.len < 3 or not s.endsWith("ms"): return -1.0
+  try:
+    result = parseFloat(s[0 ..< s.len - 2])
+  except ValueError:
+    result = -1.0
+
 proc nimonyN(src: string; cache: string): Run =
   runCmd(nimony.quoteShell & " n --silentMake --nimcache:" & cache.quoteShell &
          " " & src.quoteShell)
@@ -314,6 +353,211 @@ proc checkCrossCompileRefused() =
   else:
     ok "a cross compile is refused, not attempted"
 
+proc checkBlobCache() =
+  ## The per-symbol code cache (JIT_IMPL.md B3, nativenif's `blobcache.nim`)
+  ## across an edit, which is the shape the dev loop actually has.
+  ##
+  ## Three things, and the first two are what make the third meaningful:
+  ##
+  ## 1. **the edit is not lost.** The same source, edited in its body, run
+  ##    twice: the second run must print the NEW text. A cache that replayed a
+  ##    stale fragment would print the old one, and that is the failure mode
+  ##    worth more than any timing.
+  ## 2. **the cache filled and was then used.** The first run into a fresh
+  ##    nimcache records fragments and hits nothing; the second replays them.
+  ##    Asserted on nifasm's own counters, which `--verbose` puts on the
+  ##    `[run-engine]` line, and on the directory being there with files in it.
+  ## 3. **and it was cheaper.** `emitRoots` is 96.7 % of a cold link, so it is
+  ##    the number a cache has to move; `assemble` is compared too. Both are
+  ##    wall times on a machine a test suite does not own, so the assertion is
+  ##    "not slower", not a ratio -- the ratio is the benchmark's job
+  ##    (`bench/devloop_bench.sh`), and a test that demanded one would fail on
+  ##    a loaded CI box while a cache that had stopped working entirely still
+  ##    shows up in `hits`.
+  let dir = work / "blobcache"
+  let src = dir / "edited.nim"
+  let cache = dir / "nc"
+  writeSrc src, HelloSrc
+
+  let cold = nimonyR(src, cache, "", "--verbose")
+  let coldLine = runEngineLine(cold)
+  if cold.code != 0 or coldLine.len == 0:
+    fail "blobcache: the cold run failed or printed no timing line\n" &
+         cold.output.strip
+    return
+  if field(coldLine, "blobcache") != "on":
+    fail "blobcache: the cache is off by default (" & coldLine & ")"
+    return
+  let coldRecorded = intField(coldLine, "recorded")
+  if intField(coldLine, "hits") != 0 or coldRecorded <= 0:
+    fail "blobcache: a cold run should record fragments and hit none: " & coldLine
+  else:
+    ok "a cold `nimony r` records " & $coldRecorded & " fragments"
+
+  let store = cache / "blobcache"
+  var blobs = 0
+  if dirExists(store):
+    for kind, f in walkDir(store):
+      if kind == pcFile and f.endsWith(".blob.nif"): inc blobs
+  if blobs == 0:
+    fail "blobcache: nothing under " & store
+  else:
+    ok "the cache directory holds " & $blobs & " module blob(s)"
+
+  # The edit: one more statement in the body, so the program's OUTPUT changes.
+  writeSrc src, HelloSrc & "echo \"and again, after the edit\"\n"
+  let warm = nimonyR(src, cache, "", "--verbose")
+  let warmLine = runEngineLine(warm)
+  if warm.code != 0 or warmLine.len == 0:
+    fail "blobcache: the second run failed\n" & warm.output.strip
+    return
+  if "and again, after the edit" notin warm.output:
+    fail "blobcache: the edit did not reach the program\n" & warm.output.strip
+  elif "hello from nimony r" notin warm.output:
+    fail "blobcache: the unedited half of the program went missing\n" &
+         warm.output.strip
+  else:
+    ok "an edited body runs its new code on the second `nimony r`"
+
+  let warmHits = intField(warmLine, "hits")
+  if warmHits <= 0:
+    fail "blobcache: the second run replayed nothing: " & warmLine
+  else:
+    ok "the second run replays " & $warmHits & " cached fragment(s)"
+
+  let coldRoots = msField(coldLine, "emitRoots")
+  let warmRoots = msField(warmLine, "emitRoots")
+  let coldAsm = msField(coldLine, "assemble")
+  let warmAsm = msField(warmLine, "assemble")
+  if coldRoots < 0.0 or warmRoots < 0.0 or coldAsm < 0.0 or warmAsm < 0.0:
+    fail "blobcache: the timing line is missing a number\n    " & coldLine &
+         "\n    " & warmLine
+  elif warmRoots > coldRoots or warmAsm > coldAsm:
+    fail "blobcache: the warm assemble was not faster (emitRoots " &
+         $coldRoots & " -> " & $warmRoots & " ms, assemble " &
+         $coldAsm & " -> " & $warmAsm & " ms)"
+  else:
+    ok "the warm assemble is faster (emitRoots " & $coldRoots & " -> " &
+       $warmRoots & " ms)"
+
+  # `--no-blobcache` is the escape hatch, and it must actually take the hatch:
+  # it must report the cache off and still print exactly what the cached run
+  # printed. The output comparison is between two runs WITHOUT `--verbose`, so
+  # that it compares the program's output rather than the compiler's stderr.
+  let offVerbose = nimonyR(src, cache, "", "--verbose --no-blobcache")
+  let offLine = runEngineLine(offVerbose)
+  if offVerbose.code != 0 or offLine.len == 0:
+    fail "blobcache: `--no-blobcache` failed\n" & offVerbose.output.strip
+  elif field(offLine, "blobcache") != "off":
+    fail "blobcache: `--no-blobcache` left the cache on: " & offLine
+  else:
+    let plain = nimonyR(src, cache)
+    let off = nimonyR(src, cache, "", "--no-blobcache")
+    if not sameRun(plain, off):
+      fail "blobcache: `--no-blobcache` changed the run\n    cached: " &
+           plain.output.strip & "\n    plain:  " & off.output.strip
+    else:
+      ok "`--no-blobcache` turns the cache off and the program is unchanged"
+
+proc nifasmProfiled(body: proc (): Run {.closure.}): Run =
+  ## Run `body` with `NIFASM_PROFILE=1` in the environment, so a SPAWNED nifasm
+  ## -- the `link` node of `nimony n`, which is the only way to see that path's
+  ## cache counters -- prints its per-stage table on stderr. `putEnv` rather
+  ## than a shell prefix: `execCmdEx` does not go through a shell everywhere.
+  putEnv("NIFASM_PROFILE", "1")
+  result = body()
+  delEnv("NIFASM_PROFILE")
+
+proc profileRow(output, row: string): int =
+  ## The `n` column of one row of nifasm's `[nifasm profile]` table, or -1.
+  ## The table is `  <name> <ms> <count> <n>`, so the number wanted is the last
+  ## field of the line whose first field is `row`.
+  result = -1
+  for line in output.splitLines:
+    let f = line.splitWhitespace
+    if f.len == 4 and f[0] == row:
+      var v = 0
+      for ch in f[3]:
+        if ch notin {'0'..'9'}: return -1
+        v = v * 10 + (ord(ch) - ord('0'))
+      return v
+
+proc checkSharedCacheDir() =
+  ## One directory, both native paths, and the same executable either way.
+  ##
+  ## `nimony n`'s `link` node passes `--blobcache:<nimcache>/blobcache` to
+  ## nifasm; `nimony r` hands `AsmSession.useBlobCache` the same string. What
+  ## they share is the DIRECTORY, not the fragments: nifasm keys a blob on
+  ## target + flags + tool build id + module name, and `nimony r` assembles
+  ## with `--dev-single-thread` and no debug info while a linked executable has
+  ## threads and debug info -- genuinely different code, and so deliberately
+  ## different keys in the one store. Sharing the directory is still what
+  ## matters: it is scoped by `--nimcache`, swept by `hastur clean`, and
+  ## neither path's entries confuse the other's.
+  ##
+  ## So: each path warm on its own repeat, in one nimcache, plus the byte
+  ## identity that is the whole licence for having a cache at all.
+  let dir = work / "shared"
+  let src = dir / "shared.nim"
+  let cache = dir / "nc"
+  writeSrc src, HelloSrc
+
+  let cold = nimonyN(src, cache)
+  if cold.code != 0:
+    fail "shared cache: `nimony n` failed\n" & cold.output.strip
+    return
+
+  # A REAL edit, not a rewrite of the same text: every artifact on the way down
+  # is written `OnlyIfChanged`, so re-saving identical bytes re-runs nifler and
+  # stops there -- and a second link that never happened cannot be observed to
+  # have used the cache.
+  let edited = HelloSrc & "echo \"a second line\"\n"
+  writeSrc src, edited
+  let warm = nifasmProfiled(proc (): Run = nimonyN(src, cache))
+  if warm.code != 0:
+    fail "shared cache: the second `nimony n` failed\n" & warm.output.strip
+    return
+  let hits = profileRow(warm.output, "blobHits")
+  if hits <= 0:
+    fail "shared cache: `nimony n`'s link replayed nothing (blobHits " &
+         $hits & ")\n" & warm.output.strip
+  else:
+    ok "`nimony n`'s link node replays " & $hits & " cached fragment(s)"
+  let exe = exeIn(cache)
+  if exe.len == 0:
+    fail "shared cache: `nimony n` left no executable"
+    return
+  let cachedBytes = readFile(exe)
+
+  # The same program, the same nimcache, the other path.
+  let r = nimonyR(src, cache, "", "--verbose")
+  let rLine = runEngineLine(r)
+  if r.code != 0 or rLine.len == 0:
+    fail "shared cache: the `nimony r` failed\n" & r.output.strip
+    return
+  let r2 = nimonyR(src, cache, "", "--verbose")
+  let r2Line = runEngineLine(r2)
+  if r2.code != 0 or intField(r2Line, "hits") <= 0:
+    fail "shared cache: `nimony r` did not warm its own half: " & r2Line
+  else:
+    ok "`nimony r` warms its own half of the same directory (" &
+       $intField(r2Line, "hits") & " fragments)"
+
+  # And the licence: a cached link and an uncached one produce the same bytes.
+  let plainCache = dir / "nc-nocache"
+  let plain = runCmd(nimony.quoteShell & " n --silentMake --no-blobcache" &
+                     " --nimcache:" & plainCache.quoteShell & " " & src.quoteShell)
+  if plain.code != 0:
+    fail "shared cache: `nimony n --no-blobcache` failed\n" & plain.output.strip
+    return
+  let plainExe = exeIn(plainCache)
+  if plainExe.len == 0:
+    fail "shared cache: `--no-blobcache` left no executable"
+  elif readFile(plainExe) != cachedBytes:
+    fail "shared cache: the cached link and the scratch link differ in bytes"
+  else:
+    ok "a cached link and a scratch link produce byte-identical executables"
+
 proc checkCompilerItself() =
   ## The biggest program in the repository, ~130 modules: `nimony r` of the
   ## compiler, printing its version. It is here because everything smaller
@@ -362,6 +606,8 @@ checkCorpus()
 checkNoExecutable()
 checkOutWritesExecutable()
 checkCrossCompileRefused()
+checkBlobCache()
+checkSharedCacheDir()
 checkCompilerItself()
 
 removeDir work

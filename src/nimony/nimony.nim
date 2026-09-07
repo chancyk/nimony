@@ -118,6 +118,13 @@ Options:
                             --jobs:1 also runs the graph node by node
   --inproc-k:N              a phase runs in this process while its estimated
                             cost is under N spawn costs (default 3)
+  --no-blobcache            native backend: assemble every reachable proc from
+                            scratch instead of reusing nifasm's per-symbol code
+                            cache under <nimcache>/blobcache. The cache is on by
+                            default and produces a byte-identical image; this is
+                            the escape hatch, and `NIMONY_BLOBCACHE=off` is the
+                            same switch for a whole build tree (it reaches child
+                            processes, which a flag does not).
   --layout:FILE             native backend, bare-metal targets only: the BOARD
                             description (memory regions, stack slots, heap) that
                             arkham and nifasm build the image against. See
@@ -438,6 +445,14 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
           of "profile":
             c.buildFlags.incl Profile
             forwardArg = false
+          of "no-blobcache", "noblobcache":
+            # NOT forwarded, like `--vfs`: a `nimony s` sub-compile never
+            # reaches a native link node, and the one setting that has to
+            # travel -- to a child that DOES link, i.e. a `{.build.}` tool --
+            # travels in the environment as `NIMONY_BLOBCACHE=off`, which is
+            # already inherited.
+            c.config.blobCache = false
+            forwardArg = false
           of "report":
             c.buildFlags.incl Report
             forwardArg = false
@@ -522,6 +537,11 @@ proc runProject(c: var CmdOptions) =
            "compile (--cpu/--os name another target); use `nimony n`"
     makeDir(c.config.nifcachePath)
     let project = c.args[0].addFileExt(".nim")
+    # Read off the config BEFORE `buildGraphForRun` consumes it. The same
+    # directory the `link` node would have handed nifasm on the command line,
+    # so the two native paths keep one store per nimcache rather than each
+    # inventing its own place to put fragments.
+    let blobDir = if blobCacheEnabled(c.config): blobCacheDir(c.config) else: ""
     let wantExe = c.config.outFile.len > 0 or c.config.outDir.len > 0
     let target = buildGraphForRun(c.config, project, c.buildFlags,
                                   c.commandLineArgs, c.commandLineArgsLengc,
@@ -538,7 +558,10 @@ proc runProject(c: var CmdOptions) =
     let r = runWholeProgram(e, RunProgram(backendDir: target.backendDir,
                                           mainModule: target.mainModule,
                                           argv: argv,
-                                          verbose: c.config.verbose))
+                                          verbose: c.config.verbose,
+                                          profile: Profile in c.buildFlags or
+                                                   c.config.verbose,
+                                          blobCacheDir: blobDir))
     case r.outcome
     of roRan:
       exitAs r.status
