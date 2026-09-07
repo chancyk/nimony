@@ -837,6 +837,12 @@ machine, with one script. The rule, from 2026-09-06 on:
    (AGENTS.md style rules apply: explicit state objects, no closures).
 6. Do not touch `JIT.md`. Update the status line of the phase's section in
    `JIT_IMPL.md` when the phase is merged.
+7. Never wait on a build, suite or benchmark with a shell polling loop
+   (`until grep ...; do sleep N; done`): those were left behind as orphaned
+   tasks. Run the command in the foreground with a timeout, or with
+   `run_in_background` for one completion notification; use the Monitor tool
+   only for per-event streams, with a filter covering every terminal state,
+   and stop it when done. Leave no loop alive at the end of the task.
 
 ## Status
 
