@@ -7,7 +7,9 @@
 #
 # Usage: bench/devloop_ab.sh <toolchain-A> <toolchain-B> [scenario] [rounds]
 #   scenario: stdlib.forced (default) | stdlib.cold | hello.forced | ctfe.forced
-#             | self.editbody | self.cold | self.run   (native backend; BACKEND=c for the C path)
+#             | self.editbody (a statement inserted into a called proc of sem.nim)
+#             | self.editdead (a private, never-called proc appended: DCE removes it)
+#             | self.cold | self.run   (native backend; BACKEND=c for the C path)
 # Prints per-round wall/cpu for both, then median and min of each.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,7 +33,7 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
-  self.editbody|self.cold|self.run)
+  self.editbody|self.editdead|self.cold|self.run)
     # The compiler compiling itself (fork-point sources, copied per side) with
     # the native backend; `self.run` is `nimony r ... --version`.
     selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
@@ -48,14 +50,21 @@ A=$(cd "$A" && pwd); B=$(cd "$B" && pwd)
 cmdfor() {  # cmdfor <side> <nc> -> prints the command line
   eval "t=\$$1"
   case $scen in
-    self.editbody) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.editbody|self.editdead) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.cold)     echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
     *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
   esac
 }
 case $scen in
-  self.editbody) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
+  # A LIVE edit: a statement inserted into the body of a proc every compile
+  # calls (`semStmt`), so the change reaches hexer, arkham, DCE and the link.
+  # The earlier form appended a private, never-called proc, which DCE deleted
+  # -- arkham and nifasm measured 0 s on it (notes/b3b.md §10).
+  self.editbody) prep='sed -i "" "/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =\$/a\\
+  if isNewScope: discard $i
+" $work/self_$side/src/nimony/sem.nim' ;;
+  self.editdead) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
   self.run)      prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
   self.cold)     prep='rm -rf $nc' ;;
 esac

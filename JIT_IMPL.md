@@ -774,7 +774,10 @@ machine, with one script. The rule, from 2026-09-06 on:
    worse than `base` and is not explained by the phase that was just merged
    blocks the next launch until it is understood (profile with
    `nimony c -f --profile`, then bisect by phase branch).
-4. Scenarios, all through the NATIVE backend (`nimony n`; `BACKEND=c` for the
+4. The headline edit is `self.editbody` = a statement inserted into the body
+   of `semStmt` in `sem.nim` (a live edit that reaches hexer, arkham, DCE and
+   the link); `self.editdead` (a never-called proc appended) is kept because
+   DCE deletes it and it measures only sem and hexer. Scenarios, all through the NATIVE backend (`nimony n`; `BACKEND=c` for the
    C path): the compiler compiling itself (`self.cold` / `nochange` /
    `editbody` / `edit` / `forced`) is the verdict; hello, CTFE `tmyops`,
    `bench/ctfe_bench.nim` and stdlib `tall.nim` (C backend until
@@ -857,4 +860,5 @@ machine, with one script. The rule, from 2026-09-06 on:
 | F1 | merged (locals `` x.N`routine`0 ``: one dot, so every `symparser` scanner still classifies them local; module-wide uniqueness kept for `hexer_context.hoistedConsts`; `src/hexer/decldigest.nim` + `<mod>.decls.nif` line-info-blind digests and `rebaseLineInfo`; appended proc changes 1/0 declarations instead of 465/464; `self.editbody` 2.71 -> 0.77 s; artifacts +31 % bytes, cold +3 % cpu; 21 goldens renamed. Follow-ups: diagnostics should print the base identifier, not the namespaced spelling; `derefs`/`controlflow` counters) | merged from jit/f1 |
 | B3b (2nd attempt, after F1) | measured, NOT built again (`notes/b3b.md` §10-15, `bench/results/2026-09-07/b3b.txt`): on this tip `self.editbody` costs arkham 0.000 s and link 0.000 s — its appended proc is private and dead, so `dce` deletes it and the backend graph is up to date — so the gate reads "hexer ≤ 0.1 s from 0.27 s", and hexer's floor is 112 ms with zero declarations lowered. The splice is also unsound: F1's sidecar reports 1 changed sem-input declaration and **890 of 1794 changed lowering-output** declarations for an edit that mints one extra temp (`Pass.nextTemp`, `InlinerCtx.counter`), and an edit to the LAST declaration renumbers the FIRST — so §2's "prefix theorem" is false for the pipeline. arkham's own drift is 28 of 1949 (F1 removed the rest); nifasm reports stale 18, not 540, but records 627 fragments where 467 changed. New prerequisite, ahead of all three steps: scope hexer's counters per declaration, F1's move one level down. Landed: `passes.StageTimer` (the 14-stage breakdown of `expand`, byte-neutral over 381 artifacts) and a fourth `decl-stability` phase asserting the lowering-output digest, which nothing had ever checked | jit/b3b |
 | M1 | merged (`LedgerSample.rssBytes` from `getrusage` at `PhaseTimer.finish`, spawned samples preferred over driver peaks; `--stats` `peak MB` column + driver/largest-child line; scheduler declines in-process work when `driverPeak + max(node rss) > budget`, budget `clamp(physmem/(32*cores), 128 MB, 1 GB)`, `--inproc-mem-budget`; cold self-compilation largest process 218 -> 147 MB at no wall cost; the 147 vs 116 is `dceLive` 84 -> 147 MB from P0c's per-module resolve subsets -- streaming them out is the follow-up) | merged from jit/m1 |
+| F2 | running: hexer's temp counters (`xelim.Pass.nextTemp`, `intramodinliner.InlinerCtx.counter`, ...) scoped per top-level declaration in F1's spelling, so a one-statement edit changes ~1 lowering-output declaration instead of 890 of 1794 | |
 | B4, B5 | planned | |

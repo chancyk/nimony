@@ -107,3 +107,24 @@ subsets held at once; the fork point's largest process was the linker at
 122 MB). `--stats` now prints a `peak MB` column per phase and a `driver
 peak / largest child` line; budget rule
 `clamp(physicalMemory / (32 * cores), 128 MB, 1 GB)`, `--inproc-mem-budget`.
+
+## Run 13: the headline edit corrected -- a LIVE edit (B3b's finding)
+
+`self.editbody` appended a private, never-called proc; DCE deleted it, so
+arkham and the link cost 0 s on it and the loop read 0.71 s. The scenario is
+now a statement inserted into the body of `semStmt` (called by everything),
+and the old form is kept as `self.editdead`. Interleaved, 5 rounds, load 3.8:
+
+| sem.nim LIVE edit, rebuild | fork point | head | ratio |
+|---|---|---|---|
+| wall | 2.913 | 1.349 | 2.16x |
+| cpu | 4.148 | 1.393 | 2.98x |
+| peak rss | 117 MB | 113 MB | |
+
+Where head's 1.35 s goes (b3b.txt "grow" edit, `--profile`): nimsem 0.44,
+dceLive 0.39, hexer 0.28, arkham 0.27, link 0.33 (these overlap; wall 1.35).
+Two of them are new targets: `dceLive` re-runs because one module's
+`.dce.nif` changed (0.39 s of whole-program live-set work for a one-body
+edit), and hexer/arkham/link are whole-module because hexer's temp counters
+are module-wide (F2, running). The pre-correction numbers (0.71 s) remain
+valid for the dead-proc edit and are recorded above as such.

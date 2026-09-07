@@ -10,8 +10,9 @@ compiler produces. This file is the decision aid; `JIT.md` is the design,
 
 | scenario | before | after | peak RSS before / after |
 |---|---|---|---|
-| compiler compiling itself, one body edit in `sem.nim` | 2.31 s | 0.71 s | 116 / 101 MB |
-| same edit, then run the compiler from memory (`nimony r`) | no such command | 1.34 s | |
+| compiler compiling itself, a statement added to a called proc in `sem.nim` | 2.91 s | 1.35 s | 117 / 113 MB |
+| same file, a private never-called proc appended (DCE deletes it) | 2.31 s | 0.71 s | 116 / 101 MB |
+| after the edit, run the compiler from memory (`nimony r`) | no such command | build + ~20 ms | |
 | hello world, edit, build and run | 0.32 s | 0.033 s | 18 / 26 MB |
 | one compile-time evaluation (`const` needing a sub-compile) | 450–490 ms, 32 processes | ~27 ms, 0 processes | 59 / 61 MB |
 | compiler, no change | 74 ms | 35 ms | |

@@ -27,8 +27,11 @@
 #   self.cold        the compiler compiling itself (src/nimony/nimony.nim, 127 modules,
 #                    debug), fresh nimcache -- the fork point's sources for BOTH toolchains
 #   self.nochange    same, nothing changed
-#   self.editbody    same, a PRIVATE proc appended to src/nimony/sem.nim: the module's
-#                    interface is unchanged, so importers need not re-sem
+#   self.editbody    same, a statement inserted into the body of `semStmt` in
+#                    src/nimony/sem.nim: a LIVE edit that reaches hexer, arkham,
+#                    DCE and the link (the interface is unchanged)
+#   self.editdead    same, a PRIVATE never-called proc appended: DCE deletes it, so
+#                    only nimsem/hexer see it (the pre-2026-09-07 `self.editbody`)
 #   self.nrun        same body edit, `nimony n -r ... --version`: rebuild,
 #                    relink the whole image, exec it, print the version
 #   self.run         same body edit, `nimony r ... --version`: rebuild and run
@@ -195,7 +198,10 @@ if [ -d "$selfsrc" ]; then
   selfcmd="$nimony $backend $extra --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim"
   measure self.cold     "$runs" "rm -rf $selfc" sh -c "cd $selfdir && $selfcmd"
   measure self.nochange "$runs" ":"              sh -c "cd $selfdir && $selfcmd"
-  measure self.editbody "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
+  measure self.editbody "$runs" "sed -i '' '/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =\$/a\\
+  if isNewScope: discard 1
+' $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
+  measure self.editdead "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
   if [ "$hasRun" = "1" ]; then
     # The pair the phase is judged on: the SAME body edit, then the compiler
     # asked to print its version -- once through the linked image and once out
