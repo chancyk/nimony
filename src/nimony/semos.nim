@@ -44,14 +44,21 @@ const
     ## from every exit code a real build can produce.
 
 type
-  EvalBuildProc* = proc (baseDir, project, nimcachePath, commandLineArgs,
-                         extraPath, outFile: string;
-                         analysisOnly: bool): int {.nimcall.}
+  NestedBuild* = object
+    ## One sub-compile's build request. An object rather than eight
+    ## parameters: six strings plus two bools spill past the register
+    ## arguments on arm64, and arkham does not marshal stack arguments yet
+    ## ("(arg ...) in mem must denote a stack argument"), which broke
+    ## `hastur boot --boot-backend:native` on the first version of this proc.
+    baseDir*, project*, nimcachePath*, commandLineArgs*: string
+    extraPath*, outFile*: string
+    analysisOnly*, verbose*: bool
+
+  EvalBuildProc* = proc (nb: NestedBuild): int {.nimcall.}
     ## `deps.runEvalBuild`, reached through a variable because the module
     ## graph forbids the direct call: `deps` imports `semos`.
 
-proc noEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
-                 extraPath, outFile: string; analysisOnly: bool): int {.nimcall.} =
+proc noEvalBuild(nb: NestedBuild): int {.nimcall.} =
   ## The default: there is no in-process sub-build here, spawn as before. A
   ## real proc rather than `nil` for the same reason `dag.spawnEverything` is
   ## one -- nimony has no nil proc value, and this file is compiled by nimony
@@ -776,9 +783,7 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   var noAdditional = nifcore.createTokenBuf(1)
   runPlugin(c, dest, info, pluginName, input, noAdditional)
 
-proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
-                     extraPath = ""; outFile = "";
-                     analysisOnly = false; verbose = false): int =
+proc runNestedBuild*(nb: NestedBuild): int =
   ## Run a sub-compile's build graphs in THIS process, with the caller's
   ## frontend state moved aside for the duration (`FrontendSnapshot`). Answers
   ## `EvalBuildUnavailable` when there is no in-process path here, which is the
@@ -790,15 +795,14 @@ proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
   ## pool.
   var saved = takeFrontendState()
   try:
-    result = evalBuildInProcess(baseDir, project, nimcachePath, commandLineArgs,
-                                extraPath, outFile, analysisOnly)
+    result = evalBuildInProcess(nb)
   finally:
     restoreFrontendState(saved)
   # `--verbose` says which of the two paths a sub-build took, so that "a
   # `const` costs no process" is something a test can read off the compiler
   # rather than infer from the filesystem (`tests/ctfe_engine`).
-  if verbose and result != EvalBuildUnavailable:
-    echo "[ctfe-build] in-process ", extractModuleSuffix(project)
+  if nb.verbose and result != EvalBuildUnavailable:
+    echo "[ctfe-build] in-process ", extractModuleSuffix(nb.project)
 
 proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
                       analysisOnly = false;
@@ -820,8 +824,9 @@ proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
   ## does, and it is also what produces the diagnostics of a sub-program that
   ## does not compile, since those reach a child's captured stdout and this
   ## process's own.
-  let inproc = runNestedBuild(baseDir, file, nimcachePath, commandLineArgs,
-                              analysisOnly = analysisOnly, verbose = verbose)
+  let inproc = runNestedBuild(NestedBuild(
+    baseDir: baseDir, project: file, nimcachePath: nimcachePath,
+    commandLineArgs: commandLineArgs, analysisOnly: analysisOnly, verbose: verbose))
   if inproc != EvalBuildUnavailable:
     return (output: "", exitCode: inproc)
 
@@ -901,9 +906,10 @@ proc prepareEval*(c: var SemContext): string =
       # `deps.buildGraph` with the same `DoCompile`; the only difference is the
       # `.nim` versus `.p.nif` project, which `buildGraph` reads off the
       # extension itself.
-      let inproc = runNestedBuild(c.g.config.baseDir, writeNifSrc,
-                                  c.g.config.nifcachePath, c.commandLineArgs,
-                                  verbose = c.g.config.verbose)
+      let inproc = runNestedBuild(NestedBuild(
+        baseDir: c.g.config.baseDir, project: writeNifSrc,
+        nimcachePath: c.g.config.nifcachePath, commandLineArgs: c.commandLineArgs,
+        verbose: c.g.config.verbose))
       if inproc != EvalBuildUnavailable:
         if inproc != 0:
           return "failed to precompile std/writenif"

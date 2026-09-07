@@ -2929,8 +2929,7 @@ proc childArgs(baseDir, nimcachePath, commandLineArgs, extraPath, outFile: strin
   result.config.nifcachePath = nimcachePath
   result.config.ctfeAnalysisOnly = analysisOnly
 
-proc runEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
-                  extraPath, outFile: string; analysisOnly: bool): int {.nimcall.} =
+proc runEvalBuild(nb: NestedBuild): int {.nimcall.} =
   ## `semos.evalBuildInProcess`. Answers the exit code the spawned
   ## `nimony … s <project>` would have answered: 0 on success, 1 on a graph
   ## that failed. `EvalBuildUnavailable` says the caller has to spawn -- there
@@ -2938,13 +2937,13 @@ proc runEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
   ## nimony), so running the graph here would spawn a `nifmake` per graph and
   ## be strictly worse than the one process it replaced.
   if not inProcessMakeAvailable(): return EvalBuildUnavailable
-  let a = childArgs(baseDir, nimcachePath, commandLineArgs,
-                    extraPath, outFile, analysisOnly)
+  let a = childArgs(nb.baseDir, nb.nimcachePath, nb.commandLineArgs,
+                    nb.extraPath, nb.outFile, nb.analysisOnly)
   # `SilentMake` and nothing else: `-f`, `--profile`, `--report` and `--stats`
   # are not forwarded to a sub-compile, so the spawned child had an empty set
   # too; the progress bar is dropped because a nested build is not a phase of
   # the outer one's 0..100 %.
-  let ok = buildGraphImpl(a.config, project, {SilentMake},
+  let ok = buildGraphImpl(a.config, nb.project, {SilentMake},
                           a.forwarded, a.forwardedLengc, a.moduleFlags,
                           DoCompile, "", "", "", nested = true)
   result = if ok: 0 else: 1

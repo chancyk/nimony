@@ -15,7 +15,7 @@ import ".." / lib / nifreader
 from ".." / lib / nifcoreparse import parse
 import ".." / models / [tags]
 import nimony_model, decls, programs
-from semos import runNestedBuild, EvalBuildUnavailable
+from semos import runNestedBuild, EvalBuildUnavailable, NestedBuild
 
 type
   MacroPlugin* = object
@@ -324,8 +324,9 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   # still runs `lengc`, the C compiler and the linker -- what it stops paying
   # for is the `nimony` process in front of them, and the second `deps` scan of
   # the stdlib closure the caller has already walked.
-  let inproc = runNestedBuild(baseDir, progfile, nifcachePath, commandLineArgs,
-                              extraPath = srcLibPath, outFile = exePath)
+  let inproc = runNestedBuild(NestedBuild(
+    baseDir: baseDir, project: progfile, nimcachePath: nifcachePath,
+    commandLineArgs: commandLineArgs, extraPath: srcLibPath, outFile: exePath))
   if inproc != EvalBuildUnavailable:
     if inproc != 0:
       echo "Error compiling macro plugin for '", cleanSymbolName(pool.syms[macroSym]), "'"
