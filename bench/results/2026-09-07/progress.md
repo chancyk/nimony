@@ -93,3 +93,17 @@ rename or an index offset. Follow-ups found in review: diagnostics now
 print the namespaced spelling (`'s.0`testMutateWhileIterating`0' is
 borrowed`) where the user wants `s`; `derefs.nim`'s `err.N` and
 `controlflow.nim`'s `cf.N` still count module-wide.
+
+## Run 12: M1 (memory budget in the scheduler) merged -- interleaved, load decaying from 18
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB |
+|---|---|---|
+| compiler, cold | 5.613 / 14.609 / 116 | 5.370 / 13.844 / **147** |
+| sem.nim body edit, rebuild | 2.314 / 3.589 / 116 | 0.706 / 0.702 / 101 |
+
+The cold peak is back to what the build costs with everything spawned; the
+147 vs 116 is `dceLive` (84 -> 147 MB, P0c's 127 per-module resolve
+subsets held at once; the fork point's largest process was the linker at
+122 MB). `--stats` now prints a `peak MB` column per phase and a `driver
+peak / largest child` line; budget rule
+`clamp(physicalMemory / (32 * cores), 128 MB, 1 GB)`, `--inproc-mem-budget`.
