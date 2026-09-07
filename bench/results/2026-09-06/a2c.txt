@@ -1,0 +1,271 @@
+Phase A2c — compile-time evaluation with no process before the engine
+=====================================================================
+
+machine: macOS 26.6.2, Apple M5 (10 cores), Nim 2.2.10, Apple clang 21
+mode:    NIMONY_VFS=disk (the default), C backend, debug, --ctfe:auto (= the
+         engine on this host)
+before:  fast-devloop @5de8445f, built in this worktree and copied to
+         /tmp/a2c_before   (P0a P0b A1a A1b A1c A1d A2a* A2b B2)
+after:   jit/a2c @f9854ec8, /tmp/a2c_after3
+
+
+1. What is measured, and why it is not `ctfe.cold / 5`
+------------------------------------------------------
+
+The plan's framing was "a new evaluation costs ~176 ms end to end", which is
+run 3's `ctfe.cold` (0.88 s for `tests/nimony/consteval/tmyops.nim`'s five
+consts) divided by five. That number is dominated by what a FRESH nimcache
+pays once and never again: the `std/writenif` precompile is a whole `nimony c`
+with eight `cc`s and a link, plus the stdlib closure's nifler and nimsem, plus
+the outer program's own backend.
+
+What this phase can move is the cost of ONE evaluation on a nimcache whose
+stdlib closure is already warm. Recipe (`measure2.py`, reproduced below):
+
+  1. `nimony c --nimcache:<nc> tmyops.nim` once, warming everything;
+  2. delete `<nc>/tmy<40 hex>*` (the five sub-programs: their `.p.nif`,
+     `.out.nif`, `.s.nif` and backend directories) and the outer module's
+     `.s.nif`;
+  3. re-run the same command, timed. Median of 7.
+
+The same run with only the outer `.s.nif` deleted (five memo HITS) is the
+baseline to subtract: it is the cost of the outer module's sem and of the
+memo checks, which no phase here changes.
+
+    5 memo-hit evaluations   11.3 ms  (before)   10.9 ms  (after)
+    5 fresh evaluations     224.6 ms  (before)  144.8 ms  (after)
+
+so one NEW evaluation:
+
+    before   42.6 ms
+    after    26.8 ms
+
+taken step by step while the phase was built (a slightly busier machine, so
+the absolute numbers are ~1 ms higher than the pair above):
+
+    before   42.8 ms
+    step 1   36.0 ms   (the `nimony s` process removed)
+    step 2   30.4 ms   (the stdlib closure's `.c.nif` shared)
+
+The content-addressed caches (`ocache/`, `asmcache/`, and now `ccache/`) live
+in the nimcache and survive between runs, which is what a dev loop looks like.
+Wiping them before every run instead — so each cache is warm only WITHIN one
+compile of five consts — gives the pessimistic figure:
+
+    before   50.1 ms
+    after    38.4 ms
+
+Both are under the 50 ms the plan asks for; the 25 ms figure of JIT.md 7.2
+needs the two items in §5.
+
+
+2. Per-step breakdown of one new evaluation
+--------------------------------------------
+
+Wall figures are medians of 9 of the isolated step (the child re-run with
+exactly the artifacts that force that step deleted); the phase figures are the
+cost ledger's own fragments, summed as produce+parse+load+serialize+write and
+divided by the five sub-programs. The two do not add up to the millisecond —
+the ledger does not see the graph walk between phases — and the difference is
+reported as one line rather than hidden.
+
+    step                                      before     after
+    ---------------------------------------------------------------
+    parent: writeEvalProgram, writeEvalImports,
+      memo check, parse of `.out.nif`            1.5       1.5
+    spawn of `nimony s` + dyld + tool init       4.7        —
+    sub-build: deps scan, build-file emission,
+      mtime walks (2 graphs before, 3 after)     3.2       ~3
+    sub-build: nimsem of the snippet             1.3       1.2
+    sub-build: hexer of the snippet              1.0       0.9
+    sub-build: dceLive                           8.8       8.5
+    sub-build: dceEmit x8 -> x1                 10.0       0.3
+    engine: arkham (1 run, 7 asm-cache hits)     3.3       3.3
+    engine: assemble (nifasm)                    6.6       6.6
+    engine: lay + bind + run                     0.3       0.3
+    unattributed (graph walk, ccache keys,
+      `.c.nif` writes)                           1.9       1.2
+    ---------------------------------------------------------------
+    end to end                                  42.6      26.8
+
+`dceEmit` fragments per sub-program: 8 before, 1 after (the main module, whose
+suffix is a checksum of the expression and is therefore never cached).
+`dceLive` is now the largest single phase of an evaluation.
+
+Two facts the plan's framing did not have, and which redirected the work:
+
+  * **hexer of the stdlib closure does NOT run per sub-program.** `.x.nif` and
+    `.dce.nif` live at the top of the nimcache and are program-independent, so
+    after the first compile their nodes are up to date and skipped. Only
+    `dceEmit` (which writes `<sub-program>/<mod>.c.nif`) and `dceLive` were
+    per-sub-program, and together they were 19 of the 43 ms.
+  * The five sub-programs' seven stdlib modules produce **12 distinct `.c.nif`
+    out of 35 `dceEmit` runs** — the sharing the cache in §4 turns into hits.
+
+
+3. Step 1: the sub-build in the compiler's own process
+-------------------------------------------------------
+
+`semos.buildEvalProgram` used to `execCmdEx` a whole `nimony
+--ctfe-analysis-only --nimcache:<nc> s <sfx>.p.nif`. Since A2b that child ran
+every node of both its graphs in its own process already (`nifmake-report …
+inproc=5` for the frontend graph, `inproc=10` for the analysis graph), so what
+the spawn still bought was one thing: a fresh set of frontend globals.
+
+Isolated cost of the child (median of 9, `NIMONY_VFS=disk`):
+
+    fresh evaluation, whole child          32.6 ms
+    child with nothing stale                7.9 ms
+    `nimony --version`                      4.7 ms
+
+i.e. 4.7 ms is the process itself and 3.2 ms is graph work an in-process
+caller still pays.
+
+Byte-identity check, `--spawn:always` (which still spawns the child) against
+the default (which does not), both into the SAME nimcache path so the
+snippet's `setup("<abs>/<sfx>.out.nif")` literal is the same string:
+
+    260 .nif artifacts compared, 0 differences
+    (the 18 `asmcache/*.asm.nif` entries are named differently in the two runs
+     because the engine's key carries `getAppFilename()`, and sem runs in
+     `bin/nimsem` under `--spawn:always` and in `bin/nimony` by default. That
+     is B2's key, unchanged here.)
+
+
+4. Step 2: the stdlib closure's `.c.nif`, content-addressed
+------------------------------------------------------------
+
+Key = the module's own slice of `<main>.live.nif` (`(mod "<sfx>" <syms…>)`,
+sorted) plus the `(resolved (kv …))` entries NOT owned by the main module
+(sorted), plus a digest of the module's `.x.nif`, plus bits/cpu/os/checkFlags
+and hexer's mtime. Entry: `<nimcache>/ccache/<sha1>.c.nif`.
+
+Validation of the key against ground truth, five sub-programs of `tmyops`:
+
+    module        distinct keys   distinct .c.nif
+    assy765wm           1               1
+    fen2xhzfd           1               1
+    for2ybv4p1          1               1
+    mat7cnfv21          1               1
+    syn1lfpjv           3               3
+    sysvq0asl           2               2
+    wriwhv7qv           3               3
+    ----------------------------------------------
+    total              12              12   over 35 emissions
+
+i.e. the keys partition the emissions into exactly the distinct outputs: no
+two different files share a key (soundness), and no two identical files get
+different keys (no lost hits).
+
+Differential check, eleven programs compiled with `NIMONY_CCACHE=off` and
+again with the cache, into the same nimcache path:
+
+    tconstseq        44 .c.nif   0 differences
+    tconsttable      31          0
+    tconstchain      44          0
+    tconstforseq     44          0
+    tconstseqstr     28          0
+    tconstcase       60          0
+    tconstnestedobj  28          0
+    tconstfloat      44          0
+    tconsttuple      28          0
+    tconstarray      28          0
+    ctfe_bench      139          0
+    ------------------------------------
+    total           518          0
+
+`tests/ctfe_engine` re-runs the second of these on every sweep.
+
+
+5. What remains, with the number
+---------------------------------
+
+  * **`dceLive`, 8.5 ms** — the largest single phase left. It reads all eight
+    `.dce.nif` and computes the live set from the MAIN module's roots, so it
+    is per-program by construction and cannot be content-addressed across
+    sub-programs. Making it cheaper means either keeping the parsed stdlib
+    `.dce.nif` in memory across evaluations (a change to `src/hexer`, which
+    this phase does not own) or JIT.md 7.3's `.x.nif` feed with a cached
+    resolve step, which removes DCE from the CTFE path entirely.
+  * **`assemble`, 6.6 ms** — nifasm over all eight modules per evaluation.
+    B2's notes name the per-proc code cache as what removes it; that is B3.
+  * **`arkham`, 3.3 ms** — one module per evaluation (the snippet) plus seven
+    `.asm.nif` cache hits. Already at its floor without a per-proc cache.
+  * **The three graph emissions, ~4 ms** — `initDepContext` walks the same
+    module closure for every sub-program of one compile. Nothing here reuses
+    it across evaluations; a `DepContext` cache keyed on the import closure is
+    the obvious next step and was not attempted.
+
+
+6. `--vfs` on the CTFE path
+----------------------------
+
+The plan asked whether `memory+spill` is worth making the dev default now that
+the phases share a process. Measured on the same five-fresh-evaluations
+recipe, after step 1:
+
+    NIMONY_VFS=disk           per new evaluation  36.0 ms
+    NIMONY_VFS=memory+spill   per new evaluation  35.9 ms
+
+No difference, which is what A1b's write-through table predicts: almost
+nothing on this path is memory-only. The default stays `disk` and nothing was
+added to the ephemeral list.
+
+
+7. Raw runs
+------------
+
+  final pair, quiet machine (load < 2), caches kept across runs:
+  before  5 memo-hit   11 11 11 11 11 11 12       median 11.3
+  before  5 fresh     224 225 225 224 226 225 225 median 224.6  -> 42.6 per eval
+  head    5 memo-hit   11 12 12 11 11 11 11       median 10.9
+  head    5 fresh     145 144 146 145 152 146 145 median 144.8  -> 26.8 per eval
+
+  final pair, caches wiped every run:
+  before  5 memo-hit   median 11.2   5 fresh median 261.5   -> 50.1 per eval
+  head    5 memo-hit   median 11.3   5 fresh median 203.4   -> 38.4 per eval
+
+  step by step while the phase was built (busier machine):
+  before  5 memo-hit   11 11 12 12 11 11 11      median 11.4
+  before  5 fresh     225 225 226 225 227 233 224 median 225.3
+  step1   5 memo-hit   12 11 11 11 11 11 12      median 11.4
+  step1   5 fresh     191 191 190 218 203 191 191 median 191.2
+  step2   5 memo-hit   12 11 11 11 11 12 11      median 11.4
+  step2   5 fresh     163 179 151 150 166 153 169 median 163.2
+
+  child alone (before), fresh evaluation:
+    31.4 31.4 31.1 31.7 32.2 32.5 33.5 32.6 39.1  median 32.2
+  child alone (before), nothing stale:
+    8.0 7.8 8.0 8.5 8.1 8.0 7.9 8.3 9.8           median 8.0
+  `nimony --version`:
+    4.4 4.7 4.8 5.3 5.0 3.2 4.8 3.8 3.4           median 4.7
+
+  engine `--verbose` line, warm asm cache, before and after (unchanged):
+    arkham=3.22ms (1 run, 7 cached, 8 modules) assemble=6.59ms lay=0.08ms
+    bind=0.03ms run=0.18ms total=10.17ms
+
+
+8. One regression the block benchmark could not see
+----------------------------------------------------
+
+Splitting the analysis into two graphs first left the hexer and `dceLive`
+nodes in BOTH of them. hexer writes `.x.nif` OnlyIfChanged, so a node whose
+output keeps its old mtime is stale forever under nifmake's mtime rule — and
+the one scenario where hexer is genuinely stale is a FORCED rebuild, which is
+also the one scenario the fresh-evaluation measurement above does not cover.
+
+`bench/devloop_ab.sh /tmp/a2c_before . ctfe.forced 5` (this phase's own before
+against its after, interleaved):
+
+    with the doubled nodes:   B/A cpu 1.314  (1.285 -> 1.688 s)
+    with them emitted once:   B/A cpu 0.974  (1.495 -> 1.456 s)
+
+The block runs could not have found it: the same afternoon they reported
+`hello.forced` at +12.6 % cpu, which the interleaved script then measured at
+-4.3 %. Drift between two blocks is the same size as the signal.
+
+
+9. Progress benchmark (bench/devloop_bench.sh)
+-----------------------------------------------
+
+See the table appended to `bench/results/2026-09-06/progress.md` under run 4.

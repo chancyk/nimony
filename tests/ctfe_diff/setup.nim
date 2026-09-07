@@ -51,6 +51,15 @@ if "--self-test" notin commandLineParams():
   # `../nativenif` checkout there is no engine to compare against, `--ctfe:engine`
   # falls back to the subprocess for every evaluation, and the run would pass
   # while proving nothing -- so say so instead.
+  # A2c: the sub-build of every `const` now runs inside the very process that
+  # is semchecking the module which triggered it, with the frontend's globals
+  # moved aside and put back around it (`semos.FrontendSnapshot`). The pair
+  # that proves the restore is complete is `--ctfe:subprocess` -- which still
+  # spawns a whole `nimony s` and therefore cannot touch this process's state
+  # at all -- against the default. What it compares is not only the `.out.nif`
+  # of each evaluation but the CALLING module's `.s.nif`, which is built from
+  # the `SymId`s and the `dest` buffer that were live across the nested build.
+  failures += ctfeDiff(@["tests/nimony/consteval"], "--ctfe:subprocess", "")
   if engineIsCompiledIn():
     failures += ctfeDiff(@["tests/nimony/consteval"], "--ctfe:subprocess", "--ctfe:engine")
   else:

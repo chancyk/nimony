@@ -33,6 +33,85 @@ when defined(nimonyEngine):
   # pretending.
   import engine
 
+import identstyle
+
+# ── A2c: the sub-build seam, and the frontend state it needs ────────────────
+
+const
+  EvalBuildUnavailable* = -2
+    ## `evalBuildInProcess` could not run the graph here (no phase relay in
+    ## this process); the caller has to spawn the way it always did. Distinct
+    ## from every exit code a real build can produce.
+
+type
+  EvalBuildProc* = proc (baseDir, project, nimcachePath, commandLineArgs,
+                         extraPath, outFile: string;
+                         analysisOnly: bool): int {.nimcall.}
+    ## `deps.runEvalBuild`, reached through a variable because the module
+    ## graph forbids the direct call: `deps` imports `semos`.
+
+proc noEvalBuild(baseDir, project, nimcachePath, commandLineArgs,
+                 extraPath, outFile: string; analysisOnly: bool): int {.nimcall.} =
+  ## The default: there is no in-process sub-build here, spawn as before. A
+  ## real proc rather than `nil` for the same reason `dag.spawnEverything` is
+  ## one -- nimony has no nil proc value, and this file is compiled by nimony
+  ## in `hastur boot`.
+  EvalBuildUnavailable
+
+var evalBuildInProcess*: EvalBuildProc = noEvalBuild
+  ## The ONE module-level `var` this phase adds, and it exists for the same
+  ## reason `dag.runNodeRelay` does: a lower module has to call into a higher
+  ## one. `deps.nim` assigns it at module init, so every binary that links
+  ## `deps` -- `nimony` and `nimsem` both -- has it, and a binary that does not
+  ## simply keeps spawning.
+
+type
+  FrontendSnapshot = object
+    ## The frontend's whole process-global state, moved aside so a NESTED
+    ## compilation can run in this process as if it were a fresh one.
+    ##
+    ## Every in-process phase begins with `semmain.resetFrontendGlobals()`
+    ## (`phases.runPhaseInproc`), which is right for a scheduler running
+    ## unrelated modules back to back and fatal for a build nested inside a
+    ## live sem: the caller's `SymId`/`StrId` universe would be replaced under
+    ## it. Rather than teach sem to share, this takes the universe away for the
+    ## duration and gives it back.
+    ##
+    ## It is cheap and it is safe:
+    ##
+    ## * `pool` and `globalTags` are `ref`s and `prog` is an object of tables,
+    ##   so taking and putting back is a handful of pointer moves, not a copy.
+    ## * `nifcore.TokenBuf` captures the `Pool`/`TagPool` it was built with, so
+    ##   the caller's buffers keep decoding against the moved-aside pool
+    ##   throughout and are correct again the instant it is put back.
+    ## * moving `prog` moves the table headers, not the heap its entries live
+    ##   on, so a `ptr ToplevelEntry` from `programs.getEntry` survives; the
+    ##   nested build allocates its own.
+    ##
+    ## `identstyle`'s three tables are not exported and cannot be moved from
+    ## here, but they are lazy indexes DERIVED from `pool.strings`, so the
+    ## restore drops them (`resetStyleTables`) and they rebuild against the
+    ## restored pool. `filelinecache` is keyed by path and holds file text, not
+    ## ids, so it needs neither.
+    pool: Pool
+    tags: TagPool
+    prog: Program
+
+proc takeFrontendState(): FrontendSnapshot =
+  result = FrontendSnapshot(pool: pool, tags: globalTags,
+                            prog: move(programs.prog))
+  resetPools()
+  resetProgram()
+  resetStyleTables()
+
+proc restoreFrontendState(s: var FrontendSnapshot) =
+  pool = s.pool
+  globalTags = s.tags
+  nifcore.fallbackPool = s.pool
+  nifcore.fallbackTags = s.tags
+  programs.prog = move(s.prog)
+  resetStyleTables()
+
 proc nimonyDir(): string =
   ## The project root for stdlib resolution. `bin*` (not just `bin`) is
   ## matched so the boot bootstrap can stage toolchains under sibling
@@ -697,8 +776,33 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   var noAdditional = nifcore.createTokenBuf(1)
   runPlugin(c, dest, info, pluginName, input, noAdditional)
 
-proc buildEvalProgram(file, nimcachePath, commandLineArgs: string;
-                      analysisOnly = false): tuple[output: string, exitCode: int] =
+proc runNestedBuild*(baseDir, project, nimcachePath, commandLineArgs: string;
+                     extraPath = ""; outFile = "";
+                     analysisOnly = false; verbose = false): int =
+  ## Run a sub-compile's build graphs in THIS process, with the caller's
+  ## frontend state moved aside for the duration (`FrontendSnapshot`). Answers
+  ## `EvalBuildUnavailable` when there is no in-process path here, which is the
+  ## caller's cue to spawn exactly as before.
+  ##
+  ## The `try`/`finally` is the whole safety argument: a phase that raises
+  ## (`phases.runPhaseInproc` turns those into a failed node, but `deps` itself
+  ## can raise on an I/O error) must not leave the outer compile without its
+  ## pool.
+  var saved = takeFrontendState()
+  try:
+    result = evalBuildInProcess(baseDir, project, nimcachePath, commandLineArgs,
+                                extraPath, outFile, analysisOnly)
+  finally:
+    restoreFrontendState(saved)
+  # `--verbose` says which of the two paths a sub-build took, so that "a
+  # `const` costs no process" is something a test can read off the compiler
+  # rather than infer from the filesystem (`tests/ctfe_engine`).
+  if verbose and result != EvalBuildUnavailable:
+    echo "[ctfe-build] in-process ", extractModuleSuffix(project)
+
+proc buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs: string;
+                      analysisOnly = false;
+                      verbose = false): tuple[output: string, exitCode: int] =
   ## `nimony <forwarded args> --nimcache:<dir> s <sfx>.p.nif`, the whole graph
   ## down to the linked binary — unless `analysisOnly`, which adds
   ## `--ctfe-analysis-only` and stops it once every `.c.nif` exists, because the
@@ -709,6 +813,20 @@ proc buildEvalProgram(file, nimcachePath, commandLineArgs: string;
   ## `nimony s <name>.p.nif` spelling and genuinely needs its executable.
   ## Compilation keeps the outer cwd — nimcache paths are relative to the
   ## invoking compile.
+  ##
+  ## A2c: the same graphs run in THIS process where a phase relay is installed
+  ## (`deps.runEvalBuild`); the spawn below is what a process without one --
+  ## a bare `bin/nimsem`, a nimony-built nimony, `--spawn:always` -- still
+  ## does, and it is also what produces the diagnostics of a sub-program that
+  ## does not compile, since those reach a child's captured stdout and this
+  ## process's own.
+  let inproc = runNestedBuild(baseDir, file, nimcachePath, commandLineArgs,
+                              analysisOnly = analysisOnly, verbose = verbose)
+  if inproc != EvalBuildUnavailable:
+    return (output: "", exitCode: inproc)
+
+  if verbose:
+    echo "[ctfe-build] spawning ", extractModuleSuffix(file)
   let nimonyExe = findTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
     (if analysisOnly: " --ctfe-analysis-only" else: "") &
@@ -736,13 +854,14 @@ proc subprocessCtfeArgs(commandLineArgs: string): string =
   if not sawCtfe:
     result.add " --ctfe:subprocess"
 
-proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string];
+proc runProgram(baseDir, file: string; nimcachePath: string; usedModules: HashSet[string];
                 commandLineArgs: string;
-                sourceDir = ""): tuple[output: string, exitCode: int] =
+                sourceDir = ""; verbose = false): tuple[output: string, exitCode: int] =
   # Compile the .p.nif through the full pipeline, then run the resulting
   # binary. Only the execution step uses `workingDir` so relative paths like
   # `doc/version.md` resolve next to the caller module.
-  result = buildEvalProgram(file, nimcachePath, commandLineArgs)
+  result = buildEvalProgram(baseDir, file, nimcachePath, commandLineArgs,
+                            verbose = verbose)
   if result.exitCode != 0: return
 
   let modname = extractModuleSuffix(file)
@@ -777,10 +896,22 @@ proc prepareEval*(c: var SemContext): string =
       # stale, and tries to overwrite it — which on Windows fails because
       # the outer nimsem (currently paused waiting on this exec) still
       # has it mmap'd. The outer's args live on `c.commandLineArgs`.
+      let writeNifSrc = stdlibFile("std/writenif.nim")
+      # A2c: the same graphs, in this process. `nimony c` and `nimony s` reach
+      # `deps.buildGraph` with the same `DoCompile`; the only difference is the
+      # `.nim` versus `.p.nif` project, which `buildGraph` reads off the
+      # extension itself.
+      let inproc = runNestedBuild(c.g.config.baseDir, writeNifSrc,
+                                  c.g.config.nifcachePath, c.commandLineArgs,
+                                  verbose = c.g.config.verbose)
+      if inproc != EvalBuildUnavailable:
+        if inproc != 0:
+          return "failed to precompile std/writenif"
+        return ""
       let nimonyExe = findTool("nimony")
       var cmd = quoteShell(nimonyExe) & c.commandLineArgs &
         " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
-        " c " & quoteShell(stdlibFile("std/writenif.nim"))
+        " c " & quoteShell(writeNifSrc)
       try:
         let (output, exitCode) = execCmdEx(cmd)
         if exitCode != 0:
@@ -996,10 +1127,11 @@ when defined(nimonyEngine):
       tuple[output: string, exitCode: int, fellBack: bool] =
     ## Build only what the engine consumes, then run it.
     result = (output: "", exitCode: 0, fellBack: false)
-    let (buildOut, buildCode) = buildEvalProgram(m.progFile,
+    let (buildOut, buildCode) = buildEvalProgram(c.g.config.baseDir, m.progFile,
                                                  c.g.config.nifcachePath,
                                                  c.commandLineArgs,
-                                                 analysisOnly = true)
+                                                 analysisOnly = true,
+                                                 verbose = c.g.config.verbose)
     if buildCode != 0:
       # A sub-program that does not COMPILE fails the same way in both modes;
       # falling back would only compile it again to watch it fail again.
@@ -1049,8 +1181,10 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
         let args =
           if triedEngine: subprocessCtfeArgs(c.commandLineArgs)
           else: c.commandLineArgs
-        let (output, exitCode) = runProgram(m.progFile, c.g.config.nifcachePath, usedModules,
-                                            args, sourceDir)
+        let (output, exitCode) = runProgram(c.g.config.baseDir, m.progFile,
+                                            c.g.config.nifcachePath, usedModules,
+                                            args, sourceDir,
+                                            verbose = c.g.config.verbose)
         if exitCode != 0:
           return ensureMove(output)
     # The files the sub-program read are dependencies of the CALLING module,

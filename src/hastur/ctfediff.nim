@@ -48,6 +48,8 @@ type
     programCode: int
     seen: HashSet[string]
     fresh: seq[string]
+    seenSem: HashSet[string]  ## the same snapshot/diff for `*.s.nif`
+    freshSem: seq[string]
 
   CtfeDiffCtx = object
     ## The run: the toolchain to drive it with, the two modes, and the tally
@@ -56,6 +58,7 @@ type
     a, b: ModeRun
     files: int
     artifacts: int
+    semArtifacts: int
     differences: int
 
 # ---- reporting ------------------------------------------------------------
@@ -109,6 +112,60 @@ proc outNifNames*(cache: string): HashSet[string] =
   if not dirExists(cache): return
   for p in walkDirRec(cache, relative = true):
     if p.endsWith(".out.nif"): result.incl p
+
+proc semNifNames*(cache: string): HashSet[string] =
+  ## Every `*.s.nif` directly under `cache` — the semantic-checking output of
+  ## each module of the compile, the CALLING module's included.
+  ##
+  ## A2c runs a compile-time evaluation's sub-build inside the very process
+  ## that is semchecking the module which triggered it, with the frontend's
+  ## globals moved aside and put back (`semos.FrontendSnapshot`). The `.out.nif`
+  ## comparison cannot see whether that restore was complete: the evaluation's
+  ## own result comes from a sub-program that ran with fresh globals either way.
+  ## What would show a leak is the CALLER's `.s.nif` — the file built from the
+  ## `SymId`s and the `dest` buffer that were live across the nested build — so
+  ## it is compared too.
+  ##
+  ## Non-recursive: `.s.nif` files live at the root of a nimcache; the
+  ## per-module subdirectories hold backend artifacts.
+  result = initHashSet[string]()
+  if not dirExists(cache): return
+  for x in walkDir(cache):
+    if x.kind != pcFile: continue
+    let name = x.path.extractFilename
+    if name.endsWith(".s.nif"): result.incl name
+
+proc normalizeCachePath(data, cache: string): string =
+  ## Replace the mode's own nimcache path with a placeholder. The two modes
+  ## necessarily use different directories, and a CTFE snippet's module embeds
+  ## the absolute path of the `.out.nif` it writes — that is a real difference
+  ## between two directories and not between two modes.
+  if cache.len == 0: return data
+  result = data.replace(cache, "<nimcache>")
+
+proc compareSemArtifacts*(cacheA, cacheB: string; names: seq[string]): int =
+  ## Compare the named `*.s.nif` files, with each mode's nimcache path
+  ## normalized away. Returns the number that differ.
+  result = 0
+  for name in items names:
+    let pa = cacheA / name
+    let pb = cacheB / name
+    let hasA = fileExists(pa)
+    let hasB = fileExists(pb)
+    if not hasA or not hasB:
+      inc result
+      echo "  DIFF ", name, ": .s.nif present only in mode ",
+           (if hasA: "A" else: "B")
+      continue
+    let da = normalizeCachePath(readFile(pa), cacheA)
+    let db = normalizeCachePath(readFile(pb), cacheB)
+    let at = firstDifference(da, db)
+    if at < 0: continue
+    inc result
+    echo "  DIFF ", name, ": .s.nif first differing byte at offset ", at,
+         " (", da.len, " bytes in A, ", db.len, " in B)"
+    echo "    A: ", nifExcerpt(da, at)
+    echo "    B: ", nifExcerpt(db, at)
 
 proc compareArtifacts*(cacheA, cacheB: string; names: seq[string]): int =
   ## Compare the named `*.out.nif` files between two nimcaches, byte for byte.
@@ -174,6 +231,12 @@ proc freshArtifacts(m: var ModeRun) =
     if name notin m.seen: m.fresh.add name
   m.seen = now
   sort m.fresh
+  m.freshSem = @[]
+  let nowSem = semNifNames(m.cache)
+  for name in items nowSem:
+    if name notin m.seenSem: m.freshSem.add name
+  m.seenSem = nowSem
+  sort m.freshSem
 
 proc diffOneFile(c: var CtfeDiffCtx; file: string) =
   inc c.files
@@ -202,6 +265,15 @@ proc diffOneFile(c: var CtfeDiffCtx; file: string) =
   c.artifacts += names.len
   c.differences += compareArtifacts(c.a.cache, c.b.cache, names)
 
+  var semNames: seq[string] = @[]
+  var semUnion = initHashSet[string]()
+  for n in items c.a.freshSem: semUnion.incl n
+  for n in items c.b.freshSem: semUnion.incl n
+  for n in items semUnion: semNames.add n
+  sort semNames
+  c.semArtifacts += semNames.len
+  c.differences += compareSemArtifacts(c.a.cache, c.b.cache, semNames)
+
   if c.a.compileCode == 0 and c.b.compileCode == 0:
     runCompiled c.a
     runCompiled c.b
@@ -214,7 +286,8 @@ proc diffOneFile(c: var CtfeDiffCtx; file: string) =
         $c.a.programCode & " under A, " & $c.b.programCode & " under B"
 
   if c.differences == before:
-    echo "  ok ", file, " (", names.len, " artifact(s))"
+    echo "  ok ", file, " (", names.len, " artifact(s), ",
+         semNames.len, " .s.nif)"
 
 # ---- the walk -------------------------------------------------------------
 
@@ -290,7 +363,7 @@ proc ctfeDiff*(dirs: seq[string]; modeA, modeB: string): int =
       diffOneFile c, f
 
   echo "ctfediff: ", c.files, " file(s), ", c.artifacts, " artifact(s), ",
-       c.differences, " difference(s)"
+       c.semArtifacts, " .s.nif, ", c.differences, " difference(s)"
   # The caches are large and only interesting when something went wrong.
   if c.differences == 0:
     removeDir root
