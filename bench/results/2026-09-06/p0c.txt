@@ -1,0 +1,242 @@
+Phase P0c -- an edit re-emits only the modules whose live set changed
+====================================================================
+
+Machine: macOS 26, M5, 10 cores, Nim 2.2.10.  Branch `jit/p0c`, forked from
+`fast-devloop` at acf637f6.  NIMONY_VFS=disk, EXTRA= (defaults: `--ctfe:auto`,
+the in-process scheduler on).
+
+The machine was NOT quiet: a sibling agent (A2c) was building throughout.
+`uptime` is recorded beside every table.  That is why the headline number of
+this file is the interleaved A/B in section 3 rather than the two absolute
+tables in section 4: cpu-sum on `self.cold` drifts by ~1 s (4 %) between runs
+taken minutes apart on this load, which is larger than anything P0c does to it.
+
+
+1. The scenario, before and after (`nimony c --profile --report`)
+----------------------------------------------------------------
+
+`/tmp/devloop_base/src` (the fork point's sources, 127 modules) copied to a
+scratch dir, built cold, then
+
+    printf '\nproc devloopBenchBody(): int = 1\n' >> src/nimony/sem.nim
+
+and rebuilt.  This is `devloop_bench.sh`'s `self.editbody`: a body-only edit,
+the module's interface unchanged.
+
+BEFORE (fast-devloop tip, acf637f6):
+
+    --- nifmake profile ---
+      parse .nif:     0.001s
+      DAG setup:      0.000s
+      executed commands:
+        dceEmit         1.929s  (127 invocations)
+        cc              1.391s  (1 invocations)
+        dceLive         0.337s  (1 invocations)
+        hexer           0.260s  (1 invocations)
+        lengc           0.082s  (3 invocations)
+        link            0.038s  (1 invocations)
+      exec total:     4.036s
+      in-process:     5 of 134 commands
+      wall time:      1.656s  (+ 0.678s in-process, serial)
+    ---
+    nifmake-report cc=1 dceEmit=127 dceLive=1 hexer=1 lengc=3 link=1 total=134 inproc=5
+
+AFTER (jit/p0c):
+
+    --- nifmake profile ---
+      parse .nif:     0.001s
+      DAG setup:      0.000s
+      executed commands:
+        cc              1.332s  (1 invocations)
+        hexer           0.260s  (1 invocations)
+        lengc           0.091s  (3 invocations)
+        dceEmit         0.044s  (1 invocations)
+        link            0.038s  (1 invocations)
+      exec total:     1.766s
+      in-process:     5 of 7 commands
+      wall time:      1.371s  (+ 0.395s in-process, serial)
+    ---
+    nifmake-report cc=1 dceEmit=1 hexer=1 lengc=3 link=1 total=7 inproc=5
+
+134 executed commands -> 7.  `dceEmit` 127 -> 1, and `dceLive` does not run at
+all: with `.dce.nif` now serialised in sorted order, the leaf module's analysis
+is byte-identical and its `OnlyIfChanged` write preserves the mtime, so the
+liveness phase is not even woken.  `cc` was 1 before and is 1 after -- the
+`.c.nif` was already written `OnlyIfChanged`, which is JIT_IMPL.md P0c step 3
+(verified, not changed).
+
+The no-change build IMMEDIATELY AFTER that edit, which is the second half of
+the problem (the 126 emits wrote nothing, so their `.c.nif` kept an mtime older
+than the freshly written whole-program `.live.nif` and stayed stale forever):
+
+    before:  nifmake-report total=0 inproc=0
+             nifmake-report dceEmit=126 lengc=2 total=128 inproc=0
+    after:   nifmake-report total=0 inproc=0
+             nifmake-report lengc=2 total=2 inproc=0
+
+(`lengc=2` is a pre-existing perpetual staleness of two lengc nodes and is
+untouched by this phase.)
+
+
+2. Correctness: the emitted Leng is unchanged
+---------------------------------------------
+
+A cold self-compilation with the P0c toolchain, compared file by file against
+the one the pre-change toolchain produced from the same sources:
+
+    identical=127 different=0
+
+i.e. all 127 `.c.nif` files are byte-identical.  That is the empirical check on
+`dce2.resolveKeysOf`, which gives each module's live file only the resolve
+entries its own `.dce.nif` can justify instead of the whole table.
+
+Sizes, same build:
+
+    per-module live files: 127, 912211 bytes total, 7182 avg
+    whole-program <main>.all.live.nif: 508151 bytes
+
+Copying the whole resolve table (310336 bytes of the 508151) into each of the
+127 files would have been 39 MB per build instead of 0.9 MB.
+
+Also verified on the same build: the whole-program `.live.nif` before and after
+a body-only edit had IDENTICAL SIZE and identical whitespace-split token
+multisets (`tr -s ' ()\n' '\n' | sort | cmp` clean) -- it was a pure
+permutation, produced by `HashSet[SymId]` iterating in hash order of a pool
+index.  That is the root cause; see `notes/p0c.md` section 1.
+
+
+3. Interleaved A/B, pre-P0c vs P0c (the phase's own before/after)
+-----------------------------------------------------------------
+
+The two toolchains alternate round by round on the same scenario, the shape of
+progress.md's run 2b, so a drifting load hits both equally.  "pre" is the
+`fast-devloop` tip built from `git archive e122ef59` (this branch's notes-only
+commit); "head" is `jit/p0c`.  3 rounds, median, `uptime` 20:20 load 5.84.
+
+    scenario          pre  wall / cpu      head wall / cpu     delta
+    self.cold        7.409 / 26.067       7.370 / 26.128      -0.5 % / +0.2 %
+    self.editbody    2.826 /  4.199       2.401 /  2.446      -15 %  / -42 %
+    self.forced      7.199 / 27.234       7.021 / 26.673      -2.5 % / -2.1 %
+
+raw:
+
+    cold     pre   wall   7.409  cpu  26.067   raw wall: 7.052 7.409 7.948  cpu: 24.528 26.067 26.707
+    cold     head  wall   7.370  cpu  26.128   raw wall: 8.096 7.370 7.222  cpu: 26.846 26.128 25.971
+    body     pre   wall   2.826  cpu   4.199   raw wall: 2.672 2.826 2.953  cpu: 3.981 4.199 4.337
+    body     head  wall   2.401  cpu   2.446   raw wall: 2.401 2.199 2.447  cpu: 2.446 2.248 2.483
+    forced   pre   wall   7.199  cpu  27.234   raw wall: 6.661 7.358 7.199  cpu: 25.778 27.234 27.324
+    forced   head  wall   7.021  cpu  26.673   raw wall: 7.021 6.744 7.651  cpu: 26.673 26.312 27.435
+
+Gate: `self.editbody` loses the dceEmit fan-out (-1.75 s cpu, -0.43 s wall,
+`cc` = 1 in `--report`); `self.cold` is within 0.5 % of before on both axes.
+
+The 1.75 s of cpu is slightly more than the 1.6 s the profile attributes to the
+126 avoided `dceEmit` invocations, because `dceLive` (0.34 s) is also skipped
+now while the phase's own extra work -- sorting 4445 resolve keys plus 127 live
+sets, writing 0.9 MB of live files -- costs the difference back.
+
+
+4. The whole-branch tables (JIT_IMPL.md "Measuring" rule 2)
+-----------------------------------------------------------
+
+base = the fork point `/tmp/devloop_base` (f69b8afc), head = `jit/p0c`.  These
+are the standard fork-point comparison, not P0c's own delta: everything from
+P0a through B2 is in the difference too.  Taken minutes apart under a moving
+load (see the note at the top), so read section 3 for P0c itself.
+
+`bench/devloop_bench.sh /tmp/devloop_base base 3`   -- uptime 20:00, load 3.58
+
+    hello.forced    wall   0.426  cpu   0.677   raw wall: 0.425 0.432 0.426  cpu: 0.670 0.679 0.677
+    hello.nochange  wall   0.015  cpu   0.012   raw wall: 0.014 0.016 0.015  cpu: 0.012 0.013 0.012
+    hello.edit      wall   0.082  cpu   0.107   raw wall: 0.081 0.082 0.083  cpu: 0.107 0.108 0.107
+    ctfe.cold       wall   2.486  cpu   3.746   raw wall: 2.869 2.486 2.432  cpu: 3.773 3.746 3.706
+    ctfe.warm       wall   0.012  cpu   0.010   raw wall: 0.012 0.012 0.011  cpu: 0.010 0.010 0.010
+    ctfe.edit       wall   0.191  cpu   0.203   raw wall: 0.191 0.191 0.192  cpu: 0.202 0.203 0.205
+    ctfe.forced     wall   3.633  cpu   5.405   raw wall: 3.636 3.633 3.600  cpu: 5.369 5.405 5.433
+    bench.cold      wall   5.843  cpu   9.282   raw wall: 6.606 5.843 5.830  cpu: 9.365 9.282 9.251
+    bench.edit      wall   0.429  cpu   0.429   raw wall: 0.450 0.424 0.429  cpu: 0.486 0.427 0.429
+    stdlib.cold     wall   5.360  cpu  29.940   raw wall: 5.360 5.344 5.497  cpu: 29.793 29.940 30.262
+    stdlib.forced   wall   1.996  cpu   9.438   raw wall: 1.989 1.996 2.009  cpu: 9.438 9.487 9.433
+    stdlib.edit     wall   0.444  cpu   1.288   raw wall: 0.460 0.444 0.438  cpu: 1.315 1.288 1.285
+    self.cold       wall   7.231  cpu  28.477   raw wall: 7.623 7.179 7.231  cpu: 28.638 27.955 28.477
+    self.nochange   wall   0.098  cpu   0.095   raw wall: 0.101 0.098 0.095  cpu: 0.099 0.095 0.093
+    self.editbody   wall   2.637  cpu   3.994   raw wall: 2.665 2.637 2.624  cpu: 4.068 3.994 3.949
+    self.edit       wall   2.740  cpu   4.146   raw wall: 2.735 2.741 2.740  cpu: 4.153 4.145 4.146
+    self.forced     wall   7.395  cpu  28.005   raw wall: 7.518 7.372 7.395  cpu: 29.118 27.988 28.005
+
+    label: base   toolchain: /tmp/devloop_base   runs: 3 (median)   NIMONY_VFS=disk   EXTRA=
+
+`bench/devloop_bench.sh <worktree> head 3`          -- uptime 20:03, load 4.57
+
+    hello.forced    wall   0.408  cpu   0.642   raw wall: 0.408 0.404 0.408  cpu: 0.642 0.650 0.635
+    hello.nochange  wall   0.006  cpu   0.005   raw wall: 0.006 0.006 0.006  cpu: 0.005 0.005 0.005
+    hello.edit      wall   0.065  cpu   0.096   raw wall: 0.065 0.065 0.066  cpu: 0.096 0.096 0.093
+    ctfe.cold       wall   0.899  cpu   1.571   raw wall: 0.898 0.899 0.916  cpu: 1.560 1.571 1.601
+    ctfe.warm       wall   0.008  cpu   0.007   raw wall: 0.008 0.008 0.007  cpu: 0.007 0.007 0.007
+    ctfe.edit       wall   0.072  cpu   0.100   raw wall: 0.072 0.072 0.072  cpu: 0.099 0.100 0.102
+    ctfe.forced     wall   0.893  cpu   1.401   raw wall: 0.808 0.893 0.900  cpu: 1.317 1.435 1.401
+    bench.cold      wall   1.465  cpu   2.528   raw wall: 1.465 1.460 1.468  cpu: 2.518 2.540 2.528
+    bench.edit      wall   0.093  cpu   0.119   raw wall: 0.113 0.092 0.093  cpu: 0.165 0.119 0.113
+    stdlib.cold     wall   5.415  cpu  28.893   raw wall: 5.438 5.403 5.415  cpu: 28.893 28.606 29.050
+    stdlib.forced   wall   2.108  cpu   9.669   raw wall: 2.129 2.108 2.085  cpu: 9.669 9.694 9.590
+    stdlib.edit     wall   0.384  cpu   0.713   raw wall: 0.396 0.384 0.382  cpu: 0.725 0.713 0.707
+    self.cold       wall   7.115  cpu  26.249   raw wall: 7.140 7.109 7.115  cpu: 26.154 26.249 26.484
+    self.nochange   wall   0.108  cpu   0.107   raw wall: 0.114 0.107 0.108  cpu: 0.113 0.105 0.107
+    self.editbody   wall   2.150  cpu   2.199   raw wall: 2.153 2.150 2.147  cpu: 2.199 2.235 2.192
+    self.edit       wall   2.232  cpu   2.370   raw wall: 2.232 2.250 2.227  cpu: 2.386 2.370 2.369
+    self.forced     wall   7.083  cpu  28.124   raw wall: 7.145 6.971 7.083  cpu: 29.102 27.344 28.124
+
+    label: head   toolchain: <this worktree>   runs: 3 (median)   NIMONY_VFS=disk   EXTRA=
+
+`self.edit` (an EXPORTED proc appended, so every importer re-sems) also drops:
+4.146 -> 2.370 cpu.  A re-sem of the importers changes their `.s.nif` but not,
+for most of them, what is live, so their live files hold still too.
+
+And the full pre-P0c table for reference -- uptime 20:17, load 4.20:
+
+    hello.forced    wall   0.402  cpu   0.625   raw wall: 0.403 0.400 0.402  cpu: 0.625 0.628 0.613
+    hello.nochange  wall   0.006  cpu   0.005   raw wall: 0.006 0.006 0.006  cpu: 0.005 0.005 0.005
+    hello.edit      wall   0.064  cpu   0.091   raw wall: 0.062 0.064 0.064  cpu: 0.079 0.091 0.092
+    ctfe.cold       wall   0.884  cpu   1.543   raw wall: 0.875 0.884 0.895  cpu: 1.543 1.533 1.562
+    ctfe.warm       wall   0.008  cpu   0.008   raw wall: 0.012 0.008 0.007  cpu: 0.008 0.008 0.007
+    ctfe.edit       wall   0.071  cpu   0.098   raw wall: 0.071 0.070 0.071  cpu: 0.099 0.098 0.087
+    ctfe.forced     wall   0.882  cpu   1.381   raw wall: 0.813 0.902 0.882  cpu: 1.297 1.421 1.381
+    bench.cold      wall   1.430  cpu   2.491   raw wall: 1.428 1.433 1.430  cpu: 2.479 2.494 2.491
+    bench.edit      wall   0.097  cpu   0.125   raw wall: 0.119 0.097 0.097  cpu: 0.181 0.124 0.125
+    stdlib.cold     wall   5.250  cpu  27.229   raw wall: 5.250 5.148 5.311  cpu: 26.801 27.229 27.660
+    stdlib.forced   wall   1.984  cpu   9.250   raw wall: 1.991 1.984 1.980  cpu: 9.261 9.250 9.211
+    stdlib.edit     wall   0.404  cpu   0.720   raw wall: 0.404 0.393 0.470  cpu: 0.717 0.720 1.365
+    self.cold       wall   7.107  cpu  25.233   raw wall: 7.107 7.061 7.244  cpu: 25.233 25.132 25.411
+    self.nochange   wall   0.113  cpu   0.111   raw wall: 0.113 0.115 0.112  cpu: 0.110 0.113 0.111
+    self.editbody   wall   2.828  cpu   4.190   raw wall: 2.828 2.827 2.829  cpu: 4.170 4.190 4.194
+    self.edit       wall   2.907  cpu   4.359   raw wall: 2.907 2.990 2.719  cpu: 4.359 4.425 4.180
+    self.forced     wall   6.750  cpu  26.621   raw wall: 6.678 6.750 6.772  cpu: 26.237 26.651 26.621
+
+    label: pre-p0c   toolchain: /tmp/p0c_pretree   runs: 3 (median)   NIMONY_VFS=disk   EXTRA=
+
+The non-`self` scenarios are within noise of each other between pre-p0c and
+head, which is expected: they build 6-50 modules, so the fan-out P0c removes is
+small there in absolute terms (`stdlib.edit` cpu 0.720 -> 0.713).
+
+
+5. Suites
+---------
+
+    bin/hastur test tests/incremental
+      ctfe-ocache: 2 / 2 phases successful in 2.80s.
+      incremental: 16 / 16 phases successful in 8.22s.
+      ctfe-ocache (--vfs:memory+spill): 2 / 2 phases successful in 1.95s.
+      incremental (--vfs:memory+spill): 16 / 16 phases successful in 6.91s.
+      ctfe-ocache (--spawn:always): 2 / 2 phases successful in 2.20s.
+      incremental (--spawn:always): 16 / 16 phases successful in 8.18s.
+      inproc: 4 / 4 phases successful in 3.07s.
+      incremental-live: 5 / 5 phases successful in 1.55s.
+      incremental-live (--spawn:always): 5 / 5 phases successful in 1.52s.
+      SUCCESS.
+
+    bin/hastur tests/inproc                 3 / 3 tests successful in 37.96s.
+    bin/hastur test tests/ctfe_diff         18 file(s), 46 artifact(s), 0 difference(s)
+    bin/hastur test tests/nifcache          nifcache: all checks passed
+    bin/hastur test tests/nimony/consteval  18 / 18 tests successful in 3.83s.
+    bin/hastur tests/nimony                 793 / 793 tests successful in 146.26s.
+    bin/hastur boot                         [boot] stages 2 and 3 are byte-identical.
