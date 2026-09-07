@@ -27,7 +27,7 @@ from identstyle import resetStyleTables
 import ".." / gear2 / modnames
 import ".." / models / nifindex_tags
 import nimony_model, symtabs, builtintypes, decls, programs, sigmatch, conceptcache,
-  reporters, nifconfig, xints, semdata, sembasics,
+  reporters, renderer, nifconfig, xints, semdata, sembasics,
   semos, langmodes, derefs, vtables_frontend,
   contracts_fir, exprexec, semimport, module_plugins, sem
 when not defined(nimony):
@@ -369,8 +369,8 @@ proc instantiateMethodForType(c: var SemContext; dest: var TokenBuf; methodSym, 
     while typevars.hasMore:
       let name = takeLocal(typevars, SkipFinalParRi).name.symId
       if name notin inferred:
-        c.buildErr dest, res.decl.info, "cannot instantiate method " & pool.syms[methodSym] &
-          ", cannot infer generic parameter " & pool.syms[name]
+        c.buildErr dest, res.decl.info, "cannot instantiate method " & asNimSym(methodSym) &
+          ", cannot infer generic parameter " & asNimSym(name)
         return SymId(0)
       typeArgsBuf.addSubtree inferred.getOrQuit(name)
     let instance = requestRoutineInstance(c, methodSym, typeArgsBuf, inferred, res.decl.info)

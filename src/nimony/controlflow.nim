@@ -14,6 +14,7 @@ import std/[assertions, intsets]
 include ".." / lib / nifprelude
 
 import ".." / models / tags
+import ".." / lib / symparser
 import nimony_model, programs, builtintypes, typenav, decls
 from typeprops import isOrdinalType
 
@@ -57,6 +58,9 @@ type
     srcBase: Cursor            ## start of the source buffer; source positions are
                                ## measured relative to it (`cursorToPosition`).
     nextVar: int
+    localNs: string
+      ## namespace segment (`symparser.localNamespace`) of the routine this
+      ## graph is built for; empty for the module-level `(stmts ...)`.
     currentBlock: BlockOrLoop
     typeCache: TypeCache
     resultSym: SymId
@@ -184,10 +188,18 @@ proc addSource(c: var ControlFlow; tar: var Target; n: Cursor) =
     tar.t.add load(n)
   tar.src.add srcPosOf(c, n)
 
+proc freshCfSym(c: var ControlFlow): SymId =
+  ## A CF temporary, spelled the way `sembasics.makeLocalSym` spells a local:
+  ## `` `cf.0`step6`0 ``. The graph is built one routine at a time and thrown
+  ## away, so the count was already routine-local; writing the routine's name
+  ## next to it makes the temporary unique across the module as well, which is
+  ## what any module-lifetime table keyed on a `SymId` needs (`notes/f1.md` §3).
+  result = pool.syms.getOrIncl(localSymName("`cf", c.nextVar, c.localNs))
+  inc c.nextVar
+
 proc openTempVar(c: var ControlFlow; kind: StmtKind; typ: Cursor; info: NifLineInfo): SymId =
   assert not typ.isDotToken
-  result = pool.syms.getOrIncl("`cf." & $c.nextVar)
-  inc c.nextVar
+  result = freshCfSym(c)
   c.dest.addParLe kind, info
   c.dest.addSymDef result, info
   c.dest.addEmpty2 info # no export marker, no pragmas
@@ -314,8 +326,7 @@ proc trExprLoop(c: var ControlFlow; n: var Cursor; tar: var Target) =
 proc trCall(c: var ControlFlow; n: var Cursor; tar: var Target) =
   if c.keepReturns and tar.m == IsAppend:
     # bind to a temporary variable:
-    let tmp = pool.syms.getOrIncl("`cf." & $c.nextVar)
-    inc c.nextVar
+    let tmp = freshCfSym(c)
     let info = n.info
     c.dest.addParLe LetS, info
     c.dest.addSymDef tmp, info
@@ -506,8 +517,7 @@ proc trCase(c: var ControlFlow; n: var Cursor; tar: var Target) =
       var aa = Target(m: IsEmpty)
       trExpr c, n, aa
 
-      selector = pool.syms.getOrIncl("`cf." & $c.nextVar)
-      inc c.nextVar
+      selector = freshCfSym(c)
       c.dest.addParLe VarS, info
       c.dest.addSymDef selector, info
       c.dest.addEmpty2 info # no export marker, no pragmas
@@ -969,8 +979,7 @@ proc trAsgn(c: var ControlFlow; n: var Cursor) =
     var stmts = createTokenBuf(40)
     var stmtsSrc: seq[int32] = @[]
 
-    let tmp = pool.syms.getOrIncl("`cf." & $c.nextVar)
-    inc c.nextVar
+    let tmp = freshCfSym(c)
     stmts.addParLe LetS, info
     stmts.addSymDef tmp, info
     stmts.addEmpty2 info # no export marker, no pragmas
@@ -1120,6 +1129,10 @@ proc toControlflowImpl(n: Cursor; keepReturns: bool; srcMap: var seq[int32]; bit
   let sk = n.stmtKind
   var n = n
   if sk in {ProcS, FuncS, IteratorS, ConverterS, MethodS, MacroS}:
+    var name = n
+    inc name
+    if name.kind == SymbolDef:
+      c.localNs = localNamespace(pool.syms[name.symId])
     trProc c, n
   else:
     assert sk == StmtsS

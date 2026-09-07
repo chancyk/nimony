@@ -973,7 +973,7 @@ proc runCompiledMacroPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
     else:
       buildErr c, dest, cs.callNodeInfo, "macro plugin execution failed"
   else:
-    buildErr c, dest, cs.callNodeInfo, "macro '" & pool.syms[finalFn] & "' not compiled"
+    buildErr c, dest, cs.callNodeInfo, "macro '" & asNimSym(finalFn) & "' not compiled"
 
 proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: var CallState) =
   # Everything the candidate collection below writes to `dest` is a

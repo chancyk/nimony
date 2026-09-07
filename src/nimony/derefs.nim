@@ -47,6 +47,7 @@ include ".." / lib / compat2
 import ".." / models / tags
 import ".." / hexer / lifter
 import nimony_model, programs, decls, typenav, sembasics, reporters, renderer, typeprops, vtables_frontend, semdata, builtintypes
+import ".." / lib / symparser
 
 type
   Expects = enum
@@ -77,7 +78,14 @@ type
     classes: semdata.Classes # class entries with methods for vtables
     lifter: ref LiftingCtx
     typeSymBufs: seq[TokenBuf] # keeps Symbol cursors alive for lifter
-    tmpCounter: int  # for fresh symbols in exception lowering
+    localNs: string
+      # namespace segment (`symparser.localNamespace`) of the routine being
+      # lowered; empty at module level
+    errCounters: Table[string, int]
+      # per-`localNs` counter for the `` `err `` temporaries below. Keyed rather
+      # than reset so a routine lowered in two passes cannot mint one name twice,
+      # and namespaced rather than module-wide so an inserted proc that raises
+      # does not renumber the `` `err `` of every proc after it (`notes/f1.md`).
     handlerStack: seq[tuple[errSym, eSym: SymId]]
       # stack of (`err`, `_e`) syms for synthesized ref-exception handlers; used to
       # rewrite bare `raise` into `exc = err; raise _e` so the original error code
@@ -85,6 +93,16 @@ type
 
 proc takeTree(c: var Context; n: var Cursor) {.inline.} =
   c.dest.takeTree n
+
+proc freshErrSym(c: var Context): SymId =
+  ## The `` `err `` local the ref-exception lowering binds the in-flight
+  ## exception to, spelled the way `sembasics.makeLocalSym` spells a local:
+  ## `` `err.0`step6`0 `` — the count is per enclosing routine and the routine's
+  ## own name follows it, which is what keeps the string unique in the module
+  ## without making it depend on how many OTHER declarations raise.
+  var counter = addr c.errCounters.mgetOrPut(c.localNs, -1)
+  counter[] += 1
+  result = pool.syms.getOrIncl(localSymName("`err", counter[], c.localNs))
 
 proc endsWithOpenHderef(dest: TokenBuf): bool =
   ## True when the buffer's last value is a freshly opened `(hderef` head.
@@ -504,8 +522,11 @@ proc trProcDecl(c: var Context; n: var Cursor) =
   let props = if decl.stmtKind in {FuncS, IteratorS, ConverterS}: {IsNoSideEffect} else: {}
   var r = CurrentRoutine(returnExpects: WantT, props: props)
   swap c.r, r
+  var outerNs = ""
   takeInto c.dest, n:
     let symId = n.symId
+    outerNs = localNamespaceOf(symId)
+    swap c.localNs, outerNs
     var isGeneric = false
     for i in 0..<BodyPos:
       if i == TypevarsPos:
@@ -542,6 +563,7 @@ proc trProcDecl(c: var Context; n: var Cursor) =
         c.dest.reopenLastTree bodyStart
         checkForDangerousLocations c, body
         c.dest.addParRi()
+  swap c.localNs, outerNs
   swap c.r, r
   c.typeCache.closeScope()
 
@@ -999,8 +1021,7 @@ proc trTryCollapsed(c: var Context; n: var Cursor) =
     c.r.props = oldProps
 
     # Mint a fresh symbol for `err` (moved-out exc).
-    inc c.tmpCounter
-    let errSym = pool.syms.getOrIncl("`err." & $c.tmpCounter)
+    let errSym = freshErrSym(c)
     let excSym = pool.syms.getOrIncl(ExcThreadVarName)
 
     # Open the synthesized `(except . (stmts ...))`

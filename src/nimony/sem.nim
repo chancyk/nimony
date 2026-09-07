@@ -1843,7 +1843,7 @@ proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; sta
       dest.shrink identStart
       let ident = cursorAt(orig, 0)
       if s.name != SymId(0):
-        c.buildErr dest, ident.info, "undeclared identifier: " & pool.syms[s.name], ident
+        c.buildErr dest, ident.info, "undeclared identifier: " & asNimSym(s.name), ident
       else:
         let s = getIdent(ident)
         if s != StrId(0):
@@ -1929,7 +1929,7 @@ proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; sta
         n = beginRead(procTypeBuf)
       elif s.kind == ModuleY:
         if AllowModuleSym notin flags:
-          c.buildErr dest, readonlyCursorAt(dest, start).info, "module symbol '" & pool.syms[s.name] & "' not allowed in this context"
+          c.buildErr dest, readonlyCursorAt(dest, start).info, "module symbol '" & asNimSym(s.name) & "' not allowed in this context"
       else:
         assert false, "not implemented"
       it.typ = n
@@ -4072,10 +4072,6 @@ proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymI
     if local.name.symId in setFields:
       result = (true, local.name.symId)
       break
-
-proc asNimSym(symId: SymId): string =
-  result = pool.syms[symId]
-  extractBasename(result)
 
 template conflictingBranchesError(c: var SemContext; dest: var TokenBuf, info: NifLineInfo, prevFields: SymId, currentFields: SymId) =
   c.buildErr dest, info, "The fields '" & asNimSym(prevFields) &

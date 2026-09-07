@@ -230,7 +230,7 @@ proc getErrorMsg*(m: Match): string =
   of InvalidMatch:
     "expected: " & typeToString(m.error.expected) & " but got: " & typeToString(m.error.got)
   of InvalidRematch:
-    "Could not match again: " & pool.syms[m.error.typeVar] & " expected " &
+    "Could not match again: " & asNimSym(m.error.typeVar) & " expected " &
       typeToString(m.error.expected) & " but got " & typeToString(m.error.got)
   of ConstraintMismatch:
     typeToString(m.error.got) & " does not match constraint " &
@@ -259,13 +259,13 @@ proc getErrorMsg*(m: Match): string =
   of MismatchBug:
     "BUG: expected: " & typeToString(m.error.expected) & " but got: " & typeToString(m.error.got)
   of MissingExplicitGenericParameter:
-    "missing explicit generic parameter for " & pool.syms[m.error.typeVar]
+    "missing explicit generic parameter for " & asNimSym(m.error.typeVar)
   of ExtraGenericParameter:
     "extra generic parameter"
   of RoutineIsNotGeneric:
     "routine is not generic"
   of CouldNotInferTypeVar:
-    "could not infer type for " & pool.syms[m.error.typeVar]
+    "could not infer type for " & asNimSym(m.error.typeVar)
   of TooManyArguments:
     "too many arguments"
   of TooFewArguments:

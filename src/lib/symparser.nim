@@ -28,6 +28,27 @@ proc extractBasename*(s: var string) =
         return
     dec i
 
+proc sourceIdent*(s: string): string =
+  ## The identifier a symbol was SPELLED with in the source: the one rendering
+  ## every user-facing diagnostic uses when it names a symbol.
+  ##
+  ##   "s.0`testMutateWhileIterating`0" -> "s"
+  ##   "Foo.0.tge70svym"                -> "Foo"
+  ##   "T"                              -> "T"
+  ##
+  ## Everything after the identifier is compiler bookkeeping — a disambiguating
+  ## count, the owning routine's namespace (`LocalNsSep`), a module suffix — and
+  ## none of it is anything the user wrote. A message that must tell two
+  ## same-named symbols apart does it with the file/line/column it already
+  ## carries, not with that bookkeeping: `a.6` and `a.9` said nothing about WHICH
+  ## `a`, and the numbers moved whenever an unrelated declaration was edited.
+  ##
+  ## A name with no `.<digit>` in it — a plain identifier that never went through
+  ## `makeGlobalSym`/`makeLocalSym` — is returned unchanged, which is why this
+  ## wraps the in-place `extractBasename` rather than the one that answers `""`.
+  result = s
+  extractBasename(result)
+
 proc genericTypeName*(key, modname: string): string =
   result = "`t.0.I" & key & "." & modname
 
@@ -224,6 +245,22 @@ proc removeModule*(s: string): string =
     dec i
   return s
 
+proc localNamespace*(routineName: string): string =
+  ## The namespace segment for the locals of the routine spelled `routineName`:
+  ## its module-less name with the dots written as `LocalNsSep`, so that a local
+  ## built from it keeps exactly ONE dot and stays a local name (`isLocalName`).
+  ##
+  ##   "semExpr.0.mymod"        -> "semExpr`0"
+  ##   "foo.1.Iabcdef.mymod"    -> "foo`1`Iabcdef"
+  ##
+  ## Every counter that mints a symbol inside a routine — sem's locals, the
+  ## exception lowering's `` `err ``, the control-flow graph's `` `cf `` — keys
+  ## itself on this so that an edit to one declaration cannot renumber another's
+  ## temporaries. See `notes/f1.md`.
+  result = removeModule(routineName)
+  for i in 0 ..< result.len:
+    if result[i] == '.': result[i] = LocalNsSep
+
 type
   SplittedModulePath* = object
     dir*: string
@@ -313,9 +350,21 @@ when isMainModule:
   assert localSymName("tmp", 14, "") == "tmp.14"
   # ...and it is still a LOCAL name to everything that classifies one.
   var isGlobal = false
+  # The user-facing rendering of all three symbol shapes, plus the identifier
+  # that never got a number at all.
+  assert sourceIdent("s.0`testMutateWhileIterating`0") == "s"
+  assert sourceIdent("Foo.0.tge70svym") == "Foo"
+  assert sourceIdent("`err.2`step6`0") == "`err"
+  assert sourceIdent("T") == "T"
+
   assert isLocalName("x.3`semExpr`0")
   assert extractBasename("x.3`semExpr`0", isGlobal) == "x"
   assert not isGlobal
   assert extractModule("x.3`semExpr`0") == ""
   assert not isInstantiation("x.3`semExpr`0")
   assert removeModule("x.3`semExpr`0") == "x.3`semExpr`0"
+
+  # The namespace segment every per-routine counter keys on.
+  assert localNamespace("semExpr.0.mymod") == "semExpr`0"
+  assert localNamespace("foo.1.Iabcdef.mymod") == "foo`1`Iabcdef"
+  assert isLocalName(localSymName("`err", 2, localNamespace("step6.0.mymod")))
