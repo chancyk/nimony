@@ -121,7 +121,7 @@ Options:
   --inproc-mem-budget:MB    stop running phases in this process once its peak
                             resident size plus the next node's estimated peak
                             would exceed MB; 0 turns the rule off. The default
-                            is physical memory / (8 * cores), clamped to
+                            is physical memory / (32 * cores), clamped to
                             [128, 1024] MB
   --no-blobcache            native backend: assemble every reachable proc from
                             scratch instead of reusing nifasm's per-symbol code

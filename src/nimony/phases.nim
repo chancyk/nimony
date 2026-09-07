@@ -99,9 +99,10 @@ const
     ## measurement must not read as "this phase is free". 32 MB is below every
     ## per-tool peak measured so far, so the floor never *raises* a real
     ## number; it only stops a missing one from being zero.
-  InprocMemBudgetShare* = 8
-    ## The share of physical memory the compiler is willing to occupy: an
-    ## eighth. See `defaultInprocMemBudgetBytes`.
+  InprocMemBudgetShare* = 32
+    ## The denominator of the default budget, together with the core count.
+    ## See `defaultInprocMemBudgetBytes`, which explains where 32 comes from
+    ## and what was measured to get it.
   MinInprocMemBudgetMB* = 128
   MaxInprocMemBudgetMB* = 1024
 
@@ -170,20 +171,37 @@ proc defaultInprocMemBudgetBytes*(cores: int): int64 =
   ## How much resident memory the driver may reach before it stops taking work
   ## into its own process.
   ##
-  ## **The rule.** `clamp(physicalMemory / (8 * cores), 128 MB, 1 GB)`.
+  ## **The rule.** `clamp(physicalMemory / (32 * cores), 128 MB, 1 GB)`.
   ##
-  ## A build's steady state is `cores` tool processes at once. The share of the
-  ## machine this compiler is willing to occupy is an eighth of physical
-  ## memory, and the in-process driver stands in for *one* of those processes,
-  ## so its share of that share is `physical / (8 * cores)`. The floor of
-  ## 128 MB is under what one large `nimsem` needs, so the rule can never make
-  ## a build impossible -- the worst it does is send every node to a process,
-  ## which is `--spawn:always`, which works. The ceiling of 1 GB is there so
-  ## that a machine with a terabyte of RAM does not read as "no limit": past a
-  ## point, an address space the allocator never gives back is a cost whatever
-  ## the machine has.
+  ## The shape comes from what the driver *is*: a build's steady state is
+  ## `cores` tool processes at once, and the driver stands in for one of them,
+  ## so a share of the machine divided by the core count is the quantity that
+  ## scales correctly across machines. The ceiling of 1 GB is there because
+  ## past a point an address space the allocator never gives back is a cost
+  ## whatever the machine has; the floor of 128 MB is under what one large
+  ## `nimsem` needs, so the rule can never make a build impossible -- the worst
+  ## it can do is send every node to a process, which is `--spawn:always`,
+  ## which works.
   ##
-  ## 16 GiB and 10 cores -- the machine M1 was measured on -- gives 204 MB.
+  ## The constant 32 is a MEASUREMENT and not a derivation, which is the whole
+  ## point of putting memory in the ledger first
+  ## (`bench/results/2026-09-07/m1.txt`). On 16 GiB and 10 cores, a cold
+  ## self-compilation's largest process is 217 MB with the rule off; 184 MB at
+  ## the 204 MB budget an eighth-share would have given; and 147 MB -- exactly
+  ## what the same build costs when every node spawns, i.e. the floor the rule
+  ## can reach at all, because past that point the largest process is a CHILD
+  ## and no scheduling decision here can shrink it -- at 128 MB. None of the
+  ## three costs measurable wall time, and the compiler's own edit loop is
+  ## untouched at all of them (1.21 s, 112 MB, whatever the budget: its peak is
+  ## a child's, not the driver's). So the useful budget on an ordinary
+  ## developer machine is the floor, and the divisor is chosen to land there
+  ## and to scale up only for machines with genuinely more memory per core.
+  ##
+  ## The self-tuning version of this number is in the ledger already and is the
+  ## obvious follow-up: the driver has no business growing past the largest
+  ## `rss` any phase of this build was measured at, which is
+  ## `max(entry.ewma.rssBytes)` and needs no constant at all. It needs an
+  ## answer for the first build on a fresh machine, which this rule is.
   let phys = physicalMemoryBytes()
   var c = cores
   if c < 1: c = 1

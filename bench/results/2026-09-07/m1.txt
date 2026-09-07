@@ -1,0 +1,219 @@
+M1 -- memory in the cost ledger and the scheduler
+=================================================
+
+branch:   jit/m1 (from fast-devloop 3bb7c4c3)
+base:     f69b8afc (master fork point), /tmp/devloop_base
+machine:  macOS 26.6.2 arm64, Apple M5 (10 cores), 16 GiB, Nim 2.2.10
+backend:  native (`nimony n`)
+method:   bench/devloop_ab.sh, A/B interleaved. A is always the fork point and
+          is the drift control; B is this worktree. The machine was NOT quiet
+          (other agents building in neighbouring worktrees), so the absolute
+          wall times below drift between runs by up to 20 % and only the B/A
+          ratio inside one run is a comparison.
+
+          "The tip" is reproduced exactly by `NIMONY_INPROC_MEM_BUDGET=0`,
+          which turns M1's rule off and leaves everything else identical. That
+          is a better before/after than a second toolchain: one binary, one
+          set of sources, one difference.
+
+          uptime at the start of each block is recorded below.
+
+
+1. The rule and its default
+---------------------------
+
+    decline in-process work when
+        driverPeakNow + max(estimated rss of the depth's nodes) > budget
+
+    budget = clamp(physicalMemory / (32 * cores), 128 MB, 1 GB)
+
+`driverPeakNow` is `getrusage(RUSAGE_SELF).ru_maxrss` -- the peak so far, not
+the resident size now. It is one syscall and it is monotone, and the reset
+between in-process nodes drops the pools but not the pages, so the high-water
+mark is the honest number for "what is this process still holding".
+
+Overrides: `--inproc-mem-budget:MB`, `NIMONY_INPROC_MEM_BUDGET` (the
+environment, so a nested `nimony s` inherits it), `0` to switch the rule off.
+`--spawn:always` and `--vfs:disk` still force spawning as before.
+
+On this machine the rule lands on its 128 MB floor. Why 32 and not 8 is a
+measurement, not a derivation -- see block 3.
+
+
+2. self.cold -- the headline
+----------------------------
+
+uptime 10:46, load 12.71 / 6.91 / 6.62 (busy; read the ratios, not the walls)
+`bench/devloop_ab.sh /tmp/devloop_base . self.cold 3`, three rounds each.
+
+| B side                              | wall  | cpu    | peak rss | B/A wall |
+|-------------------------------------|-------|--------|----------|----------|
+| M1 off (== the tip)                 | 6.108 | 13.735 | 218 MB   | 1.033    |
+| M1 on, default budget (128 MB)      | 5.875 | 14.504 | **147 MB** | 0.979  |
+| NIMONY_SPAWN=always                 | 6.363 | 15.358 | 147 MB   | 1.000    |
+| A (fork point) in the same rounds   | 5.9-6.3 | 14.8-15.8 | 116 MB | --     |
+
+    218 MB  ->  147 MB, which IS the spawn-always number.
+
+147 MB is the floor the rule can reach at all: past that point the largest
+process of the build is a CHILD (see block 4) and no decision the driver makes
+about its own address space can shrink it.
+
+Wall: 0.979 vs the tip's 1.033 against the same control in adjacent runs, i.e.
+no cost, comfortably inside the 3 % gate. CPU is 5.6 % higher than with the
+rule off, which is the fan-out the rule buys back -- and it is still 2.1 %
+below the fork point's.
+
+
+3. Why the divisor is 32 -- the budget sweep
+--------------------------------------------
+
+uptime 10:37-10:41, load 3.8-8.7. Two rounds each, same A control.
+
+| budget          | peak rss | B/A wall |
+|-----------------|----------|----------|
+| off             | 217 MB   | 0.998    |
+| 204 MB (= /8)   | 184 MB   | 0.970    |
+| 160 MB          | 177 MB   | 0.960    |
+| 128 MB (= floor)| 147 MB   | 0.980    |
+| 100 MB          | 150 MB   | 0.979    |
+
+None of them costs wall time, and below 128 MB nothing more is bought: 147 MB
+is a child's peak. `physical / (8 * cores)` -- the first rule tried -- gives
+204 MB here and stops 37 MB short of what is available for free. `/ 32` gives
+53 MB, i.e. the 128 MB floor, which is where the value is. The divisor scales
+the budget up only for machines with genuinely more memory per core (512 GiB /
+64 cores -> 256 MB; 1 TiB / 16 cores -> the 1 GiB ceiling).
+
+The self-tuning version of this constant is already in the ledger and is the
+obvious follow-up: the driver has no business growing past
+`max(entry.ewma.rssBytes)`, the largest peak any phase of THIS build was
+measured at. It needs an answer for the first build on a fresh machine, which
+is what this rule is.
+
+
+4. Which tool grew: the 147 MB (head, spawn-always) vs 116 MB (fork point)
+-------------------------------------------------------------------------
+
+progress.md run 10 left this unattributed ("the wrapped builds failed early on
+both sides"). The new column answers it from inside the build.
+
+Head, `NIMONY_SPAWN=always`, forced, on the FORK POINT's own sources
+(`/tmp/devloop_base/src`, 127 modules) so that both sides compile the same
+program:
+
+    [stats] phase       samples   produce ms   spawn ms  ser+parse ms  write ms       bytes    peak MB
+    [stats] arkham          127          0.0       26.6           0.0       0.0           0        0.0
+    [stats] cc                7          0.0       78.3           0.0       0.0           0        0.0
+    [stats] dceEmit         129          0.5       12.4           3.4       0.3    25412327       28.2
+    [stats] dceLive           1        465.1       22.7          12.0      30.8      508152      146.7
+    [stats] hexer           135         19.7       28.8           3.5       0.8    53758116       65.3
+    [stats] lengc             7          0.5        9.9           0.6       0.2      224169        3.0
+    [stats] link              2          0.0      552.2           0.0       0.0           0        0.0
+    [stats] nifler          331          0.7        7.4           0.0       0.2     4761046        6.4
+    [stats] nimsem          132         24.8       20.2           1.5       1.3    29216902       54.5
+    [stats] driver peak 4.3 MB, largest child 146.8 MB
+
+The whole of the head's spawn-always 147 MB is ONE node: **dceLive**
+(`hexer dl`, the whole-program live-set pass) at 146.7 MB. Everything else is
+under 66 MB. `largest child 146.8 MB` -- `getrusage(RUSAGE_CHILDREN)` in the
+driver -- confirms it from the other side and covers the three phases that
+write no ledger fragment (`cc`, `arkham`, `link`).
+
+The same two nodes measured at the fork point, run by hand under
+`/usr/bin/time -l` out of its own `*.final.build.nif`:
+
+    fork point  hexer dl (dceLive)   0.65 s   83.6 MB
+    fork point  nifasm  (link)       1.11 s  122.2 MB
+
+So:
+
+* the fork point's largest process is the **link** (nifasm), 122 MB, which is
+  the 116 MB the benchmark reports;
+* `dceLive` went from **84 MB to 147 MB** and overtook it. That is P0c: the
+  pass now builds and writes one `<M>.live.nif` per module -- 127 resolve
+  subsets held at once -- instead of a single whole-program file. It bought
+  126 dceEmit re-runs on an edit (progress.md P0c) and it cost 63 MB in the
+  one process that does it.
+
+That is the whole of the "+30 MB even when everything spawns": it is not
+spread over the tools, it is `hexer dl`, and it is a known trade rather than a
+leak. The cheap follow-up, if the 147 MB ever matters, is streaming the live
+sets out per module instead of holding all of them.
+
+
+5. self.editbody -- unchanged, as required
+------------------------------------------
+
+uptime 10:48, load 5.20 / 6.48 / 6.53. Five rounds each.
+
+| B side                         | wall  | cpu   | peak rss | B/A cpu |
+|--------------------------------|-------|-------|----------|---------|
+| M1 off (== the tip)            | 1.539 | 1.554 | 112 MB   | 0.361   |
+| M1 on, default budget          | 1.593 | 1.618 | 112 MB   | 0.354   |
+
+Identical in memory and inside the noise in wall (the A control moved 2.986 ->
+3.260 between the two blocks; the B/A ratio is the comparison, and M1 is on
+the good side of it). Three explicit budgets measured earlier in a quieter
+window -- off / 204 MB / 128 MB -- gave 1.206 / 1.217 / 1.218 s and 112 MB
+throughout.
+
+The reason the edit loop cannot be disturbed is worth stating: its 112 MB peak
+is a CHILD's (the link), and the driver in an edit-rebuild never gets near
+128 MB. The gate has nothing to bind on.
+
+
+6. --stats with the new column, default scheduler, forced self-compilation
+--------------------------------------------------------------------------
+
+    [stats] 127 modules, 62639 LOC, 2347248 bytes
+    [stats] phase       samples   produce ms   spawn ms  ser+parse ms  write ms       bytes    peak MB
+    [stats] arkham          127          0.0       34.4           0.0       0.0           0        0.0
+    [stats] cc                7          0.0      110.2           0.0       0.0           0        0.0
+    [stats] dceEmit         129          0.5       17.2           3.6       0.3    25412328       28.2
+    [stats] dceLive           1        446.9        0.0          12.3      41.2      508152      146.7
+    [stats] hexer           135         22.3       15.2           3.6       0.7    53758117       65.3
+    [stats] lengc             7          0.4        9.3           0.5       0.2      224169        3.0
+    [stats] link              2          0.0      577.7           0.0       0.0           0        0.0
+    [stats] nifler          331          0.6        7.9           0.0       0.2     4761046        6.4
+    [stats] nimsem          131         27.1       21.8           1.7       1.7    29216903      66.5*
+    [stats] driver peak 66.8 MB, largest child 146.8 MB
+
+`*` marks a DRIVER peak: `nimsem` has only ever run inside this process here,
+so 66.5 MB is the driver's high-water mark while it did, not nimsem's own
+footprint (which the spawn-always table above puts at 54.5 MB). The two are
+different measurements and the table says which is which rather than mixing
+them.
+
+The rule at work is visible in the two numbers at the bottom: the driver
+stopped at 66.8 MB and `dceLive`, whose measured 146.7 MB cannot fit under a
+128 MB budget however empty the driver is, spawned -- `spawn ms 0.0` in this
+run is the ledger's memory of an earlier in-process run, not a claim that it
+did not spawn.
+
+Note that this holds with NO ledger at all: `self.cold` deletes the nimcache
+every round, so `dceLive` estimates at its 64 MB default table entry and the
+rule still declines once the driver has passed 64 MB doing nimsem and hexer
+work -- which is exactly where the driver stops in the table above.
+
+
+7. NIMONY_PROFILE_NODES=1
+-------------------------
+
+    [node] inproc nimsem sysvq0asl 0.0771 ready=1 rss=+15.3MB peak=19.9MB
+    [node] inproc nimsem assy765wm 0.0021 ready=5 rss=+0.4MB peak=20.4MB
+    [node] spawn  nifler paro2y9bh 0.0052 ready=165 childpeak=6.4MB
+
+`rss=+N` is the growth of the driver's peak across the node -- what running it
+here cost this process. `childpeak` is `RUSAGE_CHILDREN`'s running high-water
+mark: one syscall, and honestly named, because it is the largest child so far
+and not this one's own peak.
+
+
+8. Overhead of the measurement itself
+-------------------------------------
+
+One `getrusage` per tool run (in `PhaseTimer.finish`, beside the fragment write
+that was already there) and one per depth in the driver. Below the noise floor
+of every scenario above; the `self.cold` cpu difference between M1 on and off
+is the scheduler's fan-out, not the syscall.
