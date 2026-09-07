@@ -11,6 +11,9 @@
 #   hello.forced     hello world, `-f` on a warm nimcache (frontend + backend graphs)
 #   hello.nochange   hello world, nothing changed (nifmake mtime walk only)
 #   hello.edit       hello world, one appended statement, rebuild + relink
+#   hello.nrun       same edit, `nimony n -r`: rebuild, relink, exec the image
+#   hello.run        same edit, `nimony r`: rebuild and run from memory, no
+#                    image written and no linker run (JIT_IMPL.md B1)
 #   ctfe.cold        tests/nimony/consteval/tmyops.nim (5 consts) on a fresh nimcache
 #   ctfe.warm        same, nothing changed
 #   ctfe.edit        same, one appended statement: nimsem re-runs, every const memo-hit
@@ -26,8 +29,20 @@
 #   self.nochange    same, nothing changed
 #   self.editbody    same, a PRIVATE proc appended to src/nimony/sem.nim: the module's
 #                    interface is unchanged, so importers need not re-sem
+#   self.nrun        same body edit, `nimony n -r ... --version`: rebuild,
+#                    relink the whole image, exec it, print the version
+#   self.run         same body edit, `nimony r ... --version`: rebuild and run
+#                    the compiler out of the compiler's own memory. The pair
+#                    self.nrun/self.run is what B1 is measured by; until B3's
+#                    per-module code cache lands the whole-image assemble
+#                    dominates both, so the difference is only the image write,
+#                    the ad-hoc codesign and the exec
 #   self.edit        same, an EXPORTED proc appended: every importer re-sems
 #   self.forced      same, `-f`
+#
+# `*.run` is native by definition (`nimony r` IS the native backend), so those
+# two rows ignore BACKEND and are skipped entirely on a toolchain that has no
+# `r` command -- which is how the fork-point base is told apart from the head.
 #
 # Usage: bench/devloop_bench.sh <toolchain-root> [label] [runs]
 #   <toolchain-root> is a checkout with bin/ and lib/ (nimony finds lib/ next
@@ -110,6 +125,15 @@ measure hello.forced   "$runs" ":" "$nimony" $backend $extra -f --silentMake --n
 measure hello.nochange "$runs" ":" "$nimony" $backend $extra --silentMake --nimcache:"$hc" "$hello"
 measure hello.edit     "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" $backend $extra --silentMake --nimcache:"$hc" "$hello"
 
+# B1: the same edit, run two ways. `hasRun` is what keeps the fork-point
+# toolchain (which has no `r`) from reporting a row of failures.
+hasRun=0
+if "$nimony" r --help >/dev/null 2>&1; then hasRun=1; fi
+if [ "$hasRun" = "1" ]; then
+  measure hello.nrun "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" n $extra -r --silentMake --nimcache:"$hc" "$hello"
+  measure hello.run  "$runs" "printf 'echo \"edit\"\n' >> $hello" "$nimony" r $extra --silentMake --nimcache:"$hc" "$hello"
+fi
+
 # ---- CTFE: tmyops (5 consts) ------------------------------------------------
 ctfe="$work/tmyops.nim"
 cp "$here/tests/nimony/consteval/tmyops.nim" "$ctfe"
@@ -156,6 +180,17 @@ if [ -d "$selfsrc" ]; then
   measure self.cold     "$runs" "rm -rf $selfc" sh -c "cd $selfdir && $selfcmd"
   measure self.nochange "$runs" ":"              sh -c "cd $selfdir && $selfcmd"
   measure self.editbody "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
+  if [ "$hasRun" = "1" ]; then
+    # The pair the phase is judged on: the SAME body edit, then the compiler
+    # asked to print its version -- once through the linked image and once out
+    # of the compiler's own memory. `nimony r` writes no executable, so it gets
+    # no `--out`; the nimcache is shared on purpose, because the `.asm.nif`
+    # files both paths consume are the same files.
+    selfnrun="$nimony n $extra -r --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim --version"
+    selfrun="$nimony r $extra --silentMake --nimcache:$selfc src/nimony/nimony.nim --version"
+    measure self.nrun "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfnrun"
+    measure self.run  "$runs" "printf '\nproc devloopBenchBody(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfrun"
+  fi
   measure self.edit     "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
   measure self.forced   "$runs" ":"              sh -c "cd $selfdir && $selfcmd -f"
 else
