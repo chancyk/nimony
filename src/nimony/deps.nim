@@ -1400,6 +1400,33 @@ proc scanLiveFile(liveFile, mainSuffix: string): LiveScan =
     result.perModule[q.substr(1, q.len-2)] = joined
   result.ok = true
 
+proc xNifDigest(dir, xfile, modname: string): string =
+  ## The digest of a module's `.x.nif`, memoized beside the cache.
+  ##
+  ## It has to be a digest and not a stamp: the entry NAME is what makes the
+  ## cache shareable, and two nimcaches must agree on it or an artifact
+  ## comparison between them (`tests/nifcache`) sees the same file under two
+  ## names. But `system.x.nif` is 1.1 MB and hashing it costs more than the
+  ## `dceEmit` this cache exists to avoid -- so the digest is computed once per
+  ## nimcache and remembered in a `<modname>.xdig` sidecar under the mtime it
+  ## was computed for. The sidecar is not a `.nif`, so it is not an artifact.
+  let sidecar = dir / modname & ".xdig"
+  let stamp = $getLastModTime(xfile)
+  if vfsExists(sidecar):
+    try:
+      let t = vfsRead(sidecar)
+      let nl = t.find('\n')
+      if nl > 0 and t.substr(0, nl-1) == stamp:
+        return t.substr(nl+1)
+    except:
+      discard
+  result = ""
+  try:
+    result = computeChecksum(vfsRead(xfile))
+    vfsWrite(sidecar, stamp & "\n" & result)
+  except:
+    result = ""
+
 proc fillCNifCache(c: var DepContext; backend: string) =
   ## Between the `fpLive` and `fpAnalysis` graphs: give every non-main module a
   ## content-addressed `.c.nif` path, and where the cache already holds one,
@@ -1428,17 +1455,14 @@ proc fillCNifCache(c: var DepContext; backend: string) =
   for i in 1 ..< c.nodes.len:
     let f = c.nodes[i].files[0]
     let xfile = c.config.hexedFile(f)
-    # The `.x.nif` is identified by size and mtime rather than digested:
-    # `system.x.nif` alone is 1.1 MB and hashing it would cost more than the
-    # `dceEmit` this is here to avoid. Within one nimcache that is exactly as
-    # sound as `fillObjectCache`'s tool stamps -- a file is only rewritten by
-    # the `hexer` node above, which changes its mtime.
     if not vfsExists(xfile): continue
+    let xdig = xNifDigest(dir, xfile, f.modname)
+    if xdig.len == 0: continue
     var key = common
     key.add "x "
-    key.add xfile
+    key.add f.modname
     key.add " "
-    key.add $getLastModTime(xfile)
+    key.add xdig
     key.add "\n"
     key.add "live "
     key.add scan.perModule.getOrDefault(f.modname, "")
