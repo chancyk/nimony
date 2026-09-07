@@ -283,3 +283,39 @@ Phases:
    `cc` = 2, and the program prints the new value;
 4. a no-op rebuild after each: `total` = 0 on both graphs (the perpetual-
    staleness check from section 1).
+
+---
+
+## 6. What was built, and where it deviated from section 4
+
+Shipped as planned, with three things worth writing down.
+
+**`dceLive` now often does not run at all.** Sorting `.dce.nif` was listed as a
+bonus; on the self-compilation it is the difference between `dceLive=1` and
+`dceLive=0` for a body-only edit, because the appended private proc adds
+nothing to `roots`/`uses`/`offers` and the analysis file comes out byte-
+identical. The liveness phase is not woken, so the per-module files are not
+even compared.
+
+**The per-module resolve subset is correct in practice, not just in
+argument.** All 127 `.c.nif` files of a cold self-compilation are byte-
+identical to the ones the pre-change toolchain produces. That is the check
+section 4 asked for; `resolveKeysOf`'s coverage argument stands, but this is
+what makes it safe to rely on.
+
+**`lengc` still re-runs for the importer.** A body-only edit gives
+`dceEmit=1` and `cc=1` but `lengc=2`: `deps.addInlineSourceInputs` makes an
+importer's codegen depend on the callee's `.c.nif` (nim-lang/nimony#1897), so
+the importer's `lengc` re-runs -- and writes identical bytes, which is why `cc`
+stays at 1. `incrementalLiveTests` therefore asserts `lengc >= 1` rather than
+an exact count.
+
+### Residual, not fixed here
+
+A module whose `.x.nif` moved but whose `.c.nif` did not (an edit that is
+entirely dead code) leaves its `dceEmit` node perpetually stale: the node's
+only output is written `OnlyIfChanged`, so it keeps an mtime older than the
+input that woke it. That is the same shape as the bug section 1 describes,
+one node wide instead of 126, and it predates this phase. Fixing it needs a
+second, always-written output on `dceEmit` -- a stamp per module -- which is
+127 more files for a case that costs 44 ms.
