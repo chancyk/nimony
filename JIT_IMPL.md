@@ -697,6 +697,16 @@ module is the per-module re-check. Declaration-level incremental sem is
 outside JIT.md's "no new compiler technology" scope and is the only lever
 left for it.
 
+Status: measured twice, built neither time. The second attempt (after F1,
+branch `jit/b3b`, `notes/b3b.md` §10-15) found that the gate's own benchmark
+no longer exercises arkham or the linker at all, and that hexer's module-wide
+temp counters make the splice unsound in BOTH directions along the module.
+The ordered prerequisite is now step 3 of `notes/b3b.md` §14 — scope
+`Pass.nextTemp` and `intramodinliner`'s counter per top-level declaration —
+and nothing in this phase pays before it. The gate should also be restated on
+an edit that survives DCE: `self.editbody` appends a private, never-called
+proc, so its measured arkham + link cost is 0.000 s.
+
 ## Phase F1 — declaration-stable frontend output (B3b's prerequisites)
 
 Decision (project owner, 2026-09-07): do the prerequisites. This is the first
@@ -845,6 +855,6 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3c | merged (nativenif `jit/b3c`, pin c3f27fc: `core/declhead.nim` reads a foreign proc's signature without its body; warm compiler link 0.27 -> 0.086 s, `sem.nim`-edited 0.43 -> 0.28 s; byte-identical; headline 2.78 -> 1.26 s wall) | nativenif c3f27fc |
 | small items | merged (`findTool` never resolves via cwd/PATH, `dag.resolveProgram` for external programs; in-process nodes overlap the fan-out (measured neutral: depths are homogeneous); no-change floor 74 -> 35 ms) | merged from jit/small-items |
 | F1 | merged (locals `` x.N`routine`0 ``: one dot, so every `symparser` scanner still classifies them local; module-wide uniqueness kept for `hexer_context.hoistedConsts`; `src/hexer/decldigest.nim` + `<mod>.decls.nif` line-info-blind digests and `rebaseLineInfo`; appended proc changes 1/0 declarations instead of 465/464; `self.editbody` 2.71 -> 0.77 s; artifacts +31 % bytes, cold +3 % cpu; 21 goldens renamed. Follow-ups: diagnostics should print the base identifier, not the namespaced spelling; `derefs`/`controlflow` counters) | merged from jit/f1 |
-| B3b | running: declaration-level incremental hexer (module-wide tables per declaration, inline dependency map, full re-lowering fallback), proc-scoped labels/rodata in arkham, per-symbol blob validity in nifasm; gate hexer + arkham ≤ 0.1 s on the sem.nim edit | |
+| B3b (2nd attempt, after F1) | measured, NOT built again (`notes/b3b.md` §10-15, `bench/results/2026-09-07/b3b.txt`): on this tip `self.editbody` costs arkham 0.000 s and link 0.000 s — its appended proc is private and dead, so `dce` deletes it and the backend graph is up to date — so the gate reads "hexer ≤ 0.1 s from 0.27 s", and hexer's floor is 112 ms with zero declarations lowered. The splice is also unsound: F1's sidecar reports 1 changed sem-input declaration and **890 of 1794 changed lowering-output** declarations for an edit that mints one extra temp (`Pass.nextTemp`, `InlinerCtx.counter`), and an edit to the LAST declaration renumbers the FIRST — so §2's "prefix theorem" is false for the pipeline. arkham's own drift is 28 of 1949 (F1 removed the rest); nifasm reports stale 18, not 540, but records 627 fragments where 467 changed. New prerequisite, ahead of all three steps: scope hexer's counters per declaration, F1's move one level down. Landed: `passes.StageTimer` (the 14-stage breakdown of `expand`, byte-neutral over 381 artifacts) and a fourth `decl-stability` phase asserting the lowering-output digest, which nothing had ever checked | jit/b3b |
 | M1 | merged (`LedgerSample.rssBytes` from `getrusage` at `PhaseTimer.finish`, spawned samples preferred over driver peaks; `--stats` `peak MB` column + driver/largest-child line; scheduler declines in-process work when `driverPeak + max(node rss) > budget`, budget `clamp(physmem/(32*cores), 128 MB, 1 GB)`, `--inproc-mem-budget`; cold self-compilation largest process 218 -> 147 MB at no wall cost; the 147 vs 116 is `dceLive` 84 -> 147 MB from P0c's per-module resolve subsets -- streaming them out is the follow-up) | merged from jit/m1 |
 | B4, B5 | planned | |

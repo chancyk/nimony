@@ -18,7 +18,7 @@ include ".." / lib / compat2
 import ".." / lib / [symparser, intrinsics]
 import ".." / models / tags
 import ".." / nimony / [nimony_model, programs, typenav, expreval, xints, decls, builtintypes, sizeof, typeprops, langmodes, typekeys, nifconfig]
-import hexer_context, pipeline, dce1, lifter, hexerio, decldigest
+import hexer_context, pipeline, dce1, lifter, hexerio, decldigest, passes
 import  ".." / lib / [stringtrees, ledger]
 
 proc skipExportMarker(c: var EContext; n: var Cursor) =
@@ -2868,7 +2868,9 @@ proc loadExpandInput*(infile, outdir: string; bits: int;
                        typeCache: createTypeCache(bits),
                        liftingCtx: createLiftingCtx(mp.name, bits))
   var owningBuf = createTokenBuf(300)
+  var st = startStages(mp.name)
   discard setupProgram(infile, infile.changeModuleExt ".x.nif", owningBuf, true)
+  st.note "loadParse"
   t.noteParse()
   result.buf = ensureMove owningBuf
 
@@ -2905,12 +2907,15 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
   # The sem-input half of the `<mod>.decls.nif` sidecar, taken BEFORE the
   # passes consume the buffer. Blind to line info by construction: it hashes
   # the token stream, and a `Cursor` steps over the `LineInfoLit` suffix.
+  var st = startStages(modName)
   var inputDigests = DeclHashes()
   digestToplevel(readonlyCursorAt(input.buf, 0), inputDigests)
+  st.note "digestInput"
 
   var c0 = beginRead(input.buf)
   let cBits = c.bits
   var dest = transform(c, c0, modName, cBits)
+  st.note "transform"
 
   var n = beginRead(dest)
   let rootInfo = n.info
@@ -2949,19 +2954,26 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
     genMainProc(c, cdest, rootInfo, isWindows)
 
   # the module's close was consumed by `trToplevel`
+  # Everything since `transform`: `trToplevel` itself plus `initDynlib`,
+  # `genInitProc`, the `c.pending`/`c.initBody` appends and `genMainProc`.
+  st.note "trToplevel+genInit"
   var outputBuf = makeOutput(c, cdest, rootInfo)
+  st.note "makeOutput"
   optimizeLengOutput(outputBuf, c.main, c.bits)
+  st.restart          # `optimizeLengOutput` logged its own three stages
   c.typeCache.closeScope()
 
   # Analyse the buffer we just built rather than re-reading the file we are
   # about to write, exactly as the pre-A2a code did.
   var outputDigests = DeclHashes()
   digestToplevel(readonlyCursorAt(outputBuf, 0), outputDigests)
+  st.note "digestOutput"
 
   result = ExpandResult(x: createTokenBuf(0),
                         dce: analyzeModule(beginRead(outputBuf)),
                         decls: merge(inputDigests, outputDigests),
                         modName: c.main, dir: c.dir)
+  st.note "analyzeModule"
   result.x = ensureMove outputBuf
 
 proc xnifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".x.nif"
@@ -2972,13 +2984,18 @@ proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer;
                         s: var HexerStatus) =
   ## The `write` half of the path-based `expand`: render the `.x.nif`, publish
   ## it, then publish the `.dce.nif` analysis beside it.
+  var st = startStages(r.modName)
   let destfileName = xnifPath(r)
   let content = serializeModule(r.x, destfileName)
   t.noteSerialize()
+  st.note "serialize"
   writeSerialized(content, destfileName, OnlyIfChanged, s)
+  st.note "writeX"
   if not s.failed:
     writeAnalysis(dcenifPath(r), r.dce, "." & r.modName)
+    st.note "writeDce"
     writeDeclDigests(declsnifPath(r), r.decls, "." & r.modName)
+    st.note "writeDecls"
   t.noteWrite()
 
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];

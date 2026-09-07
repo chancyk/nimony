@@ -148,6 +148,16 @@ proc optimizeLengOutput*(buf: var TokenBuf; moduleSuffix: string; bits: int) =
   ## Optimizations over the generated Lengc tree. These run after `lengcgen`
   ## has emitted the final Lengc module, so they never see pre-Leng constructs
   ## such as try/finally.
+  ##
+  ## The last two are whole-module by construction and that is why they are
+  ## timed apart: `annotateFunctionSummaries` is a least fixpoint over the
+  ## in-module call graph and `intraModuleInline` splices this module's small
+  ## procs into their same-module callers, so neither can be restricted to a
+  ## changed declaration without a dependency map (`notes/b3b.md`).
+  var st = startStages(moduleSuffix)
   runArcopt(buf, moduleSuffix, bits)
+  st.note "arcopt"
   annotateFunctionSummaries(buf)
+  st.note "funcsummary"
   intraModuleInline(moduleSuffix, buf)
+  st.note "intraModuleInline"
