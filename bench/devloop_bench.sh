@@ -21,6 +21,11 @@
 #   stdlib.forced    same, `-f`
 #   stdlib.edit      touch-edit lib/std/strutils.nim (a copy of the tree is NOT made:
 #                    the edit is appended and reverted, so run this on a clean tree)
+#   self.cold        the compiler compiling itself (src/nimony/nimony.nim, 127 modules,
+#                    debug), fresh nimcache -- the fork point's sources for BOTH toolchains
+#   self.nochange    same, nothing changed
+#   self.edit        same, one proc appended to src/nimony/sem.nim, rebuild
+#   self.forced      same, `-f`
 #
 # Usage: bench/devloop_bench.sh <toolchain-root> [label] [runs]
 #   <toolchain-root> is a checkout with bin/ and lib/ (nimony finds lib/ next
@@ -128,6 +133,26 @@ cp "$su" "$work/strutils.orig"
 measure stdlib.edit "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $su" "$nimony" c $extra --silentMake --nimcache:"$sc" "$tall"
 cp "$work/strutils.orig" "$su"
 # the trailing runs left tall's cache built against the edited strutils; leave it.
+
+# ---- the compiler compiling itself ------------------------------------------
+# The headline of JIT.md 12: the largest real program in the repository (127
+# modules), the way `hastur boot` builds it (debug here, because that is the
+# dev loop). Both toolchains compile the SAME sources -- the fork point's, copied
+# into the scratch dir -- so a source change on the branch cannot masquerade as
+# a compiler change. `self.edit` appends a proc to `sem.nim`, a mid-dependency
+# module, and rebuilds: what an edit to the compiler costs before it can be run.
+selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
+if [ -d "$selfsrc" ]; then
+  selfdir="$work/self"; mkdir -p "$selfdir"; cp -R "$selfsrc" "$selfdir/src"
+  selfc="$work/nc_self"; selfbin="$work/self_nimony"
+  selfcmd="$nimony c $extra --silentMake --nimcache:$selfc --out:$selfbin src/nimony/nimony.nim"
+  measure self.cold     "$runs" "rm -rf $selfc" sh -c "cd $selfdir && $selfcmd"
+  measure self.nochange "$runs" ":"              sh -c "cd $selfdir && $selfcmd"
+  measure self.edit     "$runs" "printf '\nproc devloopBenchMarker*(): int = 1\n' >> $selfdir/src/nimony/sem.nim" sh -c "cd $selfdir && $selfcmd"
+  measure self.forced   "$runs" ":"              sh -c "cd $selfdir && $selfcmd -f"
+else
+  echo "self.*: skipped, no fork-point sources at $selfsrc (SELF_SRC=<dir> to point elsewhere)"
+fi
 
 echo
 echo "label: $label   toolchain: $root   runs: $runs (median)   NIMONY_VFS=$NIMONY_VFS   EXTRA=$extra"
