@@ -1498,13 +1498,15 @@ proc incrementalDeclStabilityTests*() =
   # (d) one statement inserted into the LAST proc that mints an extra hexer
   # temp. `s.len == 99 and acc > 0` is an `and`, which `xelim` lowers to a
   # bool temp -- one more `\`x.<n>` than before. The edit goes into `step10`,
-  # the last proc of the fixture, on purpose: the counter it moves is threaded
-  # ACROSS the eleven passes of `pipeline.transform` and `lowerExprs` runs
-  # three times over the whole module, so the temps `step1` receives on the
-  # SECOND run depend on how many the FIRST run minted in `step10`. An edit at
-  # the end therefore renumbers the beginning, and `notes/b3b.md` section 2's
-  # "prefix theorem" -- unchanged declarations 1..k keep an identical output
-  # prefix -- is false for the pipeline even though it holds for one pass.
+  # the last proc of the fixture, on purpose: the counter it moves used to be
+  # threaded ACROSS the eleven passes of `pipeline.transform`, and `lowerExprs`
+  # runs over the whole module more than once, so the temps `step1` received on
+  # the SECOND run depended on how many the FIRST run had minted in `step10`.
+  # An edit at the end renumbered the beginning, which is why `notes/b3b.md`
+  # section 2's "prefix theorem" -- unchanged declarations 1..k keep an
+  # identical output prefix -- was false for the pipeline even though it holds
+  # for one pass. F2 made the counters per declaration, so this phase is now
+  # the regression that keeps them that way.
   inc phases
   writeFile(lib, editOnce(originalLib, "  let s = \"b3b step ten\"\n",
     "  let s = \"b3b step ten\"\n  if s.len == 99 and acc > 0: acc = acc + 1\n",
@@ -1519,23 +1521,18 @@ proc incrementalDeclStabilityTests*() =
          "tempadd: " & $dTempIn & " declarations changed by the .decls.nif " &
          "sem-input digest (expected exactly 1); F1's per-routine local " &
          "numbering regressed"
-  # hexer's side is NOT, and this is the number B3b's step 1 would have to
-  # splice on. It is the whole module today. The bound is a ceiling that
-  # catches a regression; scoping `Pass.nextTemp` and `InlinerCtx.counter` per
-  # declaration takes it to 1 and the ceiling should then be tightened.
-  expect dTempOut > dTempIn,
-         "tempadd: the lowering-output digest changed " & $dTempOut &
-         " declarations and the sem-input digest " & $dTempIn &
-         "; if hexer's counters were scoped per declaration this test has " &
-         "served its purpose -- tighten the bound below to 1 and delete this"
-  # 11 of 23 on this fixture (every `stepN` plus `total`). A ceiling, so a
-  # change that makes hexer's numbering MORE position-dependent fails here.
-  # 18 on the merged fixture (F1's follow-ups added guard*/loop*/total after
-  # `step10`, all renumbered by the edit); F2 tightens this to 1.
-  expect dTempOut <= 18,
+  # hexer's side is now declaration-local too: F2 scoped every counter that
+  # names a synthesized symbol to the enclosing top-level declaration, in F1's
+  # spelling (`\`x.3\`step10\`0`). This edit mints one extra bool temp inside
+  # `step10` and nothing outside it may move -- not the declarations below it,
+  # and (the case `notes/b3b.md` section 11 found and section 2's "prefix
+  # theorem" got wrong) not the declarations ABOVE it either. It read 11 of 23
+  # before F2.
+  expect dTempOut == 1,
          "tempadd: " & $dTempOut & " of " & $dBase.len & " declarations " &
-         "changed by the .decls.nif lowering-output digest (expected at most " &
-         "11); hexer's lowering became more position-dependent, not less"
+         "changed by the .decls.nif lowering-output digest (expected exactly " &
+         "1); hexer's lowering became position-dependent again -- some " &
+         "counter that names a temp is not scoped to its declaration"
 
   restoreSources()
   build("restore")

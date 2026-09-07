@@ -91,7 +91,6 @@ type
     env: CurrentEnv
 
   Context = object
-    counter: int
     typeCache: TypeCache
     thisModuleSuffix: string
     procStack: seq[SymId]
@@ -114,7 +113,8 @@ type
     envFieldType: Table[SymId, Cursor] ## env FIELD sym -> captured local's type
       ## (typenav cannot type `(envp ...)` nodes, so `genCall` resolves a
       ## capture-rewritten callee's type through this instead — field syms
-      ## are counter-minted per module, so this table is safely module-wide)
+      ## carry the lifting root's namespace, so this table is safely
+      ## module-wide)
     coroCtx: coro_transform.Context
       ## Shadow `coro_transform.Context` used to drive `.closure` iter
       ## state-machine generation. We loan our `typeCache` to it via
@@ -219,8 +219,12 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let decl = n
   copyInto dest, n:
     let symId = n.symId
+    let outerNs = c.coroCtx.namer.ns
     if c.procStack.len == 0:
       c.currentProc = ProcContext()   # fresh per lifting root
+      # Env fields and temps are numbered inside the lifting ROOT, which is
+      # the top-level declaration the whole nest belongs to.
+      c.coroCtx.namer.ns = localNamespaceOf(symId)
     c.procStack.add(symId)
     if c.procStack.len > 1:
       c.nestedProcs.incl symId
@@ -248,6 +252,7 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
     if c.procStack.len == 0:
       propagateEnvNeed c
       c.procEnvs[symId] = move c.currentProc   # hand the root's state to pass 2
+    c.coroCtx.namer.ns = outerNs
   c.typeCache.closeScope()
 
 proc trIterDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
@@ -266,8 +271,10 @@ proc trIterDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let decl = n
   copyInto dest, n:
     let symId = n.symId
+    let outerNs = c.coroCtx.namer.ns
     if c.procStack.len == 0:
       c.currentProc = ProcContext()   # fresh per lifting root
+      c.coroCtx.namer.ns = localNamespaceOf(symId)
     else:
       c.escapes.incl c.procStack[0]
     c.procStack.add(symId)
@@ -296,6 +303,7 @@ proc trIterDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
     if c.procStack.len == 0:
       propagateEnvNeed c
       c.procEnvs[symId] = move c.currentProc
+    c.coroCtx.namer.ns = outerNs
   c.typeCache.closeScope()
 
 proc envTypeForProc(c: var Context; procId: SymId): SymId =
@@ -308,12 +316,8 @@ proc localToField(c: var Context; n: Cursor; local, typ: SymId; isCursor = false
   else:
     var name = pool.syms[local]
     extractBasename name
-    name.add "`f."
-    name.add $c.counter
-    inc c.counter
-    name.add "."
-    name.add c.thisModuleSuffix
-    result = pool.syms.getOrIncl(name)
+    name.add "`f"
+    result = c.coroCtx.namer.freshGlobalSym(name, c.thisModuleSuffix)
     let localTyp = c.typeCache.getType(n)
     c.currentProc.localToEnv[(typ, local)] = EnvField(objType: typ, field: result, typ: localTyp, isCursor: isCursor)
     c.envFieldType[result] = localTyp
@@ -635,8 +639,7 @@ proc emitIterValue(c: var Context; dest: var TokenBuf; iterSym: SymId; info: Nif
         pool.syms[iterSym] & " at " & infoToStr(info)
   var frameSym = SymId(0)
   if captures:
-    frameSym = pool.syms.getOrIncl("`iterFrame." & $c.counter & "." & c.thisModuleSuffix)
-    inc c.counter
+    frameSym = c.coroCtx.namer.freshGlobalSym("`iterFrame", c.thisModuleSuffix)
     dest.addParLe ExprX, info
     dest.addParLe StmtsS, info
     dest.copyIntoKind VarS, info:
@@ -899,8 +902,7 @@ proc trClosureCoroFor(c: var Context; dest: var TokenBuf; n: var Cursor) =
       # with no way to reach our environment; so bind a proper iter
       # value here — env and all — and drive the loop through that,
       # exactly as for an iter value that arrived from somewhere else.
-      let valSym = pool.syms.getOrIncl("`iterVal." & $c.counter & "." & c.thisModuleSuffix)
-      inc c.counter
+      let valSym = c.coroCtx.namer.freshGlobalSym("`iterVal", c.thisModuleSuffix)
       valInfoForEnv = n.info
       dest.copyIntoKind LetS, valInfoForEnv:
         dest.addSymDef valSym, valInfoForEnv
@@ -957,8 +959,7 @@ proc trClosureCoroFor(c: var Context; dest: var TokenBuf; n: var Cursor) =
     # env-slot ref (so `caller.env != nil` → wrapper reuse branch).
     # For direct iter-sym calls the callerCont is the Stop sentinel
     # (`caller.env == nil` → wrapper fresh-frame branch).
-    let itSym = pool.syms.getOrIncl("`coroIt." & $c.counter & "." & c.thisModuleSuffix)
-    inc c.counter
+    let itSym = c.coroCtx.namer.freshGlobalSym("`coroIt", c.thisModuleSuffix)
     c.typeCache.registerLocal(itSym, VarY, default(Cursor))
     dest.copyIntoKind VarS, info:
       dest.addSymDef itSym, info
@@ -1007,8 +1008,7 @@ proc trClosureCoroFor(c: var Context; dest: var TokenBuf; n: var Cursor) =
     # `emitWhileEnd`. The body walk uses `tre` (capture-rewriting), as
     # opposed to cps's `tr` (passive-state-machine emission); that's the
     # only behavioural difference between the two corofor expansions.
-    let myEnvSym = pool.syms.getOrIncl("`coroEnv." & $c.counter & "." & c.thisModuleSuffix)
-    inc c.counter
+    let myEnvSym = c.coroCtx.namer.freshGlobalSym("`coroEnv", c.thisModuleSuffix)
     c.typeCache.registerLocal(myEnvSym, LetY, default(Cursor))
 
     coro_transform.emitWhileBegin(dest, info, itSym, myEnvSym)
@@ -1254,8 +1254,10 @@ proc treProc(c: var Context; dest: var TokenBuf; n: var Cursor): SymId =
   copyInto dest, n:
     var isConcrete = true # assume it is concrete
     let sym = n.symId
+    let outerNs = c.coroCtx.namer.ns
     if c.procStack.len == 0:
       c.currentProc = c.procEnvs.getOrDefault(sym)   # pass 1's state for this root
+      c.coroCtx.namer.ns = localNamespaceOf(sym)
     c.procStack.add(sym)
     let closureOwner = c.procStack[0]
     let needsHeap = c.escapes.contains(closureOwner)
@@ -1279,6 +1281,7 @@ proc treProc(c: var Context; dest: var TokenBuf; n: var Cursor): SymId =
     else:
       takeTree dest, n
     discard c.procStack.pop()
+    c.coroCtx.namer.ns = outerNs
   c.typeCache.closeScope()
 
 proc treProcLift(c: var Context; dest: var TokenBuf; n: var Cursor) =
@@ -1496,8 +1499,7 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
         else:
           dest.addParLe(ExprX, info)
         copyIntoKind dest, StmtsS, info:
-          tmp = pool.syms.getOrIncl("`llTemp." & $c.counter)
-          inc c.counter
+          tmp = c.coroCtx.namer.freshSym("`llTemp")
           copyIntoKind dest, VarS, info:
             dest.addSymDef tmp, info
             dest.addDotToken() # no export marker
@@ -1878,16 +1880,19 @@ proc genObjectTypes(c: var Context; dest: var TokenBuf) =
 
 proc elimLambdas*(pass: var Pass) =
   var n = pass.n  # Extract cursor locally
-  var c = Context(counter: 0, typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix)
+  var c = Context(typeCache: createTypeCache(pass.bits), thisModuleSuffix: pass.moduleSuffix)
   c.coroCtx = coro_transform.Context(
     thisModuleSuffix: pass.moduleSuffix,
     typeCache: createTypeCache(pass.bits),   # placeholder; swapped with c.typeCache per call
     coroTypes: createTokenBuf(10),
     continuationProcImpl: coro_transform.generateContinuationProcImpl(),
     hooks: lambdaHooks(),
-    nextTemp: pass.nextTemp,        # nested Final-IR runs continue the xelim counter
     ptrSize: pass.bits div 8
   )
+  # One `TempNamer` for this pass and the coroutine transform it drives: the
+  # nested Final-IR runs continue the xelim counters, and both halves number
+  # inside the same lifting root.
+  swap(c.coroCtx.namer, pass.namer)
   c.typeCache.openScope()
   tr c, pass.dest, n
   c.typeCache.closeScope()
@@ -1926,7 +1931,7 @@ proc elimLambdas*(pass: var Pass) =
       pass.dest.add c.coroCtx.coroTypes
       pass.dest.add stmtsBuf
       pass.dest.addParRi(n2.endInfo)
-    pass.nextTemp = c.coroCtx.nextTemp
     c.typeCache.closeScope()
+  swap(c.coroCtx.namer, pass.namer)
 
   #echo "PRODUCED ", toString(pass.dest, false)

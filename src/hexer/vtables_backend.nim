@@ -40,7 +40,7 @@ type
     params: Cursor  # the routine's `(params …)` node
 
   Context* = object
-    tmpCounter: int
+    namer: TempNamer
     typeCache: TypeCache
     needsXelim: bool
     moduleSuffix: string
@@ -74,7 +74,10 @@ proc trProcDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
       let symId = r.name.symId
       if isLocalDecl(symId):
         c.typeCache.registerLocal(symId, r.kind, decl)
+      let outerNs = c.namer.ns
+      c.namer.ns = localNamespaceOf(symId)
       tr c, dest, n
+      c.namer.ns = outerNs
     else:
       takeTree dest, n
   c.typeCache.closeScope()
@@ -110,8 +113,7 @@ proc evalOnce(c: var Context; dest: var TokenBuf; n: var Cursor): TempLoc =
 
   dest.addParLe(ExprX, info) # will be closed with closeTemp
   copyIntoKind dest, StmtsS, info:
-    let symId = pool.syms.getOrIncl("`vtableTemp." & $c.tmpCounter)
-    inc c.tmpCounter
+    let symId = c.namer.freshSym("`vtableTemp")
 
     copyIntoKind dest, VarS, info:
       addSymDef dest, symId, info
@@ -421,8 +423,7 @@ proc trInstanceofImpl(c: var Context; dest: var TokenBuf; x, typ: Cursor; info: 
   # `v of T` is translated into a logical 'and' expression:
   # let vtab = v.vtab
   # (level < len(vtab.display)) and (vtab.display[level] == hash(T))
-  let vtabTempSym = pool.syms.getOrIncl("`vtableTemp." & $c.tmpCounter)
-  inc c.tmpCounter
+  let vtabTempSym = c.namer.freshSym("`vtableTemp")
 
   var xt = getType(c.typeCache, x)
   let xk = xt.typeKind
@@ -524,8 +525,7 @@ proc needsTemp(c: var Context; n: Cursor): MaybeTemp =
   if n.kind == Symbol:
     result = MaybeTemp(kind: UsesSelf, sym: n.symId)
   else:
-    let symId = pool.syms.getOrIncl("`vtableTemp." & $c.tmpCounter)
-    inc c.tmpCounter
+    let symId = c.namer.freshSym("`vtableTemp")
     let kind = if constructsValue(n): UsesTempVal else: UsesTempPtr
     result = MaybeTemp(kind: kind, sym: symId)
 
@@ -893,6 +893,7 @@ proc transformVTables*(pass: var Pass; needsXelim: var bool) =
     needsXelim: needsXelim,
     getRttiSym: pool.syms.getOrIncl("getRtti.0." & SystemModuleSuffix)
   )
+  swap(c.namer, pass.namer)
   c.typeCache.openScope()
 
   var n2 = n
@@ -909,4 +910,5 @@ proc transformVTables*(pass: var Pass; needsXelim: var bool) =
   pass.dest.addParRi()
 
   c.typeCache.closeScope()
+  swap(c.namer, pass.namer)
   needsXelim = c.needsXelim

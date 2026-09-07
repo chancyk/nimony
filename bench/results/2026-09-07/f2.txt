@@ -1,0 +1,205 @@
+Phase F2 -- declaration-stable lowering output, measured on the B3b tip
+======================================================================
+
+Machine: macOS 26.6.2 / Apple M5 (10 cores), Nim 2.2.10.
+Toolchain: worktree branch `jit/f2`, forked from `fast-devloop` at d233ddf8
+(everything through F1 and B3b's instrument).  nativenif from the pinned clone
+/Users/chanc/Projects/nativenif, UNMODIFIED.
+NIMONY_NATIVENIF=/Users/chanc/Projects/nativenif, XDG_CACHE_HOME=/tmp/f2_cache_*.
+
+"before" is a toolchain built from this branch's PARENT commit (`git archive
+HEAD~1`, /tmp/f2_before), so both sides are the same machine, the same Nim and
+the same nativenif pin and only src/hexer differs.
+
+Sources under measurement: a copy of /tmp/devloop_base/src (the fork-point
+compiler, 127 modules), built with
+  nimony n --silentMake --nimcache:<nc> --out:<exe> src/nimony/nimony.nim
+i.e. the nimcache and the executable both outside the source tree.
+
+The edit ("grow", `notes/b3b.md` section 0): one statement inserted into
+`semStmt`'s body in src/nimony/sem.nim,
+
+  sed -i '' '/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; \
+              n: var Cursor; isNewScope: bool) =$/a\
+    if isNewScope: discard 1
+  ' src/nimony/sem.nim
+
+
+1. The gate: declaration churn on F1's `<mod>.decls.nif` sidecar
+----------------------------------------------------------------
+
+One line-info-blind digest per named top-level declaration, for the sem INPUT
+and for the lowering OUTPUT; counted over the symbols present in both builds.
+
+                            sem-input        lowering-output
+  before F2                 1 of 1785        890 of 1785
+  after  F2                 1 of 1785          3 of 1785
+
+(`notes/b3b.md` section 11 recorded 1 / 890 of 1794 for the same edit on the
+F1 tip; re-measured here against this branch's own parent it is 890 of 1785,
+i.e. the same number.  The gate asks for <= 3.)
+
+The three that change after F2:
+
+  semStmt.1.                 -- the edited proc itself
+  processBodyStatements.0.   -- `intraModuleInline` splices semStmt into it
+  semStmtCallback.0.         --   ditto
+
+That is a real dependency (a changed callee's body IS copied into its caller),
+not drift.  Modelling it is `notes/b3b.md` section 14's step 6.
+
+
+2. `decl-stability` on the 13-proc fixture (tests/incremental/b3b_lib.nim)
+--------------------------------------------------------------------------
+
+  before: ... | sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/11
+  after:  ... | sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/1
+
+The fourth number is the `tempadd` phase: an `and` added to `step10`, the LAST
+declaration of the module.  Before F2 it renamed temps in 11 of the module's
+23 lowering-output declarations INCLUDING `step1`, the first
+(`(var :\`x.0` -> `(var :\`x.1`).  The phase's bound is tightened from
+`<= 11` (with a "must be worse than the input churn" assertion whose purpose
+was to fail loudly the moment the counters got scoped -- it did) to `== 1`.
+
+
+3. Byte churn of the same edit, and why it does not move as far
+---------------------------------------------------------------
+
+The same three artifacts split TEXTUALLY into the children of their root
+`(stmts ...)` -- the method of `notes/b3b.md` section 3, which keeps line info:
+
+  artifact     before          after
+  .x.nif       1148 of 1753    525 of 1753
+  .c.nif        632 of  974    452 of  974
+  .asm.nif      460 of  975    434 of  975
+
+These are dominated by something F2 does not own: an inserted LINE renumbers
+every `@...` below it in the file, so every declaration after the edit point
+differs textually whatever its symbols are called.  That is why F1 built a
+line-info-blind digest, and why section 1's 3 -- not this table's 525 -- is
+the number a declaration-level splice consults.
+
+`.asm.nif` moves least because arkham names its own temps from the ABSOLUTE
+TOKEN POSITION in its input (`aggtmp<pos>`, `nctmp<pos>`, `botmp<pos>`, ...),
+so any size change upstream renames them.  That is section 14's step 5 and it
+lives in nativenif, not here.
+
+
+4. nifasm's blob cache on the same edit (NIFASM_PROFILE=1)
+----------------------------------------------------------
+
+  before:  blobHits 3415   blobStale 18   blobRecorded 627
+  after:   blobHits 3415   blobStale 18   blobRecorded 627
+
+Identical, and that is the expected result rather than a disappointment.
+`blobcache.sameSource` validates a fragment against its MODULE's `.asm.nif`
+stamp, so sem's file changing at all still drops every fragment whose symbol
+lives in sem, and every fragment elsewhere that references one.  F2 changes
+how MUCH of that file changes, not how the check is made.  `notes/b3b.md`
+section 12 priced per-symbol validity at 627 -> ~467 before this phase and
+~2 after it; this is the measurement that says the second half of that is now
+available, i.e. step 4 is worth ~180 ms of a 1.28 s loop instead of ~55 ms.
+
+
+5. Determinism (P0c)
+--------------------
+
+The 127-module compiler built twice into two fresh nimcaches from identical
+sources, with the F2 toolchain:
+
+  compared 381 artifacts, 0 differ
+
+(127 each of `.x.nif`, `.dce.nif`, `.decls.nif`.)
+
+
+6. Cost
+-------
+
+  sem's .x.nif      6.29 MB -> 8.05 MB   (+28.0 %)
+  sem's .decls.nif   429 kB ->  430 kB   (+0.3 % -- digests, not names)
+
+Every temporary now carries its owning declaration's name.  F1 paid +30.6 % on
+`.x.nif` for the same reason one level up; this is the same bill again, and
+`notes/f1.md` section 3's argument that there is no shorter encoding which is
+also stable applies verbatim.
+
+
+7. Bootstraps
+-------------
+
+  hastur boot --boot-backend:native   SUCCESS, stages 1 == 2 == 3, total 46.60s
+  hastur boot (C)                     SUCCESS, stages 2 == 3, total 67.60s
+
+(`stage 0 and 1 differ` / `stage 1 and 2 differ` are bin0's host-Nim build vs
+the self-hosted ones; the fixpoint is what the tool checks and it holds.)
+
+
+8. Test suites
+--------------
+
+  hastur --overwrite tests/nimony   794 / 794 in 559.77s, ZERO golden changed
+  hastur tests/incremental          1 / 1 in 43.20s (all VFS/spawn modes)
+  hastur tests/inproc               3 / 3 in 28.39s
+  hastur tests/ctfe_diff            1 / 1 in 110.75s, 0 difference(s)
+  hastur tests/nifcache             1 / 1 in 3.98s
+  hastur tests/nimony_r             1 / 1 in 14.22s
+  hastur tests/nativecg             1 / 1 (arm64 golden ADDED; it did not exist)
+  hastur tests/hexer                pre-existing failure, identical before F2:
+                                    "cannot open: tests/hexer/sysvq0asl.s.nif"
+
+
+9. A/B, bench/devloop_ab.sh
+---------------------------
+
+A = /tmp/devloop_base (fork point f69b8afc), B = this branch.  Interleaved
+A B A B ...  Native backend.
+
+self.editbody, 5 rounds, load 8.6 -> 6.6:
+
+  round 0  A  wall 2.558  cpu 3.787  rss 116MB
+  round 0  B  wall 0.742  cpu 0.730  rss  98MB
+  round 1  A  wall 2.568  cpu 3.784  rss 116MB
+  round 1  B  wall 0.732  cpu 0.724  rss  98MB
+  round 2  A  wall 2.560  cpu 3.778  rss 116MB
+  round 2  B  wall 0.733  cpu 0.729  rss  98MB
+  round 3  A  wall 2.558  cpu 3.769  rss 116MB
+  round 3  B  wall 0.741  cpu 0.733  rss  98MB
+  round 4  A  wall 2.579  cpu 3.767  rss 116MB
+  round 4  B  wall 0.734  cpu 0.722  rss  98MB
+  A wall median 2.560  min 2.558 | cpu median 3.778  min 3.767 | peak rss 116 MB
+  B wall median 0.734  min 0.732 | cpu median 0.729  min 0.722 | peak rss  98 MB
+  B/A cpu (median): 0.193   B/A cpu (min): 0.192   B/A peak rss: 0.84
+
+`notes/b3b.md` section 15 recorded 2.704 -> 0.700 s wall / 3.897 -> 0.692 s cpu
+for the same pair at the B3b tip, so F2 is at the noise floor on this scenario
+-- which is the expected answer: `self.editbody` appends a PRIVATE, never
+called proc, `dce` deletes it, and neither arkham nor the linker runs at all
+(section 10 of that note).  This phase is a correctness prerequisite, not a
+speed-up; what it buys is measured in section 1.
+
+self.cold, 3 rounds, load 6.6 -> 5.4:
+
+  round 0  A  wall 5.262  cpu 13.547  rss 116MB
+  round 0  B  wall 5.220  cpu 13.317  rss 147MB
+  round 1  A  wall 5.324  cpu 13.806  rss 116MB
+  round 1  B  wall 5.231  cpu 13.509  rss 147MB
+  round 2  A  wall 5.357  cpu 13.971  rss 116MB
+  round 2  B  wall 5.273  cpu 13.687  rss 147MB
+  A wall median 5.324  min 5.262 | cpu median 13.806  min 13.547 | peak rss 116 MB
+  B wall median 5.231  min 5.220 | cpu median 13.509  min 13.317 | peak rss 147 MB
+  B/A cpu (median): 0.978   B/A cpu (min): 0.983   B/A peak rss: 1.27
+
+Cold cpu is 2 % BETTER, i.e. within noise: the longer symbol names cost bytes
+in the artifacts and nothing measurable in time.  The +27 % peak RSS is A2b's,
+not this phase's (`notes/b3b.md` section 15 recorded 116 -> 218 MB for the
+same pair before F2; the number here is lower because the machine's scheduler
+made a different spawn decision under a lighter load, and RSS is the largest
+single process of the build).
+
+
+10. What was NOT changed
+------------------------
+
+nativenif is untouched at its pin.  No `src/nimony/**`, `src/lib/**`,
+`src/nifmake/**` or `JIT*.md` file was modified.

@@ -48,7 +48,7 @@ type
     lifter: ref LiftingCtx
     flags: set[ContextFlag]
     typeCache: TypeCache
-    tmpCounter: int
+    namer: TempNamer
     resultSym: SymId
     retType: Cursor
       ## Return type of the routine being translated, as its signature already
@@ -360,8 +360,7 @@ proc evalLeftHandSide(c: var Context; le: var Cursor): TokenBuf =
   else:
     let typ = getType(c.typeCache, le)
     let info = le.info
-    let tmp = pool.syms.getOrIncl("`lhs." & $c.tmpCounter)
-    inc c.tmpCounter
+    let tmp = c.namer.freshSym("`lhs")
     # The decl is a plain statement and must precede whatever the right hand
     # side hoists in front of this assignment: an RHS that moves out of a
     # location the target's address expression still has to read (a closure
@@ -414,8 +413,7 @@ proc callDestroy(c: var Context; destroyProc: SymId; arg: SymId; info: NifLineIn
 proc tempOfTrArg(c: var Context; n: Cursor; typ: Cursor): SymId =
   var n = n
   let info = n.info
-  result = pool.syms.getOrIncl("`lhs." & $c.tmpCounter)
-  inc c.tmpCounter
+  result = c.namer.freshSym("`lhs")
   copyIntoKind c.dest, CursorS, info:
     addSymDef c.dest, result, info
     c.dest.addEmpty2 info # export marker, pragma
@@ -845,6 +843,7 @@ proc trProcDecl(c: var Context; n: var Cursor; parentNodestroy = false) =
   let oldResultSym = c.resultSym
   let oldFlags = c.flags
   let oldRetType = c.retType
+  let outerNs = c.namer.ns
   c.resultSym = NoSymId
   c.flags = {}
   let decl = n
@@ -852,6 +851,8 @@ proc trProcDecl(c: var Context; n: var Cursor; parentNodestroy = false) =
   let symId = r.name.symId
   if isLocalDecl(symId):
     c.typeCache.registerLocal(symId, r.kind, decl)
+  # Every temp this pass injects into the body is numbered inside the routine.
+  c.namer.ns = localNamespaceOf(symId)
   if hasPragmaOfValue(r.pragmas, ReportP, "lastuse"):
     c.flags.incl ReportLastUse
   if hasPragma(r.pragmas, RaisesP):
@@ -880,6 +881,7 @@ proc trProcDecl(c: var Context; n: var Cursor; parentNodestroy = false) =
   c.resultSym = oldResultSym
   c.flags = oldFlags
   c.retType = oldRetType
+  c.namer.ns = outerNs
 
 proc hasDestructor(c: Context; typ: Cursor): bool {.inline.} =
   # `isTrivial(c.lifter[], typ)` consults `c.lifter[].op`, which floats
@@ -909,8 +911,7 @@ proc bindToTemp(c: var Context; typ: Cursor; info: NifLineInfo; kind = VarS): Ow
   ## check and payload assignment) into `c.hoisted`, replacing it in the
   ## expression by a bare use of the temp. No `(expr (stmts ...) tmp)` is ever
   ## built, so nothing downstream has to flatten one back out.
-  let s = pool.syms.getOrIncl("`tmp." & $c.tmpCounter)
-  inc c.tmpCounter
+  let s = c.namer.freshSym("`tmp")
 
   result = OwningTemp(active: true, s: s, info: info, pos: c.dest.len)
 
@@ -1331,8 +1332,7 @@ proc bindPendingMoves(c: var Context; start: int; typ: Cursor; info: NifLineInfo
   ## moves run once the expression has read everything it needs. The temp is a
   ## `cursor` for the same reason `genLastRead`'s is: whatever consumes this
   ## expression is the rightful owner of the value.
-  let tmp = pool.syms.getOrIncl("`tmp." & $c.tmpCounter)
-  inc c.tmpCounter
+  let tmp = c.namer.freshSym("`tmp")
   var wrapped = createTokenBuf(64)
   copyIntoKind wrapped, ExprX, info:
     copyIntoKind wrapped, StmtsS, info:
@@ -1594,6 +1594,7 @@ proc injectDups*(pass: var Pass; lifter: ref LiftingCtx) =
   var c = Context(lifter: lifter, typeCache: createTypeCache(pass.bits),
     dest: move(pass.dest), source: addr pass.buf, moduleSuffix: pass.moduleSuffix,
     hoisted: createTokenBuf(16), mover: MoverContext(bits: pass.bits))
+  swap(c.namer, pass.namer)
   c.typeCache.openScope()
   tr(c, n, WantNonOwner)
   genMissingHooks lifter[]
@@ -1605,4 +1606,5 @@ proc injectDups*(pass: var Pass; lifter: ref LiftingCtx) =
   if errorCount > 0:
     quit 1
 
+  swap(c.namer, pass.namer)
   pass.dest = ensureMove(c.dest)
