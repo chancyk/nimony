@@ -160,6 +160,12 @@ proc artifactSnapshot(cache: string): Table[string, string] =
       if rel.startsWith(".ledger") or rel.contains(DirSep & ".ledger" & DirSep) or
           rel.endsWith("ledger.nif"):
         continue
+      # The engine's `asmcache/` is content-addressed over the main module's
+      # `.c.nif`, which carries the absolute path of its `.out.nif`, so two
+      # nimcaches name the same arkham output differently. The `.out.nif`
+      # results themselves are compared, and `tests/ctfe_diff` compares them
+      # across modes byte for byte.
+      if rel.startsWith("asmcache" & DirSep): continue
       result[rel] = readFile(path)
 
 proc compileUnder(mode, cache, src: string; output: var string): bool =
