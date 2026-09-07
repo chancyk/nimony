@@ -16,10 +16,10 @@ this file supersedes as it is filled in).
 |---|---|---|---|---|
 | 1 | `4aa797d5` | sem: `import` is not a shadowing boundary (#2479) | `merge/u1` | merged |
 | 2 | `c6db98b6` | sem: sum type constructor over a `ref object` produces the `ref` (#2481) | `merge/u2` | merged |
-| 3 | `b7c7daa6` | newest nativenif (#2478) — pin `d0781a48` -> `e201a816` | `merge/u3` | pending |
+| 3 | `b7c7daa6` | newest nativenif (#2478) — pin `d0781a48` -> `e201a816` | `merge/u3` | merged, pin taken is **`3ec73fef`**, not upstream's `e201a816` (see §3) |
 | 4 | `c6be04e1` | no globals in nifcore (#2482) | `merge/u4` | pending |
 | 5 | `38f67463` | std/http: thread the tag space instead of keeping one per process (#2484) | `merge/u5` | pending |
-| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending |
+| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending; `f9af5b24` does not exist in `nim-lang/nativenif` (it is `2c30a9ef` rebased away), so step 6 pins **`83ced299`** (`jit/upstream-master`) |
 
 Plus a parallel track in `../nativenif`: rebase our `jit/b1 .. jit/b3e-native`
 chain (fork point `d0781a48`) onto upstream nativenif master, which steps 3
@@ -368,3 +368,418 @@ pass (log lines 3428-3433, 3439-3440). Nothing was skipped.
 type constructor produces; it touches no lookup, lowering or scheduling path,
 and `decl-stability`'s digest counts are unchanged, so there is nothing to
 suggest the loop moved. Step 1's ratio measurement stands.
+
+## 3. `b7c7daa6` — newest nativenif
+
+**What upstream changed.** One line: `src/nativenif.commit`, `d0781a48
+2026-09-05` -> `e201a816 2026-09-06`, i.e. four new nativenif commits.
+
+**How it collided with us.** The only conflict in the chain so far, and an
+unavoidable one: the pin is a single line and both sides rewrote it. Ours read
+`5f6f011e 2026-09-07` (B3e's tip of the `jit/b1 .. jit/b3e-native` chain,
+which forked from `d0781a48`); upstream's reads `e201a816 2026-09-06`.
+
+```
+<<<<<<< HEAD
+5f6f011e2885bd88d9bd75244937a22432aa38a9 2026-09-07
+=======
+e201a8161f803defe128fa783c52fcda27b83ebe 2026-09-06
+>>>>>>> b7c7daa6
+```
+
+**What we did.** Resolved to **neither side**: the file now reads
+
+```
+3ec73fef7bcf335f1077d0de67c574ddbd7e71ac 2026-09-07
+```
+
+`3ec73fef` is the tip of `jit/upstream-e201a816` in
+`/Users/chanc/Projects/nativenif` — our entire 32-commit B1 -> B3e chain
+replayed onto upstream's `e201a816` by the parallel nativenif agent (its
+write-up is the "nativenif track" section at the end of this file). Taking
+either side of the conflict would have been wrong in a way a green test run
+would not have caught:
+
+- upstream's `e201a816` is upstream's chain WITHOUT ours, so `bin/arkham` and
+  `bin/nifasm` would lose B1 (nativenif as a library), B3/B3c (the blob cache
+  and `declhead`), B3d (per-declaration asm digests) and B3e (the splice) —
+  the compiler would still build and still pass, three times slower on the
+  edit loop, with no test naming the loss;
+- our `5f6f011e` does not contain upstream's four new commits, which is the
+  entire content of this bump.
+
+Verified as ancestry, not by reading the branch name: `git merge-base
+--is-ancestor e201a816 3ec73fef` and `... d0781a48 3ec73fef` both succeed,
+`git rev-list --count e201a816..3ec73fef` is `32`, and `5f6f011e` is NOT an
+ancestor of `3ec73fef` (it was rebased, not merged, which is why the old pin
+disappears rather than being reachable).
+
+The format is byte-checked against the previous pin: 40 hex, one space,
+`YYYY-MM-DD`, one `\n` (`od -c` on both).
+
+**Was anything of ours made redundant?** No. The rebase preserved all 32
+commits; nothing was dropped as redundant against upstream's four.
+
+**Was anything of ours broken?** Not on this pin. The nativenif agent reports
+that four of 2592 fixtures failed during the rebase and were fixed in
+nativenif `82ca1f38` — but that fix is on `jit/upstream-master` and is
+deliberately NOT on `3ec73fef`, because it is not needed there: the cause is
+the nifsyms refactor turning on split-symbol mode on a module's SHARED reader,
+so a module read once through `getDecl` left its reader split and B3c's
+hand-copied `readDeclHead` walked out of a tree it had already opened. That
+refactor is not in `e201a816`. **It is waiting at step 6**, and step 6 is
+where the compensating fix arrives with it.
+
+**Evidence.** Worktree `/tmp/merge-u1`, branch `merge/u3`,
+`XDG_CACHE_HOME=/tmp/cache-u1`,
+`NIMONY_NATIVENIF=/Users/chanc/Projects/nativenif`. The sibling checkout was
+put on the new pin by hand — `git switch jit/upstream-e201a816`, a local
+branch whose tip IS `3ec73fef`, so `syncNativenif` returns on `head == pin`
+and `build all` prints no `[deps]` line. That was necessary, not incidental:
+`syncNativenif` refuses to check a pin out over a checkout that sits on a
+BRANCH (it warns and builds what is there), so leaving it on `jit/b3e-native`
+would have silently built the OLD assembler under the NEW pin. Nothing was
+pushed and no remote was added, in either repository.
+
+```
+$ nim c -r src/hastur/hastur build all                    → exit 0, no [deps] warning
+
+$ bin/hastur test tests/incremental
+incremental-live (--spawn:always): 5 / 5 phases successful in 1.49s.
+decl-stability: .s.nif 32 decls | in-place changed 1 | insert changed 11 (blind 1, added 2) | stmtadd changed 12 (blind 1) | decls digest 52 syms, sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/1 | .x.nif in-place changed 1
+decl-stability: 4 / 4 phases successful in 0.87s.
+SUCCESS.
+
+$ bin/hastur tests/inproc            → 3 / 3 tests successful in 27.72s. SUCCESS.
+$ bin/hastur test tests/ctfe_diff    → ctfediff: 19 file(s), 50 artifact(s), 79 .s.nif, 0 difference(s)
+$ bin/hastur test tests/nifcache     → nifcache: all checks passed
+$ bin/hastur test tests/nimony_r     → nimony_r: all checks passed
+                                       (incl. "a cached link and a scratch link produce byte-identical
+                                        executables" and "the compiler itself runs from memory")
+$ bin/hastur test tests/ctfe_engine  → ctfe_engine: all checks passed
+$ bin/hastur test tests/ledger       → [ledger] all ledger tests passed
+
+$ bin/hastur tests/nimony
+795 / 795 tests successful in 142.41s.
+SUCCESS.
+
+$ bin/hastur boot --boot-backend:native
+[boot] stages 0 and 1 differ.
+[boot] stages 1 and 2 are byte-identical.
+[boot] stages 2 and 3 are byte-identical.
+[boot] total 48.34s.
+SUCCESS.
+```
+
+The splice counts, which are what says the new assembler still lowers per
+proc. The fork-point sources in `/tmp/u3-self/src`, built cold, then
+`devloop_bench.sh`'s `self.editbody` edit (`if isNewScope: discard 1` into
+`semStmt`) and rebuilt with `ARKHAM_CACHE_STATS=1`:
+
+```
+[arkham cache] spliced 8 lowered 1 stale 1        <- the main module
+[arkham cache] spliced 76 lowered 2 stale 2       <- the largest neighbour
+[arkham cache] spliced 523 lowered 3 stale 3      <- sem.nim
+0.85s user 0.10s system 101% cpu 0.935 total
+```
+
+Identical to `bench/results/2026-09-07/b3e.txt`'s record, line for line —
+1, 2 and 3 procs re-lowered, 523 of `sem.nim`'s 526 spliced.
+
+**Numbers.** Taken, because a new assembler is exactly the kind of change that
+moves the loop:
+
+```
+$ bench/devloop_ab.sh /tmp/devloop_base . self.editbody 5
+self.editbody: A wall median 2.276  min 2.252 | cpu median 3.533  min 3.516 | peak rss 117 MB
+self.editbody: B wall median 0.904  min 0.894 | cpu median 0.921  min 0.912 | peak rss 107 MB
+B/A cpu (median): 0.261   B/A cpu (min): 0.259   B/A peak rss: 0.91
+```
+
+cpu-sum first: B 0.921 s against the recorded 0.94, A 3.533 against the
+recorded 3.56 — both sides land on their logged values, so the machine was
+quiet for this run and these are absolute numbers, not just a ratio. The new
+assembler did not move the loop; if anything it is a hair faster. This also
+settles the caveat in §1: that run's inflated absolutes (A cpu 5.18, B 1.23)
+were machine load, exactly as recorded there, and the headline **0.92 s wall /
+0.94 s cpu stands and needs no re-taking**.
+
+
+## nativenif track
+
+Two of upstream's six commits are `src/nativenif.commit` bumps, and neither can
+land until our nativenif branch chain sits on top of upstream's new nativenif
+master. This section is that rebase. Nothing in it was committed to this repo;
+the work is in `/Users/chanc/Projects/nativenif` on two new branches.
+
+**The two pins this merge needs**
+
+| nimony step | commit | pins | take instead |
+|---|---|---|---|
+| 3 | `b7c7daa6` "newest nativenif" (#2478) | `d0781a48` → `e201a816` | `jit/upstream-e201a816` = **`3ec73fef`** |
+| 6 | `e1da48e9` "nifsyms refactor" (#2483) | `e201a816` → `f9af5b24` | `jit/upstream-master` = **`83ced299`** |
+
+Both branches exist in the nativenif checkout and are unpushed. The main
+checkout is back on `jit/b3e-native` where it was found.
+
+### Our chain as it was
+
+32 commits, linear, from the merge-base `d0781a48` to `jit/b3e-native`
+(`5f6f011e`): `jit/b1` 13, `jit/b2-fix` 1, `jit/b3` 7, `jit/b3-fixes` 0 (it
+points at the same commit as `jit/b3`; `notes/handoff.md` lists it as a seventh
+segment, but it carries nothing of its own), `jit/b3c` 4, `jit/b3d-native` 2,
+`jit/b3e-native` 5. 114 files, +7354/-464.
+
+### Upstream's drift is four commits, not three
+
+`b6cb8d0e` "ithaqua: a C-linkage gvar pair must share one linear-memory slot"
+(#162) sits below `3061c29b` and was jumped over by nimony's own pin, which is
+why the handoff names only three. In order:
+
+* `b6cb8d0e` — wasm32 only, one linear-memory slot per C-linkage gvar pair.
+  Does not touch arkham or nifasm.
+* `3061c29b` — "better death point analysis" (#163). A local whose last use is
+  inside a call's argument list may keep a volatile register: new
+  `DiesAtCall`/`RetRegOk` properties. Changes emitted machine code on every
+  native target.
+* `e201a816` — the bug #163 left behind: `releaseStaleName(RAX)` was missing on
+  the FLOAT call path. One line plus a fixture.
+* `2c30a9ef` — "the role goes in the identifier" (#165). Two things: the
+  syscall/extern wrapper asm names become `` write`sys.0.<mod> `` /
+  `` write`c.0.<mod> ``, and `pool.syms[id]` / `pool.syms.getOrIncl` become
+  `symString` / `symId` throughout arkham and nifasm.
+
+### `f9af5b24` is `2c30a9ef`
+
+`f9af5b24` is genuinely not in the nativenif object database — not as an object
+(`git cat-file --batch-all-objects` over all 29,583 objects has no such
+prefix), not on any ref, not in any reflog. The evidence that `2c30a9ef` is what
+it became is mechanical, not circumstantial:
+
+1. **Only `2c30a9ef` can satisfy a pin set by `e1da48e9`.** `e1da48e9` is the
+   commit that *introduces* `symString` (`src/lib/nifcore.nim`, +380 lines).
+   `2c30a9ef` is the only nativenif commit in existence that *calls* it — and
+   it does not merely call it, it requires it. Upstream nativenif master will
+   not build against a pre-refactor nimony at all:
+
+       src/arkham/core/programs.nim(897, 14) Error: undeclared identifier: 'symString'
+
+   A pin set by `e1da48e9` must name a nativenif commit that needs
+   post-refactor nimony. No other commit in the repository does.
+2. **`2c30a9ef` says so.** `core/typeutil.nim`'s new comment: "`symString`
+   builds the spelling from the pool's taken-apart form (nimony#2457)".
+3. **Timing and shape.** `e1da48e9` is authored 2026-09-07 23:36:55 +0200,
+   `2c30a9ef` 23:42:40 +0200 — six minutes apart, same author, single-parented
+   onto `e201a816` (exactly where `f9af5b24` had to sit), committer
+   `GitHub <noreply@github.com>` with `AuthorDate == CommitDate`: the signature
+   of a squash- or rebase-merge minting a new object for content that already
+   existed on a PR branch.
+
+`f9af5b24` was the pre-merge tip of nativenif PR #165, pinned by nimony while
+both PRs were in flight; GitHub rewrote it into `2c30a9ef` on merge and the PR
+branch went away before this mirror fetched it. This also fixes the order of
+the two pins: `e201a816` builds against nimony either side of the refactor,
+`2c30a9ef` only after it — so step 3's pin and step 6's pin must land with
+their nimony halves and not before.
+
+### `2c30a9ef` does not collide with B3d/B3e
+
+This was expected to be the hard one, since B3d/B3e name labels and temps per
+proc so an unchanged proc assembles byte-identically. It is not the same
+ground. `2c30a9ef` renames **C-linkage wrapper symbols** — the asm name of a
+syscall syproc and of a libc extproc, in `core/programs.nim`. B3d's `7b838ec3`
+renames `` `L<n> ``, `` `aggtmp<n> `` and `` `nctmp<n> `` — arkham-minted
+per-proc labels and constructor temps, in `avr/gen.nim`, `core/context.nim`,
+`risc/{driver,value}.nim` and `x64/{driver,mem,value}.nim`, none of which
+`2c30a9ef` opens. **Nothing of ours became redundant against it, and nothing of
+ours had to move.**
+
+### Conflicts
+
+`git rebase` raised **none**. `git range-diff` reports all 32 commits replayed
+identically onto `e201a816`, and identically again onto `2c30a9ef`. That is
+also the trap: the one real conflict is semantic and git could not see it.
+
+**`core/declhead.nim` (B3c, `ff8e7404`) against the nifsyms refactor.**
+`declhead.nim` is a hand copy of `nifcoreparse.parse`'s token dispatch with one
+extra rule, so a `(proc …)` head is read without its body. The refactor changed
+what `parse` dispatches over: in the reader's new split-symbol mode a `Symbol`
+token carries only `<name>` and one `ExtendedSuffix` follows per remaining
+component. `parse` turns that mode on for every read it does, and the mode
+belongs to the module's **shared** reader — so a module read once through
+`getDecl` leaves its reader split, and the next head parse on it meets a token
+the copied loop has no case for, breaks out of a tree it has already opened,
+and hands `beginRead` a buffer with unclosed tags:
+
+```
+nifasm/{x64,arm64,linux_arm64,cortex_m}/const_rodata_reloc_foreign
+  EXIT:1  `b.openTags.len == 0` beginRead with unclosed tags
+```
+
+Four artifacts of 2592 and three listings that stopped being produced — the
+four fixtures that resolve a foreign symbol both ways inside one link. It is
+order-dependent, which is why it is four and not all of them.
+
+*Resolution* (upstream's semantics win, ours re-applied): the head is read with
+split mode off and the reader is put back as it was found, through the reader's
+own exported `splitSymbols(r, false)`. `parse` consumes the components in
+`addSplitSymbol`, which `nifcoreparse` does not export; re-implementing it here
+would put a second copy of the pool's interning rules under the same
+faithfulness duty the token dispatch already carries. Both paths intern the
+same symbol — `addSplitSymbol` rebuilds a spelling itself for three of its five
+shapes — and `blobcache_selftest` is what proves it rather than the argument,
+since it links every fixture with and without `--whole-decls`, the flag that
+chooses between the two readers, and requires one image out of both. **If
+nifcoreparse ever exports `addSplitSymbol`, this should become a call to it.**
+
+On `jit/upstream-master` only, as commit `82ca1f38` — the split-symbol mode
+does not exist at `e201a816`, so `jit/upstream-e201a816` is a pure replay of
+the 32 with nothing added.
+
+### The gate, verbatim
+
+`tools/refactor_gate.sh` was run on five trees, each in its own workspace with
+its own sibling `nimony` and its own `XDG_CACHE_HOME`, so that a moved artifact
+can be attributed. (nativenif's `nim.cfg` reaches nimony by the relative path
+`../../../nimony/src`, so a worktree under `/tmp` needs a `nimony` beside it;
+and `2c30a9ef` needs a **post-refactor** nimony, so the two upstream tips could
+not share one.)
+
+```
+    2583 artifacts,      774 listings -> /tmp/gate/base-d0781a48.sums    (fork point,  nimony fast-devloop 193e1577)
+    2583 artifacts,      774 listings -> /tmp/gate/base-5f6f011e.sums    (our old tip, nimony fast-devloop 193e1577)
+    2592 artifacts,      777 listings -> /tmp/gate/base-e201a816.sums    (upstream,    nimony fast-devloop 193e1577)
+    2592 artifacts,      777 listings -> /tmp/gate/reb-e201a816.sums     (jit/upstream-e201a816)
+    2592 artifacts,      777 listings -> /tmp/gate/base-2c30a9ef.sums    (upstream,    nimony e1da48e9)
+    2592 artifacts,      777 listings -> /tmp/gate/reb-master2.sums      (jit/upstream-master)
+```
+
+Upstream's own deltas, for scale: `d0781a48` → `e201a816` moves **1773**
+artifact lines (`3061c29b`'s register allocation, across every target, plus
+nine new arm64 fixtures); `e201a816` → `2c30a9ef` moves **2032** artifact lines
+and **1386** listing lines (the wrapper renaming, in every asm-NIF that names a
+libc extern). Neither is ours.
+
+Ours is the number that had to stay put, and it did — measured the same way on
+both sides of the rebase:
+
+```
+diff base-d0781a48.sums  base-5f6f011e.sums      137 artifacts, 78 listings   (pre-rebase control)
+diff base-e201a816.sums  reb-e201a816.sums       137 artifacts, 78 listings   (jit/upstream-e201a816)
+diff base-2c30a9ef.sums  reb-master2.sums        137 artifacts, 78 listings   (jit/upstream-master)
+```
+
+and all three name the **same 137 labels**:
+
+```
+  53  arkham/cortex_m/*
+  30  arkham/x64/*
+  27  arkham/linux_arm64/*
+  27  arkham/arm64/*
+   0  nifasm/*
+```
+
+That is B3d's per-proc rename and nothing else, exactly as `notes/b3d.md`
+recorded it against the `c3f27fc` baseline: arkham's asm-NIF text and the
+listings that render its names move, and **every assembled image is
+byte-identical**. The label sets are equal as sets, not just equal in count —
+`diff` of the two sorted label lists is empty.
+
+Before the `declhead.nim` fix, `jit/upstream-master` differed in 141 artifacts
+and 81 listings: the same 137 plus the four `const_rodata_reloc_foreign` images
+and the three listings that vanished with them. After it, 137 and 78.
+
+### The other gates
+
+`nim r tests/tester.nim`, both branches, exit 0, every suite `N / N`. The
+byte-identity self-tests, which are the ones that matter here:
+
+```
+235 / 235 memory-image byte-identity checks (mach-o) successful
+234 / 234 memory-image byte-identity checks (elf) successful
+235 / 235 blob-cache byte-identity checks (macho) successful (3 fixtures the assembler refuses)
+238 / 238 blob-cache byte-identity checks (elf) successful (2 fixtures the assembler refuses)
+ 87 /  87 blob-cache byte-identity checks (raw) successful (52 fixtures the assembler refuses)
+238 / 238 arkham splice byte-identity checks (arm64) successful (15 fixtures arkham refuses)
+240 / 240 arkham splice byte-identity checks (x64) successful (13 fixtures arkham refuses)
+130 / 130 arkham splice byte-identity checks (cortex_m) successful (8 fixtures arkham refuses)
+ 25 /  25 arkham splice byte-identity checks (riscv32) successful (10 fixtures arkham refuses)
+ 20 /  20 arkham splice byte-identity checks (avr) successful (0 fixtures arkham refuses)
+231 / 231 arkham tests successful (0 known-unsupported skipped)
+231 / 231 in-memory (nifrun) tests successful (0 known-unsupported skipped)
+230 / 230 arkham arm64 stress tests successful (k=3, 1 known-broken)
+228 / 228 ithaqua wasm32 emit tests successful (25 refused as expected)
+AsmError self-test: all checks passed
+hostsyms self-test: all checks passed
+foreign-decl bounds self-test: OK
+```
+
+(qemu-system-arm, qemu-system-riscv32 and `bin/avrtest` are absent on this
+machine, so the cross-target *execution* suites skip loudly, as they did for
+B3d and B3e. The emit and rejection halves of those targets do run.)
+
+### Against nimony
+
+A worktree of `fast-devloop` (`193e1577`) under `/tmp`, `NIMONY_NATIVENIF`
+pointed at the rebased checkout, `src/nativenif.commit` set to `3ec73fef`,
+private `XDG_CACHE_HOME`. `nim c -r src/hastur/hastur build all` succeeds, and:
+
+```
+ctfe_engine: all checks passed
+nimony_r:    all checks passed
+  ok   `nimony n`'s link node replays 112 cached fragment(s)
+  ok   `nimony r` warms its own half of the same directory (112 fragments)
+  ok   a cached link and a scratch link produce byte-identical executables
+  ok   the compiler itself runs from memory (--version -> 0.6.0)
+nifcache:    all checks passed
+  ok: both modes left the same 343 .nif artifacts, byte for byte
+  ok: both modes left the same 106 .nif artifacts, byte for byte
+
+hastur boot --boot-backend:native
+  [boot] stages 1 and 2 are byte-identical.
+  [boot] stages 2 and 3 are byte-identical.
+  [boot] total 86.18s.
+  SUCCESS.
+```
+
+### Splice ratios: unchanged
+
+The `self.editbody` live edit (a statement into the body of `semStmt`),
+`ARKHAM_CACHE_STATS=1`, against `jit/upstream-e201a816`:
+
+```
+[arkham cache] spliced  11 lowered 1 stale 1
+[arkham cache] spliced  82 lowered 2 stale 2
+[arkham cache] spliced 522 lowered 3 stale 3
+```
+
+`notes/b3e.md` recorded `8/9`, `76/78` and `523/526`, i.e. **1, 2 and 3**
+procs re-lowered. The three totals moved (12, 84, 525 against 9, 78, 526)
+because the compiler's own sources have moved since B3e was measured, but the
+number that B3e is *about* — how many procs an edit costs — is **1, 2 and 3,
+identical**. Upstream's register-allocation change re-lowers no proc it did not
+have to.
+
+Not yet measurable for `jit/upstream-master`: the ratio needs a nimony that has
+both our arkham-cache wiring and the nifsyms refactor, and that tree only
+exists once merge step 6 lands. Worth re-taking then; the mechanism (a
+per-proc content digest of the source declaration plus a module-wide context
+digest) has nothing in it that `2c30a9ef`'s wrapper renaming can move, but that
+is an argument, not a measurement.
+
+### What remains
+
+* **`jit/upstream-master` has not been exercised against a nimony that is both
+  post-refactor and ours.** It was gated against upstream nimony `e1da48e9`,
+  which is where the `symString` it needs comes from, but `fast-devloop` does
+  not have that refactor until step 6 merges it. After step 6, re-run
+  `hastur build all`, the four suites, `boot --boot-backend:native` and the
+  splice-ratio measurement against pin `83ced299`. The gate (137/78/0) says the
+  tools themselves are right; what is untested is the seam.
+* **`declhead.nim` should call `addSplitSymbol` once nifcoreparse exports it.**
+  The mode switch is correct and gated, but the module's own contract is to be
+  a faithful copy of `parse`'s dispatch, and a copy that asks for a different
+  reader mode is one step further from that than a copy that calls the same
+  helper.
+* Nothing is pushed. Both branches are local to
+  `/Users/chanc/Projects/nativenif`.
