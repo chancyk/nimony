@@ -813,7 +813,13 @@ machine, with one script. The rule, from 2026-09-06 on:
 - `std/rawthreads` has no `nimNoLibc` arm outside linux/x64 (B0); it keeps
   the stdlib-wide corpus off the native backend on macOS.
 - nifasm's foreign-symbol lookup is the 0.07 s left in B3's incremental
-  link (notes/b3.md): a symbol-table cache beside the fragments.
+  link (notes/b3.md): a symbol-table cache beside the fragments. Done (B3c).
+- `--threads:off` for hexer, lengc, nifler and the nimony driver: -6 % on
+  hexer over `sem.nim` (progress.md run 14); nimsem keeps threads for the
+  engine's guest thread.
+- hexer copies the module's `TokenBuf` once per pass (eleven passes;
+  `memmove` + `skip` are ~35 % of its profile). Fewer copies per pass is the
+  cache-shaped item; it is pipeline design, not a flag.
 
 ## Execution rules for agents
 

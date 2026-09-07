@@ -128,3 +128,47 @@ Two of them are new targets: `dceLive` re-runs because one module's
 edit), and hexer/arkham/link are whole-module because hexer's temp counters
 are module-wide (F2, running). The pre-correction numbers (0.71 s) remain
 valid for the dead-proc edit and are recorded above as such.
+
+## Run 14: where nimsem and hexer spend their time on sem.nim (sampling profile)
+
+`sample` (macOS) on the tool process, 5-6 runs, top-of-stack frames; the
+question was whether a hot data structure could be kept in L2.
+
+```
+nimsem, 437 samples          hexer, 316 samples
+ 18.5%  _platform_memmove     27.8%  _tlv_get_addr
+ 15.3%  _tlv_get_addr         21.5%  _platform_memmove
+ 14.6%  nifcore.skip          14.6%  (outlined)
+ 10.5%  (outlined)            11.7%  nifcore.skip
+ 10.1%  rawAlloc               5.7%  nifcore.rawLineInfo
+  5.3%  decRcAndFree           4.4%  rawAlloc
+  4.1%  hashFarm               2.2%  subtreeWidth, addTree, symId, closeTag ...
+  3.0%  programs.hasKey
+  3.0%  rawDealloc
+```
+
+Reading: neither tool is bound by a table lookup (hashing + `hasKey` are
+~7 % of nimsem, less of hexer). The time is copying token subtrees
+(`memmove`), walking them (`skip`, `rawLineInfo`, `subtreeWidth`), and the
+allocator. The token buffers themselves are the working set (sem.nim's
+`.s.nif` is 7.6 MB of text; hexer's eleven passes each rebuild the module's
+`TokenBuf`), so the cache-relevant lever is fewer copies of the tree per
+pass, not pinning a structure. `_tlv_get_addr` is macOS thread-local
+access from Nim's threaded runtime; measured, it is worth less than the
+sample share suggests:
+
+| hexer on sem.nim (cpu, 7 interleaved runs) | |
+|---|---|
+| plain (`--threads:on`, Nim's allocator) | 0.263 s |
+| `-d:useMalloc` | 0.275 s (+5 %) |
+| `--threads:off` | 0.247 s (-6 %) |
+| both | 0.261 s |
+
+(A standalone nimsem variant could not be timed in this harness -- it
+resolves one module path differently from the installed one; the hexer
+numbers stand on their own.)
+
+Conclusion: `--threads:off` for the tools that never thread (hexer, lengc,
+nifler, the nimony driver) is a 6 % item; nimsem needs threads for the
+engine's guest. The larger lever is in hexer's pipeline design (one copy of
+the module tree per pass), which is compiler work, not a cache trick.
