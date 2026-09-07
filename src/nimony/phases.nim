@@ -75,11 +75,18 @@ const
   DefaultInprocK* = 3
     ## JIT.md 6.2's `k`: how many spawn costs a phase may be worth before the
     ## fan-out is preferred to a call.
-  MinSpawnCostNs* = 1_000_000'i64
-    ## A floor under the ledger's spawn estimate. A key whose spawn average is
-    ## still 0 has never been observed rather than being free, and
-    ## `defaultSample` already says 3 ms; this guards the arithmetic against a
-    ## ledger that recorded a suspiciously fast one.
+  MinSpawnCostNs* = 3_000_000'i64
+    ## A floor under the ledger's spawn estimate, and JIT.md 6.2's own default
+    ## (`ledger.defaultSample` gives every phase `spawnNs = 3 ms`).
+    ##
+    ## It has to be a floor and not just a fallback, because of a feedback loop
+    ## this phase creates: `ledger.estimate` answers from an existing entry as
+    ## soon as there is one, a phase that runs in-process never produces a
+    ## spawn observation, and `foldSpawn` leaves such an entry's `spawnNs` at
+    ## 0. Without the floor, one in-process build would drive the threshold to
+    ## zero and the next build would send the phase back to a process — the
+    ## scheduler would oscillate on its own measurements. What a spawn costs is
+    ## a property of the machine, not of whether we last used one.
 
 type
   PhaseRunProc* = proc (argv: seq[string]): int {.nimcall.}
