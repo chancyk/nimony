@@ -50,6 +50,10 @@
 #   toolchains compile identical inputs.
 #
 # EXTRA="<flags>" adds nimony flags to every compile (e.g. EXTRA=--ctfe:engine).
+# Each row: median wall, cpu-sum of the process tree, and the peak resident
+# size of the largest process in it (rss, MB) -- the memory the pipeline
+# needs, base vs head, since an in-process pipeline concentrates work into one
+# process that used to be spread over many.
 # Prints a table on stdout; everything else goes to a scratch directory that is
 # removed on exit. Set KEEP=1 to keep it.
 
@@ -95,9 +99,14 @@ p = subprocess.run(sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOU
 t1 = time.time()
 r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
 cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+# ru_maxrss of RUSAGE_CHILDREN is the peak resident size of the LARGEST
+# waited-for descendant (bytes on macOS, KiB on Linux): what the biggest
+# process of the build needed, which is the number an in-process pipeline
+# moves. It is not a sum over concurrent processes.
+rss = r1.ru_maxrss / (1 << 20) if sys.platform == "darwin" else r1.ru_maxrss / 1024
 if p.returncode != 0:
     sys.stderr.write(p.stdout.decode(errors="replace")[-800:])
-print(f"{t1 - t0:.3f} {cpu:.3f}")
+print(f"{t1 - t0:.3f} {cpu:.3f} {rss:.0f}")
 PY
 }
 
@@ -107,19 +116,20 @@ table="$work/table.txt"
 # measure <name> <n> <setup-shell> <cmd...>: setup, then cmd, n times.
 measure() {
   name=$1; n=$2; setup=$3; shift 3
-  walls=""; cpus=""
+  walls=""; cpus=""; rsss=""
   i=0
   while [ $i -lt "$n" ]; do
     eval "$setup"
     set -- "$@"
     out=$(runone "$@") || echo "devloop_bench: $name failed" >&2
-    walls="$walls ${out%% *}"
-    cpus="$cpus ${out##* }"
+    set -- $out
+    walls="$walls $1"; cpus="$cpus $2"; rsss="$rsss $3"
     i=$((i+1))
   done
   medw=$(python3 -c "import statistics,sys; print(f'{statistics.median([float(x) for x in sys.argv[1:]]):.3f}')" $walls)
   medc=$(python3 -c "import statistics,sys; print(f'{statistics.median([float(x) for x in sys.argv[1:]]):.3f}')" $cpus)
-  printf '%-15s wall %7s  cpu %7s   raw wall:%s  cpu:%s\n' "$name" "$medw" "$medc" "$walls" "$cpus" | tee -a "$table"
+  medr=$(python3 -c "import statistics,sys; print(f'{statistics.median([float(x) for x in sys.argv[1:]]):.0f}')" $rsss)
+  printf '%-15s wall %7s  cpu %7s  rss %5sMB   raw wall:%s  cpu:%s  rss:%s\n' "$name" "$medw" "$medc" "$medr" "$walls" "$cpus" "$rsss" | tee -a "$table"
 }
 
 # ---- hello world -----------------------------------------------------------

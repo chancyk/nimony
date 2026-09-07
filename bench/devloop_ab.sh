@@ -20,7 +20,8 @@ import resource, subprocess, sys, time
 t0=time.time(); r0=resource.getrusage(resource.RUSAGE_CHILDREN)
 p=subprocess.run(sys.argv[1:],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 t1=time.time(); r1=resource.getrusage(resource.RUSAGE_CHILDREN)
-print(f"{t1-t0:.3f} {(r1.ru_utime-r0.ru_utime)+(r1.ru_stime-r0.ru_stime):.3f}")
+rss = r1.ru_maxrss/(1<<20) if sys.platform=="darwin" else r1.ru_maxrss/1024
+print(f"{t1-t0:.3f} {(r1.ru_utime-r0.ru_utime)+(r1.ru_stime-r0.ru_stime):.3f} {rss:.0f}")
 PY
 }
 
@@ -65,23 +66,24 @@ for side in A B; do
   sh -c "$(cmdfor $side $nc)" >/dev/null 2>&1
 done
 
-wa=""; ca=""; wb=""; cb=""
+wa=""; ca=""; wb=""; cb=""; ra=""; rb=""
 i=0
 while [ $i -lt "$rounds" ]; do
   for side in A B; do
     eval "t=\$$side"; nc="$work/nc_$side"
     eval "$prep"
     out=$(runone sh -c "$(cmdfor $side $nc)")
-    printf 'round %d  %s  wall %s  cpu %s\n' "$i" "$side" "${out%% *}" "${out##* }"
-    if [ $side = A ]; then wa="$wa ${out%% *}"; ca="$ca ${out##* }"; else wb="$wb ${out%% *}"; cb="$cb ${out##* }"; fi
+    set -- $out
+    printf 'round %d  %s  wall %s  cpu %s  rss %sMB\n' "$i" "$side" "$1" "$2" "$3"
+    if [ $side = A ]; then wa="$wa $1"; ca="$ca $2"; ra="$ra $3"; else wb="$wb $1"; cb="$cb $2"; rb="$rb $3"; fi
   done
   i=$((i+1))
 done
-python3 - "$scen" "$wa" "$ca" "$wb" "$cb" <<'PY'
+python3 - "$scen" "$wa" "$ca" "$ra" "$wb" "$cb" "$rb" <<'PY'
 import statistics, sys
-scen, wa, ca, wb, cb = sys.argv[1], *[[float(x) for x in s.split()] for s in sys.argv[2:]]
+scen, wa, ca, ra, wb, cb, rb = sys.argv[1], *[[float(x) for x in s.split()] for s in sys.argv[2:]]
 def s(xs): return f"median {statistics.median(xs):.3f}  min {min(xs):.3f}"
-print(f"{scen}: A wall {s(wa)} | cpu {s(ca)}")
-print(f"{scen}: B wall {s(wb)} | cpu {s(cb)}")
-print(f"B/A cpu (median): {statistics.median(cb)/statistics.median(ca):.3f}   B/A cpu (min): {min(cb)/min(ca):.3f}")
+print(f"{scen}: A wall {s(wa)} | cpu {s(ca)} | peak rss {statistics.median(ra):.0f} MB")
+print(f"{scen}: B wall {s(wb)} | cpu {s(cb)} | peak rss {statistics.median(rb):.0f} MB")
+print(f"B/A cpu (median): {statistics.median(cb)/statistics.median(ca):.3f}   B/A cpu (min): {min(cb)/min(ca):.3f}   B/A peak rss: {statistics.median(rb)/statistics.median(ra):.2f}")
 PY

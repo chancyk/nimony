@@ -42,3 +42,28 @@ an info rebase in hexer; (3) per-declaration fragments for hexer's
 module-wide tables and an intra-module inline dependency map; (4) proc-scoped
 labels/rodata in arkham. Projected floor for hexer + arkham after all four:
 ~0.24 s (36 ms of hexer is whole-module by construction; I/O 38 ms).
+
+## Run 10: memory -- peak resident size of the largest process, base vs head
+
+Both benchmark scripts now report `rss`: `ru_maxrss` of the waited-for
+process tree = the peak resident size of the LARGEST process in it (MB). An
+in-process pipeline concentrates work into one process that used to be
+spread over many, so this is the number the design's "low memory
+consumption" goal is judged by. Interleaved, 3 rounds, native backend.
+
+| scenario | base wall / cpu / peak MB | head wall / cpu / peak MB |
+|---|---|---|
+| sem.nim body edit, rebuild | 2.786 / 3.960 / 116 | 1.200 / 1.242 / 112 |
+| compiler, cold | 5.363 / 13.882 / 116 | 5.281 / 12.422 / **216** |
+| 5-const module, forced | 3.935 / 5.745 / 59 | 0.891 / 1.089 / 61 |
+| hello, forced | 0.377 / 0.528 / 18 | 0.354 / 0.492 / 26 |
+
+Where the cold build's extra 100 MB comes from (head, one process each):
+`NIMONY_SPAWN=auto` (the in-process scheduler) 215 MB; `NIMONY_SPAWN=always`
+147 MB; with the blob cache off still 215 MB. So ~68 MB is the driver
+running nimsem/hexer nodes in its own address space (the reset drops the
+pools, but the allocator's high-water mark stays and the driver's own
+dependency state is live at the same time), and ~30 MB is what the head's
+`nimony`/tools cost on top of the fork point's even when everything spawns
+(per-tool numbers below). The edit loop and CTFE are unchanged in memory:
+the engine's 256 MB arena is reserved address space, not resident pages.
