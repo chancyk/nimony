@@ -1,0 +1,233 @@
+Phase B3d -- per-symbol blob validity (nifasm) and per-proc naming (arkham)
+==========================================================================
+
+Machine: macOS 26.6.2 / Apple M5 (10 cores), Nim 2.2.10.  Load average during
+the runs 1.8-3.1 (not an idle machine; every A/B below is INTERLEAVED, and the
+per-stage tables were taken back to back with only the two tools swapped).
+
+Toolchain: worktree branch `jit/b3d`, forked from `fast-devloop` at cbf7b0ec
+(everything through F2).  nativenif from a private clone of the pin c3f27fc
+(/tmp/b3d/nativenif, branch jit/b3d-native), commits 259f7be (nifasm) and
+7b838ec (arkham).  NIMONY_NATIVENIF=/tmp/b3d/nativenif,
+XDG_CACHE_HOME=/tmp/b3d_cache.
+
+Sources under measurement: a copy of /tmp/devloop_base/src (the fork-point
+compiler, 127 modules), built with
+  nimony n --silentMake --nimcache:<out>/nc --out:<out>/self src/nimony/nimony.nim
+i.e. the nimcache and the executable both outside the source tree.
+
+The edit is bench/devloop_bench.sh's `self.editbody`: one statement inserted
+into the body of `semStmt` in `src/nimony/sem.nim`.
+
+  sem.nim artifacts on this tip:
+    .c.nif     4.64 MB    974 declarations
+    .asm.nif  10.74 MB    974 declarations (975 top-level nodes; `(arch)` is
+                          the one that is not indexed)
+  whole corpus: 127 modules, 54 MB of .asm.nif, 4042 cached fragments
+
+
+0. Per-stage table of a live-edit rebuild
+-----------------------------------------
+
+`nimony n --profile` + NIFASM_PROFILE=1, three consecutive rounds; each round
+inserts one more statement into semStmt (the same edit devloop_bench makes).
+"before" is the identical toolchain with only bin/arkham and bin/nifasm swapped
+for release builds of the pin c3f27fc.
+
+                        before (pin)              after (jit/b3d)
+                     r1     r2     r3          r1     r2     r3
+  nimsem            0.334  0.334  0.337       0.337  0.338  0.336
+  hexer             0.268  0.273  0.271       0.275  0.273  0.269
+  dceEmit           0.051  0.051  0.054       0.054  0.051  0.053
+  dceLive           0.357   --     --         0.356   --     --
+  arkham (3 inv)    0.265  0.259  0.257       0.258  0.258  0.260
+  link (nifasm)     0.320  0.311  0.326       0.123  0.125  0.124
+  --------------------------------------------------------------
+  wall              1.274  0.904  0.923       1.077  0.721  0.723
+
+  nifasm --profile TOTAL   312.5  303.5  318.2      115.6  117.3  116.0
+  blobHits                 3415   3415   3415       4024   4024   4024
+  blobStale                  18     18     18         18     18     18
+  blobRecorded              627    627    627         18     18     18
+
+dceLive runs only on the FIRST rebuild after an edit that moves a module's
+`.dce.nif` (P0c's OnlyIfChanged on <M>.live.nif); rounds 2-3 do not run it, so
+the steady-state wall is the r2/r3 column.
+
+The backend graph's critical path in the steady state is arkham -> link:
+0.258 + 0.125 = 0.383 s, which is exactly the backend wall the profile reports.
+
+
+1. Why 627 did not become 3 on its own
+--------------------------------------
+
+Declaration-level diff of the two .asm.nif corpora across the same edit.  The
+asm-NIF carries NO line information (grep -c '@' over all 54 MB is 0), so a
+declaration's raw bytes are its identity and the embedded (.index ...) gives
+the ranges.
+
+  before this branch:  semygjvq21.asm.nif: 974 decls, changed 434
+                       TOTAL: 7660 decls, changed 434  (only sem's file differs)
+
+Masking one arkham name family at a time:
+
+  mask none                       changed  434 of 974
+  mask `L<n>                      changed  255 of 974
+  mask + `aggtmp<n> / `nctmp<n>   changed    3 of 974
+
+  after the arkham commit:  semygjvq21.asm.nif: 974 decls, changed 3
+                            TOTAL: 7660 decls, changed 3
+
+The 3 are semStmt and the two procs intramodinliner splices it into -- exactly
+what notes/f2.md's sidecar reports for hexer's output.
+
+
+2. nifasm link, driven by hand over the 127 modules
+---------------------------------------------------
+
+`nifasm -o:<one path> $(cat linkmods.txt)`, --profile totals, release builds,
+the module order taken from the build graph's link node (worklist order).
+
+  link                                 pin c3f27fc     jit/b3d
+  from scratch, no cache                  891.9 ms      855.9 ms
+  cold, empty cache (records 4042)        917.6 ms      949.0 ms   (+3.4 % over scratch)
+  warm, nothing edited                     78.5 ms       78.5 ms
+  warm, sem.nim edited                    433   ms      119.4 ms
+
+  cold-link overhead breakdown (jit/b3d):
+    blobDigest    21.7 ms  (127 modules, 7660 declarations digested)
+    blobRecord    65.2 ms  (4042 fragments, 75741 references)  [pin: 29.3 ms]
+    blobWrite     26.9 ms  (127 files)                         [pin: 26.0 ms]
+
+  warm, sem.nim edited (jit/b3d):
+    blobDigest    21.7 ms  (127; only a module whose stamp moved is digested,
+                            but `record` digests every module it records into)
+    emitRoots     96.4 ms
+    TOTAL        119.4 ms
+
+  blob store size: 7.6 MB (pin) -> 8.8 MB (+16 %), for the per-reference
+  declaration digests.
+
+
+3. Byte identity of the compiler image, nine cache states
+---------------------------------------------------------
+
+All linked to ONE output path (macOS ad-hoc codesign derives the signature
+identifier from the output file's basename -- nativenif notes/b3c.md section 0).
+"before"/"after" are the two .asm.nif corpora of section 1.
+
+  before, scratch          94a2c53961d8ef63
+  before, cold populate    94a2c53961d8ef63
+  before, warm all hits    94a2c53961d8ef63
+  before, warm whole-decls 94a2c53961d8ef63
+  after,  scratch          ac8aac92f3459605
+  after,  from stale cache ac8aac92f3459605
+  after,  warm again       ac8aac92f3459605
+  before again, from mixed 94a2c53961d8ef63    <- blob holds BOTH versions
+  before, scratch again    94a2c53961d8ef63
+
+The eighth line is the new hazard: after this phase a blob file can hold
+fragments recorded from two different versions of one module, and each has to
+answer for itself.
+
+
+4. arkham's own time, and what a per-proc splice could reach
+------------------------------------------------------------
+
+A temporary probe around generateA64Buf (built, measured, reverted), arkham
+over semygjvq21.c.nif, median of two:
+
+  [arkham probe] collect 1 ms, procs 139 ms (526 procs), rest 0 ms
+  total process time: 196 ms
+
+  139 ms  per-proc emission          <- what a splice removes
+   56 ms  parse of the 4.64 MB .c.nif + serialize of the 10.74 MB .asm.nif
+    1 ms  collect (the whole-module program model)
+
+Reading back the previous .asm.nif for the 523 unchanged procs costs ~30 ms at
+loadParse's measured 333 MB/s unless the cache is stored as `bif`.  So the
+splice lands arkham near 90-110 ms, not the 50 ms the gate asks for; reaching
+50 ms needs the parse and the serialize to become incremental too.
+
+
+5. A/B against the fork point
+------------------------------
+
+bench/devloop_ab.sh /tmp/devloop_base . <scenario> <rounds>, native backend,
+arms interleaved within each round.
+
+  self.editbody, 5 rounds
+    round 0  A  wall 2.626  cpu 3.813  rss 117MB
+    round 0  B  wall 1.444  cpu 1.479  rss 147MB
+    round 1  A  wall 2.661  cpu 3.845  rss 117MB
+    round 1  B  wall 1.085  cpu 1.114  rss 107MB
+    round 2  A  wall 2.665  cpu 3.850  rss 117MB
+    round 2  B  wall 1.069  cpu 1.104  rss 107MB
+    round 3  A  wall 2.638  cpu 3.834  rss 117MB
+    round 3  B  wall 1.071  cpu 1.112  rss 107MB
+    round 4  A  wall 2.665  cpu 3.854  rss 117MB
+    round 4  B  wall 1.082  cpu 1.117  rss 107MB
+    A wall median 2.661  min 2.626 | cpu median 3.845  min 3.813 | peak rss 117 MB
+    B wall median 1.082  min 1.069 | cpu median 1.114  min 1.104 | peak rss 107 MB
+    B/A cpu (median): 0.290   B/A cpu (min): 0.290   B/A peak rss: 0.91
+
+  self.cold, 3 rounds
+    round 0  A  wall 5.269  cpu 13.654  rss 116MB
+    round 0  B  wall 5.180  cpu 13.246  rss 147MB
+    round 1  A  wall 5.278  cpu 13.607  rss 116MB
+    round 1  B  wall 5.215  cpu 13.322  rss 147MB
+    round 2  A  wall 6.446  cpu 15.147  rss 116MB
+    round 2  B  wall 5.215  cpu 13.369  rss 147MB
+    A wall median 5.278  min 5.269 | cpu median 13.654  min 13.607 | peak rss 116 MB
+    B wall median 5.215  min 5.180 | cpu median 13.322  min 13.246 | peak rss 147 MB
+    B/A cpu (median): 0.976   B/A cpu (min): 0.973   B/A peak rss: 1.27
+
+The 147 MB cold peak is M1's known dceLive figure, unchanged by this phase.
+Round 0 of self.editbody is the first edit after a cold build (dceLive runs);
+rounds 1-4 are the steady state.
+
+  Headline, live edit in sem.nim, rebuild:
+    fork point   2.661 s wall / 3.845 s cpu / 117 MB
+    after F2     1.26  s wall (previous handoff)
+    jit/b3d      1.082 s wall / 1.114 s cpu / 107 MB
+
+
+6. Tests
+--------
+
+nativenif (nim r tests/tester.nim), green:
+  234 / 234 memory-image byte-identity checks (mach-o)
+  233 / 233 memory-image byte-identity checks (elf)
+  234 / 234 blob-cache byte-identity checks (macho)
+  237 / 237 blob-cache byte-identity checks (elf)
+   87 /  87 blob-cache byte-identity checks (raw)
+  230 / 230 arkham tests
+  230 / 230 in-memory (nifrun) tests
+  229 / 229 arkham arm64 stress tests
+
+tools/refactor_gate.sh against the c3f27fc baseline (2583 artifacts, 774
+listings):
+  after the nifasm commit    diff EMPTY, both files
+  after the arkham commit    137 of 2583 artifacts, 78 of 774 listings differ;
+                             every one of them under arkham/ or listing/, no
+                             nifasm image hash changed, no fixture changed its
+                             exit code or diagnostic
+
+nimony:
+  tests/incremental          17 / 17 phases (decl-stability: lowering-output
+                             changed 1/-/1/1)
+  tests/inproc               3 / 3
+  tests/ctfe_diff            19 files, 50 artifacts, 79 .s.nif, 0 differences
+  tests/nimony_r             all checks passed (incl. "a cached link and a
+                             scratch link produce byte-identical executables")
+  tests/ctfe_engine          all checks passed, 28 .c.nif byte-identical
+  tests/nativecg             1 / 1 after regenerating the arm64 golden
+  hastur tests/nimony        794 / 794 in 146.97s
+  hastur boot --boot-backend:native
+                             stages 1 == 2 == 3, 46.99 s
+
+Golden changed (1 file):
+  tests/nativecg/tinlinecond.arm64.asm.nif -- 3 lines, `L23.0` -> `L1.0`,
+  plus the (.indexat N) offset that follows from them.
+  tests/nativecg/tinlinecond.x64.asm.nif is NOT updated: it is regenerable only
+  on x64 and was already stale before F1 (notes/f2.md section 6).
