@@ -697,6 +697,38 @@ module is the per-module re-check. Declaration-level incremental sem is
 outside JIT.md's "no new compiler technology" scope and is the only lever
 left for it.
 
+## Phase F1 — declaration-stable frontend output (B3b's prerequisites)
+
+Decision (project owner, 2026-09-07): do the prerequisites. This is the first
+phase that changes the frontend's output rules, outside JIT.md's original
+"no new compiler technology" line; the owner accepted that for the
+incremental loop's sake.
+
+Goal: an edit to one declaration of a module changes that declaration's
+`.s.nif`, `.x.nif` and `.asm.nif` output and nothing else's, so B3b's
+declaration-level hexer/arkham and nifasm's per-symbol cache see one stale
+symbol instead of 465 (`notes/b3b.md`, the `decl-stability` scenario).
+
+Steps, in order, each gated by the `decl-stability` ratios:
+1. **Per-declaration local numbering in nimsem**: `sembasics.makeLocalSym`
+   numbers locals from a module-wide per-name counter; number them within
+   the enclosing top-level declaration instead, in a form the NIF naming
+   rules allow (AGENTS.md: follow the NIF standard for temporaries; research
+   nifspec's symbol rules before choosing the spelling). Goldens churn: every
+   `.nif` golden with local names; `hastur --overwrite`, diff reviewed.
+2. **Line-info-blind identity**: hexer (and the `.dce.nif` analysis) digest a
+   declaration with line info masked, and re-base line info on a spliced
+   fragment; `.x.nif` bytes stay identical to a full lowering.
+3. Then B3b proper: per-declaration fragments for hexer's module-wide tables,
+   an intra-module inline dependency map, full re-lowering as fallback;
+   proc-scoped labels/rodata/temps in arkham so unchanged procs emit
+   byte-identical asm; per-symbol blob validity in nifasm.
+
+Gate for F1 (steps 1-2): `decl-stability` reports ≤ 3 changed declarations
+for the appended-proc edit and 1 for the in-place edit (was 465 / 1);
+`hastur tests/nimony`, `tests/incremental`, ctfe_diff green; native boot
+byte-identical; `self.editbody` not worse.
+
 ## Phase B4 — hot reload and `nimony dev`
 
 Layout sidecar and classifier, slot swap with generation counter,
@@ -811,4 +843,6 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3 (nimony half) | merged (`deps.blobCacheDir` = `<nimcache>/blobcache`, beside `ocache/`/`ccache/`; the native `link` node passes `--blobcache:<dir>` and `engine.runWholeProgram` calls `useBlobCache` on the same string, so both native paths share one store — one directory, two flag keys, because `nimony r` assembles `--dev-single-thread` without debug info and a linked executable does neither; `--no-blobcache` / `NIMONY_BLOBCACHE=off`, documented in `--help`; `--verbose`'s `[run-engine]` line gained `emitRoots=` and `blobcache=on hits=/stale=/recorded=`, `--profile` turns on nifasm's own per-stage table; pin `src/nativenif.commit` -> f8d2676. self.editbody 1.805 -> 1.381 s and self.run 1.785 -> 1.364 s (cache off vs on, same toolchain; 2.263 s at the fork point), compiler assemble 849.91 -> 484.11 ms after a `sem.nim` body edit (hits 3415, stale 18, recorded 627) and 245.10 ms with nothing edited. Byte identity checked three ways: `--no-blobcache` vs cached executables, `tests/nativecg`'s asm-NIF and exe, and `hastur boot --boot-backend:native` run in both states with stage 3 identical between them. Also upstreamed B1's `_exit` workaround as a real fix and dropped it here. What is left of a warm link is 318 ms of `blobResolve`+`blobRefs`, a symbol-table cost that is B4's) | merged from jit/b3-nimony, nativenif jit/b3-fixes f8d2676 |
 | B3b | measured, NOT built (`notes/b3b.md`): sem's output is not declaration-stable (module-wide local numbering, line info) and arkham's labels are module-scoped, so the ≤ 0.2 s gate is unreachable from hexer/arkham alone; a `decl-stability` scenario pins the ratios; prerequisites are frontend changes (owner decision) -- symbol-granularity lowering — hexer and arkham re-lower only the procs whose Leng changed, so a body edit in a 7k-line module costs one proc; pulled forward from B4 because the compiler's edit loop after B3 is ~0.45 s nimsem + 0.36 s hexer + 0.41 s arkham on ONE module (progress.md run 6) | |
 | B3c | merged (nativenif `jit/b3c`, pin c3f27fc: `core/declhead.nim` reads a foreign proc's signature without its body; warm compiler link 0.27 -> 0.086 s, `sem.nim`-edited 0.43 -> 0.28 s; byte-identical; headline 2.78 -> 1.26 s wall) | nativenif c3f27fc |
+| small items | merged (`findTool` never resolves via cwd/PATH, `dag.resolveProgram` for external programs; in-process nodes overlap the fan-out (measured neutral: depths are homogeneous); no-change floor 74 -> 35 ms) | merged from jit/small-items |
+| F1 | running: declaration-stable frontend output (per-declaration local numbering, line-info-blind identity) | |
 | B4, B5 | planned | |
