@@ -18,8 +18,8 @@ this file supersedes as it is filled in).
 | 2 | `c6db98b6` | sem: sum type constructor over a `ref object` produces the `ref` (#2481) | `merge/u2` | merged |
 | 3 | `b7c7daa6` | newest nativenif (#2478) — pin `d0781a48` -> `e201a816` | `merge/u3` | merged, pin taken is **`3ec73fef`**, not upstream's `e201a816` (see §3) |
 | 4 | `c6be04e1` | no globals in nifcore (#2482) | `merge/u4` | merged; A2a's two `nifcore.fallback*` re-points are now **redundant and deleted** (see §4) |
-| 5 | `38f67463` | std/http: thread the tag space instead of keeping one per process (#2484) | `merge/u5` | pending |
-| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending; `f9af5b24` does not exist in `nim-lang/nativenif` (it is `2c30a9ef` rebased away), so step 6 pins **`83ced299`** (`jit/upstream-master`) |
+| 5 | `38f67463` | std/http: thread the tag space instead of keeping one per process (#2484) | `merge/u5` | merged |
+| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending; `f9af5b24` does not exist in `nim-lang/nativenif` (it is `2c30a9ef` rebased away), so step 6 pins **`9d7fcf78`**, the current tip of `jit/upstream-master`. That is `83ced299` (this file's earlier figure) plus two notes-only commits: `git diff --stat 83ced299 9d7fcf78 -- . ':(exclude)notes'` is empty, so the code is identical and either would build the same |
 
 Plus a parallel track in `../nativenif`: rebase our `jit/b1 .. jit/b3e-native`
 chain (fork point `d0781a48`) onto upstream nativenif master, which steps 3
@@ -745,6 +745,135 @@ signature of machine load and not of a one-sided regression; `uptime` reported
 a load average of 5.02 during the second run, with another agent's worktree
 building. The headline 0.92 s cpu stands as step 3 re-took it; the loop did
 not move.
+
+## 5. `38f67463` — std/http: thread the tag space instead of keeping one per process
+
+**What upstream changed.** `std/http` kept its tag space — the `TagPool` that
+interns known header names, methods, header values and structural tags — in one
+process-global `gHttpTags`, filled during init. It becomes an `HttpTags` value
+an application makes with `newHttpTags()` and passes to `initHttpMsg` /
+`initHttpConn`; `HttpMsg.tags` then carries it, so the parser and the wire
+writer need no tag parameter of their own, and `registerHeader` takes the space
+as its first argument. The argument in `doc/internals/http.md` is that a
+`TagId` only means something against the space it was written against, and
+threading puts that in the signatures instead of leaving it a promise the
+process has to keep.
+
+The file split is worth stating because the chain plan had it slightly
+different: one doc, **four** library files
+(`lib/std/http/{httpconn,httpmsg,httpparse,httpwire}.nim`) and **six** tests
+(`tests/nimony/http/{tchunked,tconn,tmsg,tparse,tresponse,twire}.nim`).
+
+**How it collided with us.** Not at all, and this is the one step where that
+can be said at full strength rather than as the outcome of a resolution.
+`git diff --stat f69b8afc..450a0831 -- doc/internals/http.md lib/std/http
+tests/nimony/http` is **empty**: this branch has never touched any of the 11
+files. Our only `lib/std` changes anywhere are P0a's `syncio.nim` read log and
+`writenif.nim`'s `.out.nif.reads` sidecar.
+
+**What we did.** Nothing. Upstream won all 11 files entire. The check that has
+carried the previous four steps returns its strongest form here — each merged
+file is not merely "different from upstream by our hunks" but **byte-identical**
+to `git show 38f67463:<path>`:
+
+```
+for f in <the 11 paths>; do
+  git show 38f67463:$f > /tmp/u5_up.tmp; diff -q /tmp/u5_up.tmp $f
+done            # 11 x "identical to upstream", no output from diff
+```
+
+**The question this step was set, and its answer.** `38f67463` is
+`c6be04e1`'s pattern one layer out — process-global state becoming a threaded
+parameter — so: does anything in our reset or snapshot machinery know about a
+per-process http tag space?
+
+**No, and it structurally cannot.** Checked against §4's inventory
+(`notes/merge-u4.md` §2), which is the complete list of what we reset:
+`resetFrontendGlobals` (`nifpools.pool`, `globalTags`, `programs.prog`,
+identstyle, filelinecache), `resetHexerGlobals`, `resetLengcGlobals`, and
+`semos.takeFrontendState`/`restoreFrontendState`. Every entry is a global of a
+**compiler** process. `gHttpTags` was a global of a program the compiler
+*produces*: `std/http` is library code, no compiler source imports it
+(`grep -rn 'std/http' src/` is empty) and none mentions `HttpTags`/`gHttpTags`
+(also empty). A2c's `FrontendSnapshot` moves `pool`/`globalTags`/`prog` aside
+for an in-process sub-build; the http tag space was never in that address space
+at all.
+
+The analogy does land somewhere, though, and it is worth recording: the bug
+upstream fixed is the same *class* as A2a's, and it bit in **joined tests**.
+`tests/nimony/http/` is a joined group, so its six tests share one process, and
+the doc says exactly what followed — "the tag pool is process-global while a
+joined group is one process, so each test registering for itself made the first
+member's init decide what ids the rest saw". That is A2a's failure shape
+reached from the other direction: A2b/A2c made the compiler run several phases
+in one process, `AGENTS.md`'s joined tests make several tests run in one
+process. Nothing for us to do; but if a future phase makes more of the suite
+share a process, this is the class of bug to look for first.
+
+**Was anything of ours made redundant?** No. Nothing of ours is in these files
+or reachable from them.
+
+**Was anything of ours broken?** No.
+
+**Evidence.** Worktree `/tmp/merge-u1`, branch `merge/u5` taken from
+`origin/fast-devloop` at `450a0831` (confirmed by `git rev-parse HEAD` before
+merging), `XDG_CACHE_HOME=/tmp/cache-u1`,
+`NIMONY_NATIVENIF=/Users/chanc/Projects/nativenif`. Pin unchanged at
+`3ec73fef`; `../nativenif` on `jit/upstream-e201a816` whose tip IS the pin, so
+`build all` printed **zero `[deps]` lines** — §3's evidence rule. Nothing
+pushed, no remote added, in either repository.
+
+```
+$ nim c -r src/hastur/hastur build all           → exit 0, 0 [deps] lines
+
+$ bin/hastur tests/nimony/http
+SUCCESS tests/nimony/http/tchunked.nim
+SUCCESS tests/nimony/http/tconn.nim
+SUCCESS tests/nimony/http/tmsg.nim
+SUCCESS tests/nimony/http/tparse.nim
+SUCCESS tests/nimony/http/tresponse.nim
+SUCCESS tests/nimony/http/twire.nim
+6 / 6 tests successful in 3.09s.
+SUCCESS.
+
+$ bin/hastur test tests/incremental
+decl-stability: .s.nif 32 decls | in-place changed 1 | insert changed 11 (blind 1, added 2) | stmtadd changed 12 (blind 1) | decls digest 52 syms, sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/1 | .x.nif in-place changed 1
+decl-stability: 4 / 4 phases successful in 0.95s.
+SUCCESS.
+
+$ bin/hastur tests/inproc
+  ok: nifler: 4 output files byte-identical to two processes
+  ok: nimsem: 6 output files byte-identical to two processes
+[inproc/hexer] all checks passed
+[inproc/lengc] all in-process lengc tests passed
+3 / 3 tests successful in 27.83s.
+SUCCESS.
+
+$ bin/hastur test tests/ctfe_diff    → ctfediff: 19 file(s), 50 artifact(s), 79 .s.nif, 0 difference(s)
+$ bin/hastur test tests/nifcache     → nifcache: all checks passed
+$ bin/hastur test tests/nimony_r     → nimony_r: all checks passed
+$ bin/hastur test tests/ctfe_engine  → ctfe_engine: all checks passed
+$ bin/hastur test tests/ledger       → [ledger] all ledger tests passed
+
+$ bin/hastur tests/nimony
+795 / 795 tests successful in 143.22s.
+SUCCESS.
+
+$ bin/hastur boot --boot-backend:native
+[boot] stages 0 and 1 differ.
+[boot] stages 1 and 2 are byte-identical.
+[boot] stages 2 and 3 are byte-identical.
+[boot] total 47.72s.
+SUCCESS.
+```
+
+**795 -> 795.** `git status` after the merge shows all 11 files as `M` and none
+as `A`: no test file was added, so the total cannot move. Checked rather than
+assumed, on §2's precedent.
+
+**Numbers.** None taken. The commit touches only `lib/std/http`, which no
+compiler phase imports, so it cannot reach the loop. §4's 0.260/0.261 against
+§3's 0.261 is the live reference.
 
 ## nativenif track
 
