@@ -18,7 +18,7 @@ include ".." / lib / compat2
 import ".." / lib / [symparser, intrinsics]
 import ".." / models / tags
 import ".." / nimony / [nimony_model, programs, typenav, expreval, xints, decls, builtintypes, sizeof, typeprops, langmodes, typekeys, nifconfig]
-import hexer_context, pipeline, dce1, lifter, hexerio
+import hexer_context, pipeline, dce1, lifter, hexerio, decldigest
 import  ".." / lib / [stringtrees, ledger]
 
 proc skipExportMarker(c: var EContext; n: var Cursor) =
@@ -2823,6 +2823,11 @@ type
     dce*: ModuleAnalysis      ## what `.dce.nif` serializes; `computeLiveSet`
                               ## takes this object directly, so the in-process
                               ## path never round-trips it through a file
+    decls*: ModuleDecls       ## what `<mod>.decls.nif` serializes: per top-level
+                              ## declaration, a digest of its sem INPUT and one
+                              ## of its lowering OUTPUT, both blind to line
+                              ## info. A third output, not a change to the
+                              ## second -- `x` stays byte-identical (F1 step 2)
     modName*: string
     dir*: string
 
@@ -2897,6 +2902,12 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
   )
   c.typeCache.openScope()
 
+  # The sem-input half of the `<mod>.decls.nif` sidecar, taken BEFORE the
+  # passes consume the buffer. Blind to line info by construction: it hashes
+  # the token stream, and a `Cursor` steps over the `LineInfoLit` suffix.
+  var inputDigests = DeclHashes()
+  digestToplevel(readonlyCursorAt(input.buf, 0), inputDigests)
+
   var c0 = beginRead(input.buf)
   let cBits = c.bits
   var dest = transform(c, c0, modName, cBits)
@@ -2944,13 +2955,18 @@ proc expand*(input: var ExpandInput; bigEndian: bool;
 
   # Analyse the buffer we just built rather than re-reading the file we are
   # about to write, exactly as the pre-A2a code did.
+  var outputDigests = DeclHashes()
+  digestToplevel(readonlyCursorAt(outputBuf, 0), outputDigests)
+
   result = ExpandResult(x: createTokenBuf(0),
                         dce: analyzeModule(beginRead(outputBuf)),
+                        decls: merge(inputDigests, outputDigests),
                         modName: c.main, dir: c.dir)
   result.x = ensureMove outputBuf
 
 proc xnifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".x.nif"
 proc dcenifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".dce.nif"
+proc declsnifPath*(r: ExpandResult): string {.inline.} = r.dir / r.modName & ".decls.nif"
 
 proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer;
                         s: var HexerStatus) =
@@ -2962,6 +2978,7 @@ proc writeExpandResult*(r: var ExpandResult; t: var PhaseTimer;
   writeSerialized(content, destfileName, OnlyIfChanged, s)
   if not s.failed:
     writeAnalysis(dcenifPath(r), r.dce, "." & r.modName)
+    writeDeclDigests(declsnifPath(r), r.decls, "." & r.modName)
   t.noteWrite()
 
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode];

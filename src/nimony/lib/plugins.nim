@@ -71,6 +71,11 @@ nifcore.fallbackTags = pluginTags
 
 var
   unusedNameBase = ""
+  unusedNameTail = ""
+    ## The namespace segment the compiler's local symbols carry after their
+    ## disambiguator (`` `semExpr`0 ``, empty at module level). A gensym must
+    ## reproduce it or it lands in a different routine's name space; see
+    ## `notes/f1.md`.
   nextUnusedName = 0
   fileDependencies: seq[string] = @[]
 
@@ -297,7 +302,7 @@ proc genSym*(): SymId =
   assert unusedNameBase.len > 0,
     "genSym requires plugin input with an .unusedname directive"
   result = pluginPool.syms.getOrIncl(
-    unusedNameBase & "." & $nextUnusedName)
+    unusedNameBase & "." & $nextUnusedName & unusedNameTail)
   inc nextUnusedName
 
 proc addErrorMessage(t: var NifBuilder; msg: string; info: LineInfo) =
@@ -839,13 +844,15 @@ proc loadPluginTree(filename: string): NifBuilder =
   if hint.len > 0:
     var hintBase = ""
     var hintNumber = 0
-    assert splitLocalSymName(hint, hintBase, hintNumber),
+    var hintTail = ""
+    assert splitLocalSymName(hint, hintBase, hintNumber, hintTail),
       "plugin .unusedname must be a local symbol"
     if unusedNameBase.len == 0:
       unusedNameBase = hintBase
+      unusedNameTail = hintTail
       nextUnusedName = hintNumber
     else:
-      assert unusedNameBase == hintBase,
+      assert unusedNameBase == hintBase and unusedNameTail == hintTail,
         "plugin inputs must use the same .unusedname base"
       if nextUnusedName < hintNumber:
         nextUnusedName = hintNumber
@@ -859,7 +866,8 @@ proc writePluginTree(tree: var NifBuilder; filename: string) =
   var buf = createTokenBuf(tree.len + 4)
   if unusedNameBase.len > 0:
     buf.openTag(buf.tags.registerTag(UnusedNameTag))
-    nifcore.addSymUse(buf, unusedNameBase & "." & $nextUnusedName)
+    nifcore.addSymUse(buf,
+                      unusedNameBase & "." & $nextUnusedName & unusedNameTail)
     buf.closeTag()
   if fileDependencies.len > 0:
     # `(dependency …)`: the second sidecar tree, peeled off by `semos.runPlugin`

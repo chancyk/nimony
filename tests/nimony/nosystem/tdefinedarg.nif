@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 443              )
+(.indexat 453              )
 (stmts@,1,tests/nimony/nosystem/tdefinedarg.nim
  (type@5 :untyped.0.
   (untyped).
@@ -8,7 +8,7 @@
  (proc@,2 :defined.0.@5
   (defined). .
   (params@C
-   (param@1 :x.0 . .
+   (param@1 :x.0`defined`0 . .
     (untyped@3).)).
   (pragmas@P
    (magic@2 Defined@7)). .)
@@ -24,6 +24,6 @@
  (comment@G,2 untyped.0.))(.index@,1,tests/nimony/nosystem/tdefinedarg.nim
  (x untyped.0. 85)
  (x defined.0. 70)
- (h x.0. 133)
+ (h x.0. 143)
  (h y.0. 43)
  (h z.0. 42))

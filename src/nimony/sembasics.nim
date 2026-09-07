@@ -388,11 +388,41 @@ proc makeFieldSym*(c: var SemContext; result: var string) =
   result.add '.'
   result.addInt n
 
+proc localNamespaceOf*(sym: SymId): string =
+  ## The namespace segment for the locals of the routine `sym`: its module-less
+  ## name with the dots written as `` ` `` so that a local built from it keeps
+  ## exactly ONE dot and stays a local name (`symparser.isLocalName`).
+  ## `semExpr.0.mymod` -> `` semExpr`0 ``, `foo.1.Iabcdef.mymod` ->
+  ## `` foo`1`Iabcdef ``.
+  result = removeModule(pool.syms[sym])
+  for i in 0 ..< result.len:
+    if result[i] == '.': result[i] = LocalNsSep
+
 proc makeLocalSym*(c: var SemContext; result: var string) =
+  ## `x` -> `` x.3`semExpr`0 ``: the disambiguator counts this NAME inside this
+  ## ROUTINE, and the routine's name follows it so the string stays unique in
+  ## the module. Nothing about the spelling depends on what the module declared
+  ## before, which is the whole point of `notes/f1.md`.
+  ##
+  ## The counter is keyed by identifier + namespace and lives in `c.locals` for
+  ## the whole module, i.e. it is per owner and PERSISTENT rather than pushed
+  ## and popped: a generic instantiation's parameters are minted twice — once
+  ## for the signature `requestRoutineInstance` builds and once for the body
+  ## `subsGenericProc` emits — and a counter that restarted would hand both the
+  ## same names.
+  let baseLen = result.len
+  if c.localNs.len > 0:
+    result.add LocalNsSep
+    result.add c.localNs
   var counter = addr c.locals.mgetOrPut(result, -1)
   counter[] += 1
+  let disamb = counter[]
+  result.setLen baseLen
   result.add '.'
-  result.addInt counter[]
+  result.addInt disamb
+  if c.localNs.len > 0:
+    result.add LocalNsSep
+    result.add c.localNs
 
 proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
   ## A fresh name for a copy of `s`, keeping its layout — `forceGlobal` promotes
@@ -450,10 +480,7 @@ proc makeTemplateSym*(c: var SemContext; result: var string; kind: SymKind) =
   if kind in RoutineLikeSyms:
     c.makeGlobalSym(result)
   else:
-    var counter = addr c.locals.mgetOrPut(result, -1)
-    counter[] += 1
-    result.add '.'
-    result.addInt counter[]
+    c.makeLocalSym(result)
 
 type
   SymStatus* = enum

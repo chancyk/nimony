@@ -1,0 +1,246 @@
+Phase F1 -- declaration-stable frontend output
+==============================================
+
+Branch `jit/f1`, forked from `fast-devloop` (547d193c).
+Worktree /Users/chanc/Projects/nimony/.claude/worktrees/agent-aef60723bf82ec129
+nativenif: the pinned clone at /Users/chanc/Projects/nativenif, UNMODIFIED.
+Machine: macOS 26, M5, Nim 2.2.10.  XDG_CACHE_HOME=/tmp/f1_cache_5927.
+
+Two changes:
+
+  1. `sembasics.makeLocalSym` numbers a local inside its enclosing routine and
+     writes that routine's name into the local's disambiguator, so a local's
+     spelling is a function of its own declaration and nothing else.
+  2. hexer writes a `<mod>.decls.nif` sidecar: per top-level declaration, a
+     digest of its sem INPUT and one of its lowering OUTPUT, both blind to
+     line info.  Plus `rebaseLineInfo`, the splice-side inverse.
+
+
+1. Declaration stability
+------------------------
+
+Method: `notes/b3b.md` section 3 -- each artifact split into the children of
+its root `(stmts ...)`, the trailing embedded `(.index ...)` cut at the byte
+offset the header's `.indexat` names, declarations matched by their
+`:SymbolDef` and compared by content; `blind` is the same comparison with
+every NIF line-info suffix stripped.  Driver: /tmp/f1_declstab.py, which
+mirrors `src/hastur/incrementaltests.nim`'s `splitNifDecls`/`diffDecls`
+exactly.  Input: a copy of `src/` frozen at 547d193c, compiled with
+`nimony n`, edited, recompiled.  Both sides compile the SAME sources.
+
+  src/nimony/sem.nim -- 1222 top-level `.s.nif` declarations, 1753 `.x.nif`
+
+  (a) inplace  a string literal in `semCase` replaced by one of the same length
+  (b) append   `proc devloopBenchBodyN(): int = 1` at EOF
+               == bench/devloop_bench.sh's `self.editbody` edit, i.e. the edit
+                  the gate is stated on
+  (c) stmtadd  two statements inserted into a proc body mid-file
+
+                          .s.nif                    .x.nif
+                    changed      blind        changed      blind
+  -----------------------------------------------------------------
+  (a) inplace   base       1          1             1          1
+                F1         1          1             1          1
+  -----------------------------------------------------------------
+  (b) append    base     465        465           464        464
+                F1         1          1             0          0
+  -----------------------------------------------------------------
+  (c) stmtadd   base     181          1           242          1
+                F1       181          1           242          1
+
+  GATE: `<= 3 changed declarations for the appended-proc edit (was 465)` -- 1.
+        `1 for the in-place edit` -- 1.
+        `the line-info-blind digest reports 1 changed declaration for the
+         two-statements-inserted edit` -- 1.
+
+  Correction to `notes/b3b.md`.  That note reported 49 for (c) blind.  That
+  number was a measurement error, not a property of the compiler: the
+  scenario's textual stripper removed `@...` suffixes only, and
+  `nifbuilder.attachLineInfo` omits the `@` when the column diff is negative
+  because the leading `~` already carries the sign.  A suffix can therefore
+  read `~C,~1Ib` with no `@` in it, and what was left of it -- a base-62 line
+  delta -- read as content.  With both openers stripped the fork point already
+  reports 1 for (c) blind, and hexer's own token-stream digest, computed by
+  entirely different code over an entirely different representation, agrees.
+  What F1 changes about (c) is nothing; what it changes is (b).
+
+  The `decl-stability` scenario on its own 13-declaration fixture
+  (`bin/hastur test tests/incremental`):
+
+    before  .s.nif 13 decls | in-place changed 1 | insert changed 7
+            (blind 7, added 1) | stmtadd changed 8 (blind 2)
+            | .x.nif in-place changed 1
+
+    after   .s.nif 13 decls | in-place changed 1 | insert changed 7
+            (blind 1, added 1) | stmtadd changed 8 (blind 1)
+            | decls digest 23 syms, changed 1/0/1
+            | .x.nif in-place changed 1
+
+  `insert` blind 7 -> 1 is the renaming; `stmtadd` blind 2 -> 1 is the
+  stripper fix; `decls digest 1/0/1` is hexer's sidecar answering the same
+  three questions independently.
+
+
+2. What it costs: artifact size
+-------------------------------
+
+A local now carries its routine's name, so it is longer.  Whole nimcache of a
+`nimony n` self-compile, 130-134 modules:
+
+  artifact      base          F1            delta
+  ----------------------------------------------------
+  .s.nif        24,272,428    32,745,915    +34.9 %
+  .x.nif        44,410,082    57,987,138    +30.6 %
+  .dce.nif       3,059,516     3,058,998     -0.0 %
+  .decls.nif             0     2,040,260     (new)
+
+  sem.nim .s.nif   3,297,829   4,327,544    +31.2 %
+  sem.nim .x.nif   5,866,401   7,516,067    +28.1 %
+  sem.nim .decls.nif       0     185,452    (new, 4.3 % of its .x.nif)
+
+  26,668 namespaced local occurrences in sem's `.s.nif`, mean namespace 19.8
+  bytes.  The token COUNT is unchanged (194,508 in both) and the dot-count
+  histogram is unchanged, which is the check that nothing was reclassified
+  from local to global by accident.
+
+  There is no shorter encoding that is also stable.  A per-declaration ORDINAL
+  is position-derived and moves under exactly the edit this phase exists to
+  fix; a hash of the owner is short but a collision is a silent miscompile and
+  it throws away the readability that is half the point.  See `notes/f1.md`
+  section 3.
+
+
+3. Benchmark
+------------
+
+`bench/devloop_ab.sh <A> <B> <scenario> <rounds>`, interleaved A B A B.
+A = /tmp/f1_base_bin, the toolchain built from 547d193c.
+B = this worktree.  SELF_SRC=/tmp/f1_selfsrc/src (the 547d193c sources), so
+both sides compile identical input.
+
+  $ uptime
+  10:16  up 18 days, 10:12, 4 users, load averages: 2.81 2.93 3.39
+
+  == self.editbody, 5 rounds
+  round 0  A  wall 1.215  cpu 1.260
+  round 0  B  wall 0.697  cpu 0.693
+  round 1  A  wall 1.209  cpu 1.251
+  round 1  B  wall 0.696  cpu 0.692
+  round 2  A  wall 1.203  cpu 1.247
+  round 2  B  wall 0.705  cpu 0.702
+  round 3  A  wall 1.199  cpu 1.243
+  round 3  B  wall 0.703  cpu 0.699
+  round 4  A  wall 1.214  cpu 1.259
+  round 4  B  wall 0.709  cpu 0.705
+  self.editbody: A wall median 1.209  min 1.199 | cpu median 1.251  min 1.243
+  self.editbody: B wall median 0.703  min 0.696 | cpu median 0.699  min 0.692
+  B/A cpu (median): 0.559   B/A cpu (min): 0.557
+
+  == self.cold, 3 rounds
+  round 0  A  wall 5.382  cpu 12.542
+  round 0  B  wall 5.506  cpu 12.936
+  round 1  A  wall 5.444  cpu 12.626
+  round 1  B  wall 5.528  cpu 13.035
+  round 2  A  wall 5.375  cpu 12.654
+  round 2  B  wall 5.511  cpu 13.001
+  self.cold: A wall median 5.382  min 5.375 | cpu median 12.626  min 12.542
+  self.cold: B wall median 5.511  min 5.506 | cpu median 13.001  min 12.936
+  B/A cpu (median): 1.030   B/A cpu (min): 1.031
+
+  $ uptime
+  10:17  up 18 days, 10:14, 4 users, load averages: 4.08 3.30 3.49
+
+  Repeated after the final tightening of the digest, on a machine still
+  recovering from the boot runs (so the absolute numbers are higher and only
+  the RATIOS are comparable):
+
+    self.editbody 5 rounds   B/A cpu median 0.531  min 0.550
+    self.cold     3 rounds   B/A cpu median 1.028  min 1.028
+
+  which agrees with the quiet run above.
+
+self.editbody: 1.209 -> 0.703 s wall, 1.251 -> 0.699 s cpu.  -44 %.
+
+  Nothing in this phase makes any phase faster; what it does is stop an
+  appended proc from renaming 465 declarations.  Downstream, nifasm's
+  per-symbol blob cache (B3) and P0c's per-module live sets then find the work
+  already done.  This is the number B3b was supposed to move and it moved
+  without B3b, from the prerequisite alone.
+
+self.cold: 5.382 -> 5.511 s wall (+2.4 %), 12.626 -> 13.001 s cpu (+3.0 %).
+
+  Attributed by building a third toolchain with the sidecar compiled out
+  (`when false` around the two `digestToplevel` calls) and running the same
+  A/B against it:
+
+    A=547d193c        B=names only, no sidecar   cpu median 1.044, min 1.004
+    A=names only      B=names + sidecar          cpu median 1.026, min 1.026
+
+  i.e. the renaming itself is at or below the noise floor and the whole of the
+  +3 % is the new artifact: two Cursor walks per module plus a 2 MB write.
+  The first implementation used `nifchecksums.computeChecksum`, which is SHA-1
+  and allocates a string per numeric literal; it cost 3.3 % on its own
+  (12.614 -> 12.944 s cpu at the time).  Replacing it with the two-lane
+  128-bit `DeclHash` in `src/hexer/decldigest.nim` brought that to 2.6 %,
+  and re-keying the maps by `SymId` instead of by name changed nothing
+  measurable -- what is left is the walk, not the hash.
+
+  Under JIT_IMPL.md's "Measuring" rule 3 (`more than 5 % worse and not
+  explained by the phase blocks the next launch`) this is inside the bound and
+  fully attributed.  It buys an artifact nothing reads yet; B3b is what reads
+  it.
+
+
+4. Tests
+--------
+
+  bin/hastur tests/nimony            794 / 794 successful in 145.78s.  SUCCESS.
+  bin/hastur test tests/incremental  16+16+16+2+2+2+2+4+5+5+3 phases, SUCCESS.
+  bin/hastur tests/inproc            3 / 3 successful in 30.06s.  SUCCESS.
+  bin/hastur test tests/ctfe_diff    19 files, 50 artifacts, 79 .s.nif,
+                                     0 difference(s).
+  bin/hastur test tests/nifcache     all checks passed (343 and 106 artifacts
+                                     byte-identical between --vfs modes).
+  bin/hastur test tests/nimony_r     all checks passed (cached link ==
+                                     scratch link, byte-identical).
+  bin/hastur boot --boot-backend:native
+                                     stages 1 and 2 byte-identical,
+                                     stages 2 and 3 byte-identical.
+  bin/hastur boot (C backend)        stages 2 and 3 byte-identical.
+
+  Goldens: `bin/hastur --overwrite tests/nimony`.  21 files, 298 lines,
+  classified mechanically -- 226 lines are a local rename, 72 are
+  `(.indexat N)` / `(h|x <sym> <offset>)` in the trailing embedded index,
+  which move because the file got longer.  0 lines changed for any other
+  reason.
+
+  Pre-existing failures found in `hastur.mode = skip` directories while
+  checking for stale goldens.  None naming-related, none new:
+    tests/nativecg      only `tinlinecond.x64.asm.nif` exists; on arm64 the
+                        suite asks for `tinlinecond.arm64.asm.nif`
+    tests/validator_sem imports `lib/plugins.nim`; the file is at
+                        `src/nimony/lib/plugins.nim`
+    tests/hexer         `setup.nim` opens `tests/hexer/sysvq0asl.s.nif`,
+                        which is not in the tree
+
+
+5. What B3b can do now that it could not
+-----------------------------------------
+
+  * `self.editbody` invalidates ONE `.s.nif` declaration and ZERO `.x.nif`
+    declarations instead of 465 and 464.  The theorem in `notes/b3b.md` §2 --
+    "if declarations 1..k are unchanged then after every pass the output
+    prefix for 1..k is identical and every counter is at the same value" --
+    now has a prefix worth having on the pessimal edit, not just on the
+    typical one.
+  * A declaration's identity is a digest in a file beside the `.x.nif`, so the
+    diff does not have to be recomputed by re-parsing and re-comparing text,
+    and it does not report "changed" for a declaration that only moved.
+  * `rebaseLineInfo` exists and knows which tokens it must NOT touch.
+
+  Still in the way, unchanged by this phase and unchanged in priority
+  (`notes/b3b.md` §7 steps 3-5): hexer's seven module-wide counters, its
+  first-use ownership of generated top-level nodes, `c.initBody`,
+  `funcsummary`'s whole-module fixpoint and `intraModuleInline`'s cross-proc
+  splicing; arkham's module-scoped `labelCount` and rodata index; nifasm's
+  per-module blob validity check.

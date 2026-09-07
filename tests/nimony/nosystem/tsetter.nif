@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 672              )
+(.indexat 716              )
 (stmts@,1,tests/nimony/nosystem/tsetter.nim
  (type@5 :int.0.
   (i 64).
@@ -10,17 +10,17 @@
   (object@2 .))
  (proc@,4 :bar=.0.@5 . . .
   (params@B
-   (param@1 :x.0 . . Foo.0.@3 .)
-   (param@9 :y.0 . .
+   (param@1 :x.0`bar=`0 . . Foo.0.@3 .)
+   (param@9 :y.0`bar=`0 . .
     (i@3 64).)). . .
   (stmts@U
    (discard .)))
  (proc@,5 :\5B\5D=.0.@5 . . .
   (params@A
-   (param@1 :x.1 . . Foo.0.@3 .)
-   (param@9 :y.1 . .
+   (param@1 :x.0`\5B\5D=`0 . . Foo.0.@3 .)
+   (param@9 :y.0`\5B\5D=`0 . .
     (i@3 64).)
-   (param@H :z.0 . .
+   (param@H :z.0`\5B\5D=`0 . .
     (i@3 64).)). . .
   (stmts@b
    (discard .)))
@@ -31,5 +31,5 @@
  (x int.0. 81)
  (h Foo.0. 62)
  (h bar=.0. 53)
- (h \5B\5D=.0. 142)
- (h foo.0. 181))
+ (h \5B\5D=.0. 156)
+ (h foo.0. 211))

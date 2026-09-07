@@ -446,7 +446,12 @@ proc subsGenericType(c: var SemContext; dest: var TokenBuf; req: InstRequest) =
     # take the pragmas from the origin:
     dest.copyTree decl.pragmas
     var sc = SubsContext(params: addr req.inferred)
+    # The copied body's locals belong to the INSTANTIATION, not to whichever
+    # declaration happened to ask for it first (`notes/f1.md`).
+    let outerLocalNs = c.localNs
+    c.localNs = localNamespaceOf(req.targetSym)
     subs(c, dest, sc, decl.body)
+    c.localNs = outerLocalNs
     addFreshSyms(c, sc)
 
 proc subsGenericProc(c: var SemContext; dest: var TokenBuf; req: InstRequest) =
@@ -463,11 +468,17 @@ proc subsGenericProc(c: var SemContext; dest: var TokenBuf; req: InstRequest) =
     produceInvoke c, dest, req, decl.typevars, info
 
     var sc = SubsContext(params: addr req.inferred)
+    # Likewise: the instantiation names its own params and body locals, so two
+    # instantiations of one generic never share a counter and neither depends
+    # on where in the module the request came from.
+    let outerLocalNs = c.localNs
+    c.localNs = localNamespaceOf(req.targetSym)
     subs(c, dest, sc, decl.params)
     subs(c, dest, sc, decl.retType)
     subs(c, dest, sc, decl.pragmas)
     subs(c, dest, sc, decl.effects)
     subs(c, dest, sc, decl.body)
+    c.localNs = outerLocalNs
     addFreshSyms(c, sc)
 
 template withFromInfo(req: InstRequest; body: untyped) =
@@ -667,11 +678,17 @@ proc requestRoutineInstance*(c: var SemContext; origin: SymId;
         signature.addSymUse(origin, info)
         signature.add typeArgs
       var sc = SubsContext(params: addr inferred)
+      # This signature copy is minted at a CALL SITE but its parameters belong
+      # to `targetSym`; namespacing them by the caller would make an
+      # instantiation's names depend on which routine asked for it first.
+      let outerLocalNs = c.localNs
+      c.localNs = localNamespaceOf(targetSym)
       subs(c, signature, sc, decl.params)
       let beforeRetType = signature.len
       subs(c, signature, sc, decl.retType)
       subs(c, signature, sc, decl.pragmas)
       subs(c, signature, sc, decl.effects)
+      c.localNs = outerLocalNs
       addFreshSyms(c, sc)
       signature.addDotToken() # no body
 

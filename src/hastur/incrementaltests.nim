@@ -940,10 +940,20 @@ type
     total*, same*, changed*, added*, removed*: int
 
 proc stripNifLineInfo*(s: string): string =
-  ## Drop every NIF line-info suffix (`@` up to the next space, parenthesis or
-  ## newline) outside of string literals. What is left is the declaration's
-  ## CONTENT: two declarations that differ only because an edit above them
-  ## moved the line counter then compare equal.
+  ## Drop every NIF line-info suffix outside of string literals: `@` or `~` up
+  ## to the next space, parenthesis or newline. What is left is the
+  ## declaration's CONTENT: two declarations that differ only because an edit
+  ## above them moved the line counter then compare equal.
+  ##
+  ## BOTH openers matter. `nifbuilder.attachLineInfo` writes `@<col>,<line>` in
+  ## general but drops the `@` when the column DIFF is negative, because the
+  ## leading `~` already carries the sign -- so a suffix can read `~C,~1Ib`
+  ## with no `@` in sight. Stripping only `@` left those alone and the
+  ## remaining `,<line>` looked like content: `sem.nim`'s two-statement
+  ## insertion reported 48 declarations differing "blind" that differed by
+  ## nothing but a base-62 line delta. Neither character can occur unescaped
+  ## anywhere else in the token stream -- both are in `nifbuilder.ControlChars`
+  ## and a leading one is escaped -- so this stays exact.
   result = newStringOfCap(s.len)
   var i = 0
   var inStr = false
@@ -961,7 +971,7 @@ proc stripNifLineInfo*(s: string): string =
       inStr = true
       result.add c
       inc i
-    elif c == '@':
+    elif c == '@' or c == '~':
       inc i
       while i < s.len and s[i] notin {' ', '(', ')', '\n'}: inc i
     else:
@@ -1044,6 +1054,47 @@ proc diffDecls*(before, after: seq[NifDecl]; blind: bool): DeclDelta =
   for name, group in afterByName:
     let consumed = used.getOrDefault(name, 0)
     if group.len > consumed: result.added += group.len - consumed
+
+proc readDeclDigests*(path: string): Table[string, (string, string)] =
+  ## Parse a `<mod>.decls.nif` sidecar into `symbol -> (sem-input digest,
+  ## lowering-output digest)`. Line based, like `splitNifDecls`: the file is
+  ## written one `(decl <sym> "<in>" "<out>")` per line by construction
+  ## (`src/hexer/decldigest.nim`), and both digests are hex, so no quoting
+  ## subtleties arise.
+  result = initTable[string, (string, string)]()
+  if not fileExists(path): return
+  for line in readFile(path).splitLines:
+    let s = line.strip()
+    if not s.startsWith("(decl "): continue
+    let rest = s.substr("(decl ".len)
+    let sp = rest.find(' ')
+    if sp <= 0: continue
+    let sym = rest.substr(0, sp-1)
+    var quoted: seq[string] = @[]
+    var i = sp
+    while i < rest.len:
+      if rest[i] == '"':
+        let e = rest.find('"', i+1)
+        if e < 0: break
+        quoted.add rest.substr(i+1, e-1)
+        i = e + 1
+      else:
+        inc i
+    if quoted.len >= 2:
+      result[sym] = (quoted[0], quoted[1])
+
+proc digestChanges*(before, after: Table[string, (string, string)];
+                    input: bool): int =
+  ## How many symbols present in BOTH sidecars have a different digest. A
+  ## symbol that appeared or vanished is a different question (`added`/
+  ## `removed` in `DeclDelta`) and is deliberately not counted here.
+  result = 0
+  for sym, d in before:
+    if after.hasKey(sym):
+      let o = after.getOrDefault(sym)
+      let a = if input: d[0] else: d[1]
+      let b = if input: o[0] else: o[1]
+      if a != b: inc result
 
 proc editOnce(text, needle, replacement, what: string): string =
   ## `replace` with the count checked. The scenario below finds its edit sites
@@ -1144,6 +1195,11 @@ proc incrementalDeclStabilityTests*() =
   let sBase = splitNifDecls(sNif)
   let xBase = if xNif.len > 0 and fileExists(xNif): splitNifDecls(xNif)
               else: @[]
+  let dNif = findModuleNif(cache, "b3b_lib.nim", "decls")
+  let dBase = readDeclDigests(dNif)
+  expect dBase.len >= 8,
+         "cold: the .decls.nif sidecar has only " & $dBase.len &
+         " entries; hexer is not recording per-declaration digests"
   expect sBase.len >= 11,
          "cold: the fixture's .s.nif has only " & $sBase.len &
          " top-level declarations; it cannot measure locality"
@@ -1159,6 +1215,10 @@ proc incrementalDeclStabilityTests*() =
          " added / " & $sInplace.removed & " removed declarations in the " &
          ".s.nif; a same-length literal edit inside one proc must touch " &
          "exactly one declaration or symbol-granularity lowering has no premise"
+  let dInplace = digestChanges(dBase, readDeclDigests(dNif), true)
+  expect dInplace == 1,
+         "in-place: " & $dInplace & " declarations changed by the .decls.nif " &
+         "sem-input digest (expected exactly 1)"
   var xInplaceChanged = -1
   if xBase.len > 0 and fileExists(xNif):
     let d = diffDecls(xBase, splitNifDecls(xNif), false)
@@ -1195,10 +1255,19 @@ proc incrementalDeclStabilityTests*() =
   # (`result.N`, `acc.N`, `s.N`) -- `sembasics.makeLocalSym` counts per name
   # per MODULE. That is prerequisite 1 of B3b; when it lands this number goes
   # to 0 and the bound below stays satisfied.
-  expect sInsertBlind.changed <= sBase.len - 4,
+  # F1 landed prerequisite 1: a local is numbered inside its own routine and
+  # carries that routine's name, so a proc inserted in the middle renames
+  # nothing below it. What is left is the declaration the edit actually
+  # touches. Raising this bound means the numbering regressed.
+  expect sInsertBlind.changed <= 2,
          "insert: " & $sInsertBlind.changed & " of " & $sBase.len &
-         " declarations changed with line info ignored; a proc inserted in " &
-         "the middle must not invalidate more than what follows it"
+         " declarations changed with line info ignored (expected at most 2); " &
+         "a proc inserted in the middle must not rename another " &
+         "declaration's locals"
+  let dInsert = digestChanges(dBase, readDeclDigests(dNif), true)
+  expect dInsert <= 2,
+         "insert: " & $dInsert & " declarations changed by the .decls.nif " &
+         "sem-input digest (expected at most 2)"
 
   # (c) one statement inserted into a proc in the middle of the file.
   inc phases
@@ -1214,10 +1283,20 @@ proc incrementalDeclStabilityTests*() =
   expect sStmtBlind.changed <= sStmtRaw.changed,
          "stmtadd: ignoring line info made the churn WORSE (" &
          $sStmtBlind.changed & " vs " & $sStmtRaw.changed & ")"
-  expect sStmtBlind.changed <= 3,
+  expect sStmtBlind.changed <= 1,
          "stmtadd: " & $sStmtBlind.changed & " declarations differ even " &
-         "with line info ignored (expected at most 3); a line-info-blind " &
+         "with line info ignored (expected at most 1); a line-info-blind " &
          "declaration digest no longer recovers locality"
+  # The same question asked of the artifact B3b would actually consult. The
+  # textual strip above and hexer's token-stream digest are computed by
+  # completely different code over completely different representations, so
+  # their agreement is the cross-check that neither is lying.
+  let dStmt = digestChanges(dBase, readDeclDigests(dNif), true)
+  expect dStmt <= 1,
+         "stmtadd: " & $dStmt & " declarations changed by the .decls.nif " &
+         "sem-input digest (expected at most 1); the sidecar is what B3b " &
+         "consults, so this is the number that decides whether a " &
+         "declaration-level lowering can skip work"
 
   restoreSources()
   build("restore")
@@ -1227,6 +1306,8 @@ proc incrementalDeclStabilityTests*() =
        " (blind ", sInsertBlind.changed, ", added ", sInsertRaw.added,
        ") | stmtadd changed ", sStmtRaw.changed, " (blind ",
        sStmtBlind.changed, ")",
+       " | decls digest ", dBase.len, " syms, changed ", dInplace, "/",
+       dInsert, "/", dStmt,
        (if xInplaceChanged >= 0: " | .x.nif in-place changed " &
                                  $xInplaceChanged else: "")
 
