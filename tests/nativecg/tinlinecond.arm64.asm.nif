@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 15994            )
+(.indexat 15933            )
 (stmts
  (arch arm64)
  (type :`cchar.0.
@@ -56,10 +56,6 @@
     (sp)-16)
    (stp
     (x20)
-    (x21)
-    (sp)-16)
-   (stp
-    (x22)
     (x19)
     (sp)-16)
    (sub
@@ -71,35 +67,35 @@
     (ptr
      (ptr
       (c 8)))
-    (x9))
+    (x11))
    (mov `tmp0.0
     (x1))
    (rebind :`tmp1.0
     (ptr
      (ptr
       (c 8)))
-    (x9))
+    (x11))
    (gstore `tmp1.0 cmdLine.0)
    (kill `tmp1.0)
    (rebind :`tmp2.0
     (ptr
      (ptr
       (c 8)))
-    (x9))
+    (x11))
    (mov `tmp2.0
     (x2))
    (rebind :`tmp3.0
     (ptr
      (ptr
       (c 8)))
-    (x9))
+    (x11))
    (gstore `tmp3.0 nimEnviron.0)
    (kill `tmp3.0)
    (scope
     (scope
      (rebind :`tmp4.0
       (bool)
-      (x9))
+      (x11))
      (gload `tmp4.0 `iniGuard.0.)
      (cbz `tmp4.0 `L2.0)
      (kill `tmp4.0)
@@ -109,7 +105,7 @@
      (lab :`L1.0)
      (rebind :`tmp5.0
       (i 64)
-      (x9))
+      (x11))
      (mov `tmp5.0 1)
      (gstore `tmp5.0 `iniGuard.0.)
      (kill `tmp5.0)
@@ -117,7 +113,7 @@
       (scope
        (rebind :`tmp6.0
         (bool)
-        (x9))
+        (x11))
        (gload `tmp6.0 `iniGuard.0.sysvq0asl)
        (cbz `tmp6.0 `L4.0)
        (kill `tmp6.0)
@@ -127,7 +123,7 @@
        (lab :`L3.0)
        (rebind :`tmp7.0
         (i 64)
-        (x9))
+        (x11))
        (mov `tmp7.0 1)
        (gstore `tmp7.0 `iniGuard.0.sysvq0asl)
        (kill `tmp7.0)
@@ -135,7 +131,7 @@
         (scope
          (rebind :`tmp8.0
           (nil)
-          (x9))
+          (x11))
          (mov `tmp8.0
           (nil))
          (rebind :`tmp9.0
@@ -153,7 +149,7 @@
       (scope
        (rebind :`tmp10.0
         (bool)
-        (x9))
+        (x11))
        (gload `tmp10.0 `iniGuard.0.syn1lfpjv)
        (cbz `tmp10.0 `L6.0)
        (kill `tmp10.0)
@@ -163,7 +159,7 @@
        (lab :`L5.0)
        (rebind :`tmp11.0
         (i 64)
-        (x9))
+        (x11))
        (mov `tmp11.0 1)
        (gstore `tmp11.0 `iniGuard.0.syn1lfpjv)
        (kill `tmp11.0)
@@ -171,7 +167,7 @@
         (scope
          (rebind :`tmp12.0
           (bool)
-          (x9))
+          (x11))
          (gload `tmp12.0 `iniGuard.0.sysvq0asl)
          (cbz `tmp12.0 `L8.0)
          (kill `tmp12.0)
@@ -181,7 +177,7 @@
          (lab :`L7.0)
          (rebind :`tmp13.0
           (i 64)
-          (x9))
+          (x11))
          (mov `tmp13.0 1)
          (gstore `tmp13.0 `iniGuard.0.sysvq0asl)
          (kill `tmp13.0)
@@ -189,7 +185,7 @@
           (scope
            (rebind :`tmp14.0
             (nil)
-            (x9))
+            (x11))
            (mov `tmp14.0
             (nil))
            (rebind :`tmp15.0
@@ -207,7 +203,7 @@
         (scope
          (rebind :`tmp16.0
           (bool)
-          (x9))
+          (x11))
          (gload `tmp16.0 `iniGuard.0.for2ybv4p1)
          (cbz `tmp16.0 `L10.0)
          (kill `tmp16.0)
@@ -217,7 +213,7 @@
          (lab :`L9.0)
          (rebind :`tmp17.0
           (i 64)
-          (x9))
+          (x11))
          (mov `tmp17.0 1)
          (gstore `tmp17.0 `iniGuard.0.for2ybv4p1)
          (kill `tmp17.0)
@@ -225,7 +221,7 @@
           (scope
            (rebind :`tmp18.0
             (bool)
-            (x9))
+            (x11))
            (gload `tmp18.0 `iniGuard.0.sysvq0asl)
            (cbz `tmp18.0 `L12.0)
            (kill `tmp18.0)
@@ -235,7 +231,7 @@
            (lab :`L11.0)
            (rebind :`tmp19.0
             (i 64)
-            (x9))
+            (x11))
            (mov `tmp19.0 1)
            (gstore `tmp19.0 `iniGuard.0.sysvq0asl)
            (kill `tmp19.0)
@@ -243,7 +239,7 @@
             (scope
              (rebind :`tmp20.0
               (nil)
-              (x9))
+              (x11))
              (mov `tmp20.0
               (nil))
              (rebind :`tmp21.0
@@ -339,7 +335,7 @@
         (kill p.0x9))
        (lab :returnLabel.0x3)))
      (var :`x.0h1``main`0
-      (x20)
+      (x9)
       (i 64))
      (scope
       (scope
@@ -353,7 +349,7 @@
          (stmts
           (rebind :`tmp22.0
            (i 64)
-           (x9))
+           (x11))
           (mov `tmp22.0 1)
           (cbz `tmp22.0 `L13.0)
           (kill `tmp22.0)
@@ -375,7 +371,7 @@
             (lab :returnLabel.0h16``main`0)))
           (rebind :`x.0h1``main`0
            (i 64)
-           (x20))
+           (x9))
           (add `x.0h1``main`0 `x.0h7``main`0)
           (scope
            (scope
@@ -395,7 +391,7 @@
        (kill i.0h5``main`0)))
      (scope
       (var :f.0x13
-       (x21)
+       (x20)
        (ptr `t.0.IArefSX46ileX4fbj0syn1lfpjv.syn1lfpjv))
       (gload f.0x13 stdout.0.syn1lfpjv)
       (scope
@@ -432,11 +428,11 @@
          (s)string.0.sysvq0asl)
         (rebind :`tmp25.0
          (i 64)
-         (x9))
+         (x11))
         (lea `tmp25.0 s.0x16)
         (rebind :`tmp26.0
          (i 64)
-         (x10))
+         (x12))
         (lea `tmp26.0 `tmp.0x15)
         (rebind :`tmp27.0
          (i 64)
@@ -470,7 +466,7 @@
         (kill `tmp25.0)
         (scope
          (var :`x.0x17
-          (x20)
+          (x9)
           (aptr
            (c 8)))
          (scope
@@ -502,17 +498,17 @@
            (ble `L17.0)
            (rebind :`x.0x17
             (u 64)
-            (x20))
+            (x9))
            (rebind :`tmp28.0
             (ptr
              (c 8))
-            (x9))
+            (x11))
            (rebind :`tmp29.0
             (i 64)
-            (x10))
+            (x12))
            (rebind :`tmp30.0
             (ptr LongString.0.sysvq0asl)
-            (x11))
+            (x13))
            (mov `tmp30.0
             (mem
              (dot s.0x16 more.0)))
@@ -529,55 +525,55 @@
            (kill `tmp29.0)
            (rebind :`tmp31.0
             (i 64)
-            (x9))
+            (x11))
            (rebind :`x.0x17
             (u 64)
-            (x20))
+            (x9))
            (add3 `x.0x17 `tmp31.0 0)
            (kill `tmp31.0)
            (rebind :`x.0x17
             (aptr
              (c 8))
-            (x20))
+            (x9))
            (b `L16.0)
            (lab :`L17.0)
            (rebind :`x.0x17
             (u 64)
-            (x20))
+            (x9))
            (rebind :`tmp32.0
             (ptr
              (u 64))
-            (x9))
+            (x11))
            (lea `tmp32.0
             (dot s.0x16 bytes.0))
            (rebind :`tmp33.0
             (i 64)
-            (x9))
+            (x11))
            (rebind :`tmp34.0
             (u 64)
-            (x9))
+            (x11))
            (add `tmp34.0 1)
            (rebind :`tmp35.0
             (aptr
              (c 8))
-            (x9))
+            (x11))
            (rebind :`tmp36.0
             (i 64)
-            (x9))
+            (x11))
            (rebind :`x.0x17
             (u 64)
-            (x20))
+            (x9))
            (add3 `x.0x17 `tmp36.0 0)
            (kill `tmp36.0)
            (rebind :`x.0x17
             (aptr
              (c 8))
-            (x20))
+            (x9))
            (lab :`L16.0)
            (lab :returnLabel.0x27)
            (kill `x.0x24)))
          (var :`x.0x18
-          (x22)
+          (x10)
           (i 64))
          (scope
           (scope
@@ -609,7 +605,7 @@
            (ble `L19.0)
            (rebind :`tmp37.0
             (ptr LongString.0.sysvq0asl)
-            (x9))
+            (x11))
            (mov `tmp37.0
             (mem
              (dot s.0x16 more.0)))
@@ -715,12 +711,8 @@
     (sp)
     (ssize))
    (ldp
-    (x22)
-    (x19)
-    (sp)16)
-   (ldp
     (x20)
-    (x21)
+    (x19)
     (sp)16)
    (ldp
     (x29)
@@ -772,4 +764,4 @@
    (ret))))(.index
  (x `cchar.0. 58)
  (x `iniGuard.0. 151)
- (x isLe.0. 15261))
+ (x isLe.0. 15200))
