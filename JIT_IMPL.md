@@ -87,6 +87,7 @@ wave 3  A2a  buffer-level phase entry points + global reset (per tool)     [para
 wave 4  B1   nativenif as a library + memory image + nimony r from memory  [nativenif repo; after B0]
         B2   engine behind executeExpr                                     [after B1 and A2c]
         B3   per-module code cache, nimrun guest                           [after B2]
+        B3f  declaration-level incremental sem            [OPTIONAL, unsettled]
         B4   hot reload, nimony dev                                        [after B3]
         B5   macOS/arm64 + Windows dev runtime                             [after B3]
 ```
@@ -754,6 +755,145 @@ for the appended-proc edit and 1 for the in-place edit (was 465 / 1);
 `hastur tests/nimony`, `tests/incremental`, ctfe_diff green; native boot
 byte-identical; `self.editbody` not worse.
 
+## Phase B3f — declaration-level incremental sem (OPTIONAL, unsettled)
+
+**Optional, and outside JIT.md's scope by construction** (JIT.md 2 draws the
+line at "no new optimizer, tier or speculation"; this is neither, but it is
+also not something JIT.md asks for -- `SUMMARY.md` and this file have both
+recorded it as "not planned" since B3b). It is written down because after B4
+`nimsem` is the single largest cost in the edit loop and the only phase
+nobody has attacked, and the owner should be able to decide on evidence
+rather than on that one line. Research: `notes/b3f.md`.
+
+The loop after B4, profiled on the live `semStmt` edit (127 modules, run 21):
+
+| phase | cpu | share |
+|---|---|---|
+| **nimsem** | 0.426 s | **42 %** |
+| hexer | 0.290 s | 29 % |
+| link | 0.141 s | 14 % |
+| arkham | 0.107 s | 11 % |
+| dceEmit | 0.051 s | 5 % |
+
+The idea, in B3e's idiom: sem already makes three passes over a module --
+`SemcheckTopLevelSyms`, `SemcheckSignatures`, `SemcheckBodies`
+(`semmain.nim:265,271,285`) -- plus a fourth, un-named post-processing bucket
+(`instantiateGenerics`, `injectDerefs`, contracts; `semmain.nim:511-556`)
+that is entirely demand-driven from the third. Phases 1 and 2 build the
+module's scope; phase 3 consumes it. So phase 3 is the skippable unit and a
+top-level routine is the grain, exactly as an arkham proc was in B3e.
+
+### Step 0 is a measurement, and it may end the phase
+
+**Do not design this before measuring it.** `nimsem` has no `passes`-style
+stage timer -- hexer's `passes.StageTimer` was built for precisely this
+question in B3b -- and the ledger carries one `"nimsem"` bucket total, so
+**nobody knows what share of 0.426 s phase 3 and the post-processing
+actually are.** If they are a small share, the phase buys little and stops
+here. Building the timer is an instrumentation commit in an idiom that
+already exists (`src/hexer/passes.nim`), hours not weeks, and it is the
+cheapest thing on this list.
+
+Two reasons to expect less than 42 %:
+
+* phase 2 does the heavy per-declaration work -- full type, pragma, hook,
+  converter and method processing (`semdecls.nim:1148-1163`) -- and this
+  design does **not** skip it;
+* F1 alone cut `self.editbody` 44 % (`notes/f1.md` §7) **without touching
+  sem's own body-check cost**, purely by letting hexer's and arkham's caches
+  hit. Some of what reads as "sem is 42 %, unattacked" may already be banked
+  indirectly, which would make the marginal value smaller than the raw share
+  implies. `notes/h1.md` is the standing warning here: that phase's 0.36 s
+  premise turned out to be an accidental deep copy, not the algorithm.
+
+### Prerequisites -- three of five already built
+
+1. **Per-declaration sem-INPUT digests** -- built. F1's
+   `hexer/decldigest.nim` writes `<mod>.decls.nif`, one line-info-blind entry
+   per declaration (`digestToplevel`, `decldigest.nim:150`), and
+   `decl-stability` already asserts on them.
+2. **Declaration-stable sem output** -- built (F1), and its synthesized-name
+   half too (F2's `passes.TempNamer`).
+3. **The two-level cross-module rule** -- built twice, in B3d §3.3 and B3e §4:
+   ask the file stamp first, and a stamp that MOVED asks about the specific
+   declarations this unit actually read.
+4. **An intra-module "what did this body read" map** -- NOT built. B3e's
+   per-proc read attribution is the closest precedent but is arkham code over
+   asm-NIF; a same-module equivalent has to be built fresh against nimony's
+   `nifprelude` layer.
+5. **Generic-instantiation replay** -- NOT built, and see below.
+
+### The hard part, and it has no precedent on this branch
+
+`c.instantiatedProcs` starts empty on every compile (`sem.nim:640-727`): the
+compiler already re-instantiates every generic from scratch, every time.
+Instantiation is a per-declaration **demand** whose satisfaction is
+module-wide -- whichever declaration asks first satisfies it for everyone. So
+skipping a body does not merely skip work; it can silently **starve the
+module of an instantiation that only that body would have asked for**.
+
+This is B3f's version of B3e's cautionary finding ("a body edit can change
+another proc's frame"), and it is worse in one specific way: **every prior
+phase's miss-mode was a slow path or a loud error** -- a wrong blob hit is an
+unresolved symbol, a stale `.c.nif` is a re-run. Here a miss is a *smaller
+correct-looking file*, i.e. a wrong compile. Any design must replay a skipped
+declaration's instantiation demands (B3e's "replays what it owed the module")
+rather than assume they were incidental.
+
+Note also `c.genericInnerProcs`: not a fixpoint, but its consumer
+`reorderInnerGenericInstances` is whole-module, so the *set* matters and the
+set is built from every declaration.
+
+One reassurance, recorded so nobody re-checks it: `attachSpecialProc`'s
+hook/converter/method registration was examined for B3e's `(smry ...)` shape
+-- a signature that is secretly a function of the body -- and does **not**
+have it, because it runs in phase 2, which this design does not skip.
+Likewise `typeHooks`, `converters`, `converterIndexMap`, `classes`,
+`toBuild`, `toBundle` and `exports` are populated in phase 2 and are
+therefore **not** body-skip hazards at all; `templateInstCounter`,
+`usedTypevars` and `fieldCounts` are already safely scoped.
+
+### The key
+
+Per B3e §3.2: the declaration's own sem-input digest; the sem-input digest of
+every declaration it named; the module's imports by stamp, then per-reference
+for a stamp that moved; and a tool build-id stamp so a toolchain upgrade
+cannot read as "nothing changed" (B3e §8).
+
+### Gate
+
+* **`.s.nif` byte-identical** between a skip-enabled run and a full run,
+  across the cache states B3e's self-test enumerates (`notes/b3e.md` §5), plus
+  one shape B3e's corpus never needed: an edit to a generic's only caller.
+* **`instantiateGenerics`'s emitted set identical** between the two runs.
+  This is strictly stronger than byte-equality in the failure mode that
+  matters, because a missing instantiation makes a *smaller* file that a
+  per-declaration digest can miss.
+* `hastur boot --boot-backend:native` stages 1 == 2 == 3 -- the strongest
+  practical oracle, the compiler being the largest generic-heavy corpus here.
+* `hastur tests/nimony`, `tests/incremental`, `tests/ctfe_diff` green.
+* `--no-incsem` / `NIMONY_INCSEM=off`, in the family of `--no-blobcache` and
+  `NIMONY_ARKHAMCACHE=off`, with the "inert when off" check B3e's gate used.
+
+### Effort, and reasons not to do it
+
+At least **three F1/F2/B3e-scale efforts stacked** -- the stage timer, the
+intra-module read map, and generic-instantiation replay -- not one branch.
+
+Against doing it: step 0 may show phase 3 is a minority of `nimsem`; the
+miss-mode is a wrong compile rather than a slow path, which no earlier phase
+on this branch has had to defend against; it deepens divergence from upstream
+in `sem.nim`, the file the 2026-09-07 merge chain fought hardest over
+(`MERGE.md`); and the cheaper win is still on the table -- **B3b's remaining
+half is worth ~0.18 s** (hexer 0.29 s against a measured 0.11 s floor) for one
+phase of work in a tool that is already declaration-incremental everywhere
+else.
+
+Gate for step 0 alone: a `nimsem` stage timer, byte-neutral over the corpus
+(F2's `StageTimer` bar), and a line in `bench/results/<date>/progress.md`
+giving the four-way split of `nimsem` on `self.editbody`. That number decides
+whether B3f exists.
+
 ## Phase B4 — hot reload and `nimony dev`
 
 Built on **macOS/arm64**, which is the platform with the evidence behind it.
@@ -1022,5 +1162,6 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3e | merged (pin nativenif 5f6f011) -- done on `jit/b3e` + nativenif `jit/b3e-native` (`notes/b3e.md`): `--asmcache:DIR` writes a `<mod>.arkham.nif` sidecar holding each proc's line-info-blind `.c.nif` digest and the BYTE RANGE its text occupies in the `.asm.nif` beside it -- no generated byte is stored, the text is copied out of the module's own previous output whose content hash the sidecar records, so the two cannot disagree. A spliced proc is a `(arkhamsplice n)` marker in the token buffer (a remembered position does not survive `finish`'s peephole) and replays what it owed the module (`rodata`, whose names are minted from the running count, and the two firmware divider flags). The key: arkham's build id + target + every non-proc declaration + every proc SIGNATURE + the ANSWERS of `cleanSigProcNames`/`noReturnProcs` (the latter walks every body, so a body edit can change another proc's frame); hexer's `(smry ...)` is excluded -- it is computed from the proc's own body and made every signature a function of it (0 of 526 spliced until that was found). Cross-module: the file stamp is asked first, and a stamp that MOVED asks about the declarations this lowering actually read out of that module, per PROC -- `notes/b3d.md` §3.3's per-reference rule one tool earlier. Live edit: 523 of 526, 76 of 78 and 8 of 9 procs spliced, arkham 0.259 -> 0.089 s, `sem.nim` alone 196 -> 63 ms; cold -2 %; headline 2.61 -> 0.92 s. Byte-identical: 651 splice self-test checks over five corpus/target pairs in eight states, 0 of 127 compiler modules differ cached vs not (also with the cache populated before the edit: 4045 procs spliced, 0 differ), the linked compiler identical, refactor gate identical to `7b838ec`, boot 1 == 2 == 3 | nativenif 5f6f011 |
 | H1 | NOT built as scoped -- the premise was a measurement artifact (`notes/h1.md`, `bench/results/2026-09-07/h1.txt`): `dceLive`'s 0.36 s was not the whole-program recomputation but an accidental deep copy. `markLive` took `moduleGraphs` non-`var`, so every lookup bound `compat2`'s BY-VALUE `getOrQuit` and `let graph = moduleGraphs.getOrQuit(moduleName)` copied a whole `ModuleAnalysis` (a `Table[SymId, HashSet[SymId]]` plus two `HashSet`s) on each of the 7867 worklist pops, plus the dependency set on top. Reading the 131 `.dce.nif` is 19 ms and the fixpoint is 7 ms; the other 305 ms was copying. Taking the table as `var` and never materializing the intermediate: `hexer dl` 0.36 -> 0.05 s, in-build `dceLive` 0.367 -> 0.062 s (gate <= 0.08), first-rebuild-after-an-edit wall 1.39 -> 1.10 s, cold 5.08 -> 4.79 s, all 131 `<M>.live.nif` + anchor byte-identical. No incremental live set built: at 51 ms against an 80 ms gate it could remove ~11 ms for a persisted graph, a delta classifier, a fallback rule and a byte-identity obligation on every live-set-SHRINKING edit (which needs the previous analysis, because minimality can only be rechecked by re-running the fixpoint). Also found: `devloop_ab.sh self.editbody`'s 5-round MEDIAN cannot measure `dceLive` -- its edit leaves `.dce.nif` byte-identical after round 0, so 4 of 5 rounds skip the node | merged from jit/h1 |
 | upstream merge chain | merged (`MERGE.md`): the six commits master gained after the fork point, one branch per commit, plus the F1 respelling (`643569c2`) that `e1da48e9` requires and the nativenif re-pins `3ec73fef` and `9d7fcf78`. 795/795, boot 1 == 2 == 3, ctfe_diff 0, decl-stability 1/0/1/1. **Costs the edit loop 13.8 % cpu** (`self.editbody`, pre-chain `6870790c` against post-chain `95fff89d` interleaved in one run; editcall 1.147, editdead 1.156, cold 1.072, no-change 1.000, peak RSS unmoved). Decomposed commit by commit into five interleaved runs whose product is 1.137 against the 1.138 measured end to end: **`c6be04e1` "no globals in nifcore" 1.057** and **`e1da48e9` "nifsyms refactor" (with its pin) 1.066** are the whole of it, both putting an indirection on the pipeline's hottest read; steps 1-3 together 0.998, step 5 1.005, and OUR F1 respelling **1.006**, i.e. nothing in the number is ours. Tested and rejected as a fix: memoizing `decldigest`'s per-token spelling (1.074 -> 1.070, digests bit-identical). The headline against the fork point is therefore 2.58 -> 1.02 s wall on the live edit (was 2.30 -> 0.92 before the chain) | run 19/20, `bench/results/2026-09-07/postchain.txt` |
+| B3f | **OPTIONAL, and step 0 is a measurement that may end it** (`notes/b3f.md`). After B4, `nimsem` is 0.426 s of the 1.05 s live edit -- 42 %, the largest single cost and the only phase unattacked. The seam exists: sem already makes three passes (`semmain.nim:265,271,285`) plus a demand-driven post-processing bucket (`:511-556`), and phase 3 (bodies) is the skippable unit with a top-level routine as the grain, exactly as an arkham proc was in B3e. Three of five prerequisites are already built -- F1's per-declaration sem-input digests (`<mod>.decls.nif`), declaration-stable output (F1+F2), and the stamp-then-per-reference cross-module rule (B3d 3.3, B3e 4). **But nobody knows what share of 0.426 s phase 3 actually is**: nimsem has no `passes`-style stage timer and the ledger has one bucket. Two reasons to expect well under 42 % -- phase 2 does the heavy per-declaration work and is NOT skipped (`semdecls.nim:1148-1163`), and F1 alone cut `self.editbody` 44 % without touching sem's body-check cost at all, so some of the share may already be banked indirectly (`notes/h1.md` is the standing warning). **The hard part has no precedent here**: `c.instantiatedProcs` starts empty every compile (`sem.nim:640-727`), so instantiation is a per-declaration DEMAND satisfied module-wide by whoever asks first -- skipping a body can starve the module of an instantiation only that body would have requested. Every prior phase's miss-mode was a slow path or a loud unresolved symbol; this one is a smaller correct-looking file, i.e. a wrong compile. Checked and cleared so nobody re-checks it: `attachSpecialProc` does NOT have B3e's `(smry ...)` shape (it runs in phase 2), and `typeHooks`/`converters`/`classes`/`toBuild`/`exports` are phase-2 populated and not body-skip hazards. Effort: at least three F1/F2/B3e-scale efforts stacked. The cheaper win is still on the table -- B3b's remaining half is ~0.18 s (hexer 0.29 s against a measured 0.11 s floor) for one phase. Gate for step 0 alone: a byte-neutral nimsem stage timer and the four-way split of `nimsem` in `progress.md`; that number decides whether B3f exists | not started |
 | B4 | **merged-ready on `jit/b4`; the gate is met** (`notes/b4.md`). **Stage 1 -- 1a**, the design question the staging existed to catch: the trace-table walk is the SAME mechanism as `lib/std/stacktraces.nim` -- synchronous, in the guest's address space -- because `cfaOff` is valid only past the prologue (`tracetable.nim:36-39`) and an out-of-process guest cannot be reached across the boundary without the entitlement B0's design refuses (`hostrun.nim:28-34`). **1b**: `guestwire.nim` (socketpair on fd 3, length-framed records, `posix_spawn`, signal re-raise), `nimrun.nim` (the loader -- it calls `engine.runWholeProgram`, so out-of-process is not a second implementation), `runWholeProgramOutOfProcess`, `nimony r --guest:inproc\|subprocess` (default `inproc`); 50 runs from one host process: in-process 51 threads / +13.6 GB / 0.52 s, out-of-process 1 thread / 0 / 0.15 s. **Stage 2**: the `extproc` path CANNOT provide JIT.md 7.3's build-time slot indirection (arkham classifies `extproc` from the Leng decl alone with no flag; nifasm follows a foreign symbol into its module with no exclusion set) -- so the same indirection is installed at the FIRST RELOAD instead: re-assemble the whole edited program, lay its code into free arena space with the LIVE data region as its data addresses (`MemRegion` separates `at` from `vaddr` for exactly this), walk the guest's stack at a safepoint, and overwrite each replaced proc's entry with `emitA64Stub`'s 12-byte stub through a slot. `devwalk.nim` (the walk), `devclassify.nim` (the classifier -- no layout sidecar needed for soundness, argued), `devhost.nim` (the swap), `devdriver.nim` + `nimony dev` (`--dev-interval`, `--dev-max-edits`), `lib/std/devreload.nim` (the safepoint), `tests/dev/` (the demo and the gate). Gate output: a body edit reloads at tick N+1 with the global counter intact and `devPoll()` reporting generation 1; a signature edit restarts with `restart: the signature of render changed`; the restarted guest is itself reloadable. nativenif `ad886112` adds `AsmSession.wantTraceTable` and `MemImage.traceTable`, both three lines. 795/795, boot 1 == 2 == 3, ctfe_diff 0, decl-stability 1/0/1/1, `self.editbody` neutral | jit/b4, nativenif ad886112 |
 | B5 | planned (retitled: Windows + linux/x86-64; three macOS/arm64 bullets struck as built or designed out) | |
