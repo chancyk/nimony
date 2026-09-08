@@ -757,8 +757,8 @@ byte-identical; `self.editbody` not worse.
 ## Phase B4 — hot reload and `nimony dev`
 
 Built on **macOS/arm64**, which is the platform with the evidence behind it.
-JIT.md 7.4's "(x64 first)" is inherited from a B1 premise B0 formally
-overturned (`bench/results/2026-09-06/native_status.md:242-245`) and both
+The "(x64 first)" this section used to carry (JIT.md:637, in the phase list of
+its §9) is inherited from a B1 premise B0 formally overturned (`bench/results/2026-09-06/native_status.md:242-245`) and both
 halves of that premise are false in the built system: the symbol resolver uses
 `dlsym` on every POSIX host (`nativenif/src/nifasm/core/hostsyms.nim:123-145`),
 and the "existing TLS mechanism" is precisely what x86-64 lacks under

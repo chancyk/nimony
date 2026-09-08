@@ -1,0 +1,13 @@
+round 0  A  wall 1.103  cpu 1.120  rss 146MB
+round 0  B  wall 1.113  cpu 1.134  rss 146MB
+round 1  A  wall 1.018  cpu 1.044  rss 107MB
+round 1  B  wall 1.023  cpu 1.047  rss 107MB
+round 2  A  wall 1.015  cpu 1.039  rss 107MB
+round 2  B  wall 1.021  cpu 1.046  rss 107MB
+round 3  A  wall 1.017  cpu 1.042  rss 107MB
+round 3  B  wall 1.029  cpu 1.051  rss 107MB
+round 4  A  wall 1.024  cpu 1.046  rss 107MB
+round 4  B  wall 1.024  cpu 1.046  rss 107MB
+self.editbody: A wall median 1.018  min 1.015 | cpu median 1.044  min 1.039 | peak rss 107 MB
+self.editbody: B wall median 1.024  min 1.021 | cpu median 1.047  min 1.046 | peak rss 107 MB
+B/A cpu (median): 1.003   B/A cpu (min): 1.007   B/A peak rss: 1.00

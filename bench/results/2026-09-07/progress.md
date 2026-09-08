@@ -393,3 +393,34 @@ running the pre-chain and post-chain toolchains over the same corpus.
 wrong: it claims 1 proc re-lowered in all three modules where three toolchains
 over two corpora give 1, 2 and 3. Treat the two rows above as the reference and
 `11/1, 83/1, 527/1` as superseded.
+
+---
+
+## Run 21: B4 stage 1 against its parent -- interleaved, machine quiet
+
+A = `/tmp/merge-u1` (`95fff89d`, which is `5df66183`'s code: the tip commit
+touches no `src/`), B = `/tmp/b4/nimony` (`jit/b4`, stage 1). Raw rounds:
+`bench/results/2026-09-07/b4stage1.txt`.
+
+| scenario | A wall / cpu / peak MB | B wall / cpu / peak MB | B/A cpu | B/A rss |
+|---|---|---|---|---|
+| `self.editbody` | 1.018 / 1.044 / 107 | 1.024 / 1.047 / 107 | **1.003** | 1.00 |
+
+Neutral, as it should be: stage 1 adds two modules and a flag arm that no
+compile-graph node reaches. The A side also reproduces run 19's head column
+(1.020 / 1.045 / 107) to three digits, which is the check that the two runs are
+commensurable.
+
+### A trap this run walked into first, worth writing down
+
+The obvious base -- `/Users/chanc/Projects/nimony`, the main checkout, which
+IS at the tip commit -- gave **1.127 cpu**, an apparent 13 % regression. It is
+not one. That tree's `bin/nimony` was last built at 15:50, i.e. **before**
+`6870790c`, so its toolchain is the PRE-CHAIN one and the ratio measured is the
+merge chain (run 20: 1.138), not the change. Run 19 measured the head from
+`/tmp/merge-u1` for the same reason and did not say so.
+
+**The rule: a base is a BUILT TOOLCHAIN, not a commit.** Check the mtime of
+`bin/nimony` against the commit date before believing a ratio, or rebuild the
+base. The main checkout is not a safe default base while it holds an older
+build than its own HEAD.
