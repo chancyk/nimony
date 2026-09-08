@@ -318,7 +318,7 @@ proc analyseOconstr(c: var Context; n: var Cursor) =
       n.into:
         assert n.isSymbol
         let expected = lookupField(c.typeCache, objType, n.symId)
-        assert not cursorIsNil(expected), "could not lookup type for " & pool.syms[n.symId]
+        assert not cursorIsNil(expected), "could not lookup type for " & pool.symString(n.symId)
         skip n # field name
         checkNilMatch c, n, expected
         skip n # value

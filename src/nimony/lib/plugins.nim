@@ -133,7 +133,7 @@ proc symText*(n: NifCursor): string {.inline.} =
 
 proc symText*(s: SymId): string {.inline.} =
   ## Resolves a plugin-pool symbol handle to its name.
-  pluginPool.syms[s]
+  pluginPool.symString(s)
 
 proc identText*(n: NifCursor): string {.inline.} =
   ## Returns the current `Ident` text.
@@ -308,7 +308,10 @@ proc genSym*(): SymId =
   # `unusedNameBase` already carries the owning routine's namespace inside the
   # identifier (`` `nimonyTemp`semExpr`0 ``), so a gensym lands in that
   # routine's name space by construction and the number is all that is added.
-  result = pluginPool.syms.getOrIncl(
+  #
+  # Qualified: this module imports nifcore `except symId` (it has its own
+  # `symId(Replacer)`), so the pool accessor has to be named through nifcore.
+  result = nifcore.symId(pluginPool,
     unusedNameBase & "." & $nextUnusedName)
   inc nextUnusedName
 

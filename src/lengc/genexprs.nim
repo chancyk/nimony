@@ -204,7 +204,7 @@ proc genField(c: var GeneratedCode; fld: Cursor; objBody: Cursor; objTypeIsImpor
           else:
             discard
           skip p
-    var x = c.m.pool.syms[s]
+    var x = c.m.pool.symString(s)
     if objTypeIsImported:
       extractBasename x
       stripLocalNs x

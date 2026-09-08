@@ -48,7 +48,7 @@ proc rewriteSymsToIdentsImpl(newBuf: var TokenBuf; n: var Cursor) =
   if not n.hasMore: return
   case n.kind
   of Symbol, SymbolDef:
-    var name = pool.syms[n.symId]
+    var name = pool.symString(n.symId)
     extractBasename name
     stripLocalNs name
     newBuf.addIdent(pool.strings.getOrIncl(name), n.info)
@@ -60,7 +60,7 @@ proc rewriteSymsToIdentsImpl(newBuf: var TokenBuf; n: var Cursor) =
     if (ek == OchoiceX or ek == CchoiceX) and firstChild.isSymbol:
       # unwrap the choice to a single ident:
       n.into:
-        var name = pool.syms[n.symId]
+        var name = pool.symString(n.symId)
         extractBasename name
         stripLocalNs name
         newBuf.addIdent(pool.strings.getOrIncl(name), n.info)
@@ -239,7 +239,7 @@ proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
   ## Symbols from the post-sem macro decl are rewritten to idents at the end
   ## so the plugin module re-runs through sem with its own scope.
   result = createTokenBuf(128)
-  let macroName = sourceIdent(pool.syms[macroSym])
+  let macroName = sourceIdent(pool.symString(macroSym))
   let implName = macroName & "Impl"
   let paramCount = countParams(macroDecl)
 
@@ -258,7 +258,7 @@ proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
 # ----------------------------------------------------------------------------
 
 proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
-  let symName = pool.syms[macroSym]
+  let symName = pool.symString(macroSym)
   var cleanName = ""
   for ch in symName:
     if ch in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
@@ -343,7 +343,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     echo "Macro plugin: failed to invoke ", cmd
     return ""
   if exitCode != 0:
-    echo "Error compiling macro plugin for '", sourceIdent(pool.syms[macroSym]), "':"
+    echo "Error compiling macro plugin for '", sourceIdent(pool.symString(macroSym)), "':"
     echo output
     return ""
 

@@ -58,6 +58,29 @@ Notes that cost hours to learn:
 - A cold build whose `--out` binary is named `nimony` and sits in the cwd
   used to fail (the CTFE sub-compile resolved the tool name to it); fixed on
   the branch, still true at the fork point: keep `--out` outside the source dir.
+- **`devloop_ab` interleaves within a run, not across runs — so two branches
+  must be compared in ONE invocation, never by comparing two invocations'
+  ratios.** The script alternates A B A B so drift hits both sides equally,
+  and that is exactly why a B/A ratio is only meaningful against the A side it
+  was measured beside. Comparing a ratio from one run with a ratio from
+  another silently reintroduces the drift the interleaving removed.
+
+  What it looks like when you get it wrong: measured against the fork point
+  the way `SUMMARY.md` describes, the F1-respell branch read B/A cpu **0.281**
+  against an earlier **0.260-0.261** — an apparent 8 % regression that does not
+  exist. `0ece350b` measured the same way in the same session read **0.257**,
+  and the two *B* sides were 0.994 and 0.995 cpu — identical. What had moved
+  was the **A** side, the FIXED fork-point toolchain: 3.536 s in one
+  invocation, 3.879 s in another. Nothing about A changed; the machine did.
+
+  Asked as a two-branch question — `bench/devloop_ab.sh <old-branch>
+  <new-branch> self.editbody 5`, both arms in one interleaved run — the answer
+  was **0.990 wall / 1.001 cpu, RSS 1.00**: no change, which is the truth.
+
+  The rule: the fork-point comparison is for the HEADLINE ("how far have we
+  come"), and it is only quotable as an absolute pair taken in one run. To ask
+  "did this change move the loop", interleave the two branches being compared
+  and read that run's ratio alone.
 
 ## 2. The A/B script (the one that produces the verdict)
 

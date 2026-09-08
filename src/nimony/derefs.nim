@@ -102,7 +102,7 @@ proc freshErrSym(c: var Context): SymId =
   ## without making it depend on how many OTHER declarations raise.
   var counter = addr c.errCounters.mgetOrPut(c.localNs, -1)
   counter[] += 1
-  result = pool.syms.getOrIncl(localSymName("`err", counter[], c.localNs))
+  result = pool.symId(localSymName("`err", counter[], c.localNs))
 
 proc endsWithOpenHderef(dest: TokenBuf): bool =
   ## True when the buffer's last value is a freshly opened `(hderef` head.
@@ -999,7 +999,7 @@ proc shouldCollapseTry(c: var Context; tryAfterTag: Cursor): bool =
 proc emitRefExceptionType(dest: var TokenBuf; info: NifLineInfo) =
   ## Emits `(ref Exception)` into `dest`.
   dest.copyIntoKind RefT, info:
-    dest.addSymUse pool.syms.getOrIncl(ExceptionName), info
+    dest.addSymUse pool.symId(ExceptionName), info
 
 proc trTryCollapsed(c: var Context; n: var Cursor) =
   ## Lower a try with ref-typed except arms into a single catchall
@@ -1022,7 +1022,7 @@ proc trTryCollapsed(c: var Context; n: var Cursor) =
 
     # Mint a fresh symbol for `err` (moved-out exc).
     let errSym = freshErrSym(c)
-    let excSym = pool.syms.getOrIncl(ExcThreadVarName)
+    let excSym = pool.symId(ExcThreadVarName)
 
     # Open the synthesized `(except . (stmts ...))`
     c.dest.addParLe ExceptU, info
@@ -1176,7 +1176,7 @@ proc trRaise(c: var Context; n: var Cursor) =
   if lookahead.isDotToken:
     if c.handlerStack.len > 0:
       let h = c.handlerStack[^1]
-      let excSym = pool.syms.getOrIncl(ExcThreadVarName)
+      let excSym = pool.symId(ExcThreadVarName)
       c.dest.copyIntoKind StmtsS, info:
         c.dest.copyIntoKind AsgnS, info:
           c.dest.addSymUse excSym, info
@@ -1194,8 +1194,8 @@ proc trRaise(c: var Context; n: var Cursor) =
 
   let opType = getType(c.typeCache, lookahead, {SkipAliases})
   if opType.typeKind == RefT:
-    let excSym = pool.syms.getOrIncl(ExcThreadVarName)
-    let failureSym = pool.syms.getOrIncl(FailureName)
+    let excSym = pool.symId(ExcThreadVarName)
+    let failureSym = pool.symId(FailureName)
     c.dest.copyIntoKind StmtsS, info:
       c.dest.addParLe AsgnS, info
       c.dest.addSymUse excSym, info

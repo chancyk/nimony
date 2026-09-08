@@ -1078,7 +1078,7 @@ proc parseSlotArgs(n: var Cursor; slot: var CmdSlot) =
 
 proc parseCommandDefinition(n: var Cursor; dag: var Dag) =
   if n.kind == SymbolDef:
-    let cmdName = pool.syms[n.symId]
+    let cmdName = pool.symString(n.symId)
     inc n
 
     var slots: seq[CmdSlot] = @[]
@@ -1115,7 +1115,7 @@ proc parseCommandDefinition(n: var Cursor; dag: var Dag) =
 proc parseDoRule(n: var Cursor; dag: var Dag) =
   var cmdName: string
   if n.kind == Symbol:
-    cmdName = pool.syms[n.symId]
+    cmdName = pool.symString(n.symId)
     inc n
   elif n.kind == Ident:
     cmdName = n.strVal

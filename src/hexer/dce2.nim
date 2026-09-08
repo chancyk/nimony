@@ -57,17 +57,18 @@ proc resolveSymbolConflicts(modules: Table[string, ModuleAnalysis];
   result = initTable[string, SymId]()
   for m in modules.values:
     for offer in m.offers:
-      let offerName = pool.syms[offer]
-      let key = removeModule(offerName)
+      let key = pool.symWithoutModule(offer)
       let existing = result.getOrDefault(key, SymId(0))
-      if existing == SymId(0) or prefersOffer(offerName, pool.syms[existing], mainModule):
+      # P0b's ownership rule, on upstream's accessors: the `offerName` binding
+      # this used to read was dropped when the loop head moved to
+      # `pool.symWithoutModule`, so the spelling is asked for directly.
+      if existing == SymId(0) or
+         prefersOffer(pool.symString(offer), pool.symString(existing), mainModule):
         result[key] = offer
 
 proc translate(resolved: ResolveTable; sym: SymId): SymId =
-  let symName = pool.syms[sym]
-  if isInstantiation(symName):
-    let key = removeModule(symName)
-    result = resolved.getOrDefault(key, sym)
+  if pool.symIsInstantiation(sym):
+    result = resolved.getOrDefault(pool.symWithoutModule(sym), sym)
   else:
     result = sym
 
@@ -99,8 +100,8 @@ proc markLive(moduleGraphs: var Table[string, ModuleAnalysis];
 
   while worklist.len > 0:
     let sym = translate(resolved, worklist.pop())
-    let moduleName = extractModule(pool.syms[sym])
-    assert moduleName.len > 0, "moduleName is empty for " & pool.syms[sym]
+    let moduleName = pool.symModule(sym)
+    assert moduleName.len > 0, "moduleName is empty for " & pool.symString(sym)
 
     # Check if symbol is already live in its owning module
     if not result.getOrQuit(moduleName).containsOrIncl(sym):
@@ -109,10 +110,10 @@ proc markLive(moduleGraphs: var Table[string, ModuleAnalysis];
         if moduleGraphs.getOrQuit(moduleName).uses.hasKey(sym):
           for dep in moduleGraphs.getOrQuit(moduleName).uses.getOrQuit(sym):
             let s = translate(resolved, dep)
-            let sowner = extractModule(pool.syms[s])
+            let sowner = pool.symModule(s)
             # Check if dependency is already live in its owning module
             if sowner.len > 0:
-              assert sowner in result, "sowner is not in result for " & pool.syms[s]
+              assert sowner in result, "sowner is not in result for " & pool.symString(s)
             if sowner.len > 0 and s notin result.getOrQuit(sowner):
               worklist.add(s)
 
@@ -148,7 +149,7 @@ proc tr(dest: var TokenBuf; n: var Cursor; alive: HashSet[SymId]; resolved: Reso
       n.into:
         if n.isSymbolDef:
           let def = n.symId
-          if isLocalName(pool.syms[def]):
+          if pool.symIsLocal(def):
             dest.addParLe(headTag, headInfo)
             dest.addSymDef def.toLengName, n.info
             inc n # skip symbol def
@@ -300,7 +301,7 @@ proc addResolved(b: var Builder; resolved: ResolveTable; keys: openArray[string]
       if resolved.hasKey(key):
         b.withTree "kv":
           b.addStrLit key
-          b.addSymbol pool.syms[resolved.getOrQuit(key)], ""
+          b.addSymbol pool.symString(resolved.getOrQuit(key)), ""
 
 proc addLiveMod(b: var Builder; modName: string; syms: HashSet[SymId]) =
   ## One `(mod "name" sym*)` block, symbols in sorted-by-name order.
@@ -440,7 +441,7 @@ proc liveOf*(ls: LiveSet; modName: string): HashSet[SymId] =
   else: initHashSet[SymId]()
 
 proc addInstantiationKey(keys: var HashSet[string]; sym: SymId) {.inline.} =
-  let name = pool.syms[sym]
+  let name = pool.symString(sym)
   if isInstantiation(name): keys.incl removeModule(name)
 
 proc resolveKeysOf(a: ModuleAnalysis; liveSyms: HashSet[SymId]): seq[string] =

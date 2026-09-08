@@ -725,7 +725,7 @@ proc derefsBoxedRef(c: var Context; ptrOperand: Cursor): bool =
 proc addDataFieldHop(c: var Context; info: NifLineInfo) =
   ## Emit the `d 0` that follows an already-emitted `(deref refptr)` to reach the
   ## object payload of a boxed `ref` cell.
-  c.dest.addSymUse(pool.syms.getOrIncl(DataField), info)
+  c.dest.addSymUse(pool.symId(DataField), info)
   c.dest.addIntLit(0, info) # inheritance
 
 proc trOnlyEssentials(c: var Context; n: var Cursor)
@@ -799,8 +799,8 @@ proc trOnlyEssentials(c: var Context; n: var Cursor)
           var field = probe
           skip field # object operand -> field name
           if field.kind == Symbol and
-             field.symId != pool.syms.getOrIncl(DataField) and
-             field.symId != pool.syms.getOrIncl(RcField):
+             field.symId != pool.symId(DataField) and
+             field.symId != pool.symId(RcField):
             doHop = true
       if doHop:
         let info = n.info
@@ -873,7 +873,7 @@ proc trProcDecl(c: var Context; n: var Cursor; parentNodestroy = false) =
       trOnlyEssentials c, r.body
     else:
       tr c, r.body, DontCare
-      assert c.pendingMoves.len == 0, "deferred =wasMoved escaped " & pool.syms[r.name.symId]
+      assert c.pendingMoves.len == 0, "deferred =wasMoved escaped " & pool.symString(r.name.symId)
     c.typeCache.closeScope()
   else:
     copyTree c.dest, r.body
@@ -1041,7 +1041,7 @@ proc genOutOfMemCheck(c: var Context; ow: OwningTemp; info: NifLineInfo) =
       copyIntoKind c.dest, StmtsS, info:
         copyIntoKind c.dest, RaiseS, info:
           addRaisedCode(c.dest, c.retType,
-                        pool.syms.getOrIncl("OutOfMemError.0." & SystemModuleSuffix),
+                        pool.symId("OutOfMemError.0." & SystemModuleSuffix),
                         c.resultSym, info)
 
 proc trNewobj(c: var Context; n: var Cursor; e: Expects; kind: ExprKind)
@@ -1057,12 +1057,12 @@ proc trNewobj(c: var Context; n: var Cursor; e: Expects; kind: ExprKind)
   let baseType = refType.childCursor
   var refTypeCopy = refType
   let typeKey = takeMangle(refTypeCopy, Frontend, c.lifter.bits)
-  let typeSym = pool.syms.getOrIncl(genericTypeName(typeKey, c.moduleSuffix))
+  let typeSym = pool.symId(genericTypeName(typeKey, c.moduleSuffix))
 
   copyIntoKind c.dest, CastX, info:
     c.dest.addSubtree refType
     copyIntoKind c.dest, CallX, info:
-      c.dest.addSymUse(pool.syms.getOrIncl("allocFixed.0." & SystemModuleSuffix), info)
+      c.dest.addSymUse(pool.symId("allocFixed.0." & SystemModuleSuffix), info)
       copyIntoKind c.dest, SizeofX, info:
         c.dest.addSymUse(typeSym, info)
   c.dest.addParRi() # finish temp declaration
@@ -1077,11 +1077,11 @@ proc trNewobj(c: var Context; n: var Cursor; e: Expects; kind: ExprKind)
     copyIntoKind c.dest, OconstrX, info:
       c.dest.addSymUse(typeSym, info)
       copyIntoKind c.dest, KvU, info:
-        let rcField = pool.syms.getOrIncl(RcField)
+        let rcField = pool.symId(RcField)
         c.dest.addSymUse(rcField, info)
         c.dest.addIntLit(0, info)
       copyIntoKind c.dest, KvU, info:
-        let dataField = pool.syms.getOrIncl(DataField)
+        let dataField = pool.symId(DataField)
         c.dest.addSymUse(dataField, info)
         if kind == NewobjX:
           copyIntoKind c.dest, OconstrX, info:
@@ -1511,9 +1511,8 @@ proc trTry(c: var Context; n: var Cursor) =
       takeInto c.dest, n:
         tr c, n, WantNonOwner
 
-proc readableHookname(s: string): string =
-  result = s
-  extractBasename(result)
+proc readableHookname(fn: SymId): string =
+  result = pool.symBasename(fn)
   if result.len > 2 and result[0] == '=' and result[1] in {'a'..'z'}:
     var i = 2
     while i < result.len and result[i] != '_':
@@ -1526,7 +1525,7 @@ proc checkForErrorRoutine(r: var Reporter; fn: SymId; info: NifLineInfo): int =
   if res.status == LacksNothing:
     let routine = asRoutine(res.decl)
     if routine.kind.isRoutine and hasPragma(routine.pragmas, ErrorP):
-      let fnName = readableHookname(pool.syms[fn])
+      let fnName = readableHookname(fn)
       var m = "'" & fnName & "' is not available"
       var arg = routine.params
       if arg.substructureKind == ParamsU:

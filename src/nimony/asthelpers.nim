@@ -29,7 +29,7 @@ proc takeIdent*(n: var Cursor): StrId =
     result = n.strId
     inc n
   elif n.isSymbol or n.isSymbolDef:
-    let sym = pool.syms[n.symId]
+    let sym = pool.symString(n.symId)
     var isGlobal = false
     # The IDENTIFIER, both halves of the bookkeeping off: this is what a named
     # argument is matched against on both sides (`sigmatch.buildParamsInfo`

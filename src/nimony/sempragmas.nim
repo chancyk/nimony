@@ -338,7 +338,7 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     if hasParRi and n.hasMore:
       semConstStrExprIgnoreTopLevel c, dest, n
     elif crucial.sym != SymId(0):
-      var name = pool.syms[crucial.sym]
+      var name = pool.symString(crucial.sym)
       extractBasename name
       # `{.importc.}`/`{.exportc.}` with no string: the identifier the source
       # wrote IS the external name, so the namespace comes off too. A local
@@ -536,7 +536,7 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     else:
       # No type specified - default to system.ErrorCode
       let typeStart = dest.len
-      dest.addSymUse pool.syms.getOrIncl(ErrorCodeName), n.endInfo
+      dest.addSymUse pool.symId(ErrorCodeName), n.endInfo
       crucial.raisesType = c.typeToCursor(dest, typeStart)
       dest.addParRi()
   of CallConvP:
@@ -571,7 +571,7 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
         buildErr c, dest, info, "`pragma` takes no arguments"
         while n.hasMore: skip n
       else:
-        var basename = pool.syms[crucial.sym]
+        var basename = pool.symString(crucial.sym)
         extractBasename basename
         stripLocalNs basename
         c.customPragmaTemplates.incl pool.strings.getOrIncl(basename)

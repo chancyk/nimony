@@ -32,10 +32,9 @@ proc tr(n: var Cursor; a: var ModuleAnalysis; owner: SymId) =
       n.into:
         var newOwner = owner
         if n.isSymbolDef:
-          let symName = pool.syms[n.symId]
-          if isInstantiation(symName):
+          if pool.symIsInstantiation(n.symId):
             a.offers.incl(n.symId)
-          if not isLocalName(symName):
+          if not pool.symIsLocal(n.symId):
             newOwner = n.symId
         while n.hasMore:
           tr n, a, newOwner
@@ -59,13 +58,12 @@ proc tr(n: var Cursor; a: var ModuleAnalysis; owner: SymId) =
         let isFld = n.substructureKind == FldU
         n.into:
           if isFld and n.kind == SymbolDef:
-            let symName = pool.syms[n.symId]
-            if isInstantiation(symName):
+            if pool.symIsInstantiation(n.symId):
               a.offers.incl(n.symId)
           while n.hasMore:
             tr n, a, owner
   of Symbol:
-    if not isLocalName(pool.syms[n.symId]):
+    if not pool.symIsLocal(n.symId):
       if owner == SymId(0):
         a.roots.incl(n.symId)
       else:
@@ -106,7 +104,7 @@ proc sortedSymNames*(syms: HashSet[SymId]): seq[string] =
   ## Sorting by name makes the file a function of its content alone, which is
   ## what `OnlyIfChanged` needs in order to mean anything.
   result = newSeq[string](0)
-  for s in syms: result.add pool.syms[s]
+  for s in syms: result.add pool.symString(s)
   sort result, cmpSymNames
 
 proc writeAnalysis*(outputFilename: string; a: var ModuleAnalysis;
@@ -127,7 +125,7 @@ proc writeAnalysis*(outputFilename: string; a: var ModuleAnalysis;
     var owners = newSeq[string](0)
     var byName = initTable[string, SymId]()
     for owner in a.uses.keys:
-      let n = pool.syms[owner]
+      let n = pool.symString(owner)
       owners.add n
       byName[n] = owner
     sort owners, cmpSymNames

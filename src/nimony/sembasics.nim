@@ -414,7 +414,7 @@ proc localNamespaceOf*(sym: SymId): string =
   ## The namespace segment for the locals of the routine `sym` — see
   ## `symparser.localNamespace`, which the exception lowering and the
   ## control-flow graph key their own temporaries on too.
-  localNamespace(pool.syms[sym])
+  localNamespace(pool.symString(sym))
 
 proc makeLocalSym*(c: var SemContext; result: var string) =
   ## `x` -> `` x`semExpr`0.3 ``: the owning routine's name joins the IDENTIFIER
@@ -449,7 +449,7 @@ proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
   ## did not (a template body declares in the template's scope; expanding it at
   ## toplevel puts the declaration in the module). See `expandTemplateImpl`.
   var isGlobal = false
-  var name = extractBasename(pool.syms[s], isGlobal)
+  var name = extractBasename(pool.symString(s), isGlobal)
   # Back to the name the source spelled: `makeLocalSym` appends the CURRENT
   # routine's namespace, and a copy that kept the original's would stack a
   # second tag onto the first every time a template body is re-emitted.
@@ -458,7 +458,7 @@ proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
     c.makeGlobalSym(name)
   else:
     c.makeLocalSym(name)
-  result = pool.syms.getOrIncl(name)
+  result = pool.symId(name)
 
 proc classifyType*(c: var SemContext; n: Cursor): TypeKind =
   result = typeKind(n)
@@ -529,7 +529,7 @@ proc identToSym*(c: var SemContext; str: sink string; kind: SymKind): SymId =
     c.makeGlobalSym(name)
   else:
     c.makeLocalSym(name)
-  result = pool.syms.getOrIncl(name)
+  result = pool.symId(name)
 
 proc identToSym*(c: var SemContext; lit: StrId; kind: SymKind): SymId =
   result = identToSym(c, pool.strings[lit], kind)
@@ -538,13 +538,18 @@ proc symToIdent*(s: SymId): StrId =
   ## The identifier `s` goes back into scope under — the one the source wrote.
   ## Both halves of the bookkeeping come off: the disambiguator and module
   ## suffix after the identifier, and the owning routine's namespace inside it.
-  var name = pool.syms[s]
+  var name = pool.symString(s)
   extractBasename name
   stripLocalNs name
   when false:
     # XXX activate this later!
     for i in 0..<name.len:
       if name[i] == ' ': name[i] = '.'
+  # NOT `pool.symNameId(s)`, which upstream's version of this proc returns:
+  # `symNameId` is the `name` FIELD, and after the respelling that field still
+  # carries the owning routine's tag (`` x`semExpr`0 ``). Scope keys and named
+  # arguments are matched on the SOURCE identifier, so both halves have to come
+  # off first. See `notes/f1-respell.md` and `notes/merge-u6b.md`.
   result = pool.strings.getOrIncl name
 
 proc declareSym*(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymKind): SymStatus =
@@ -635,7 +640,7 @@ proc handleSymDef*(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: S
   elif n.isDotToken:
     var name = "`anon"
     c.makeLocalSym(name)
-    let symId = pool.syms.getOrIncl(name)
+    let symId = pool.symId(name)
     let s = Sym(kind: kind, name: symId, pos: dest.len)
     result = DelayedSym(status: OkExisting, s: s, info: info)
     dest.addSymDef(symId, info)

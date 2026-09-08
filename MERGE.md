@@ -19,7 +19,7 @@ this file supersedes as it is filled in).
 | 3 | `b7c7daa6` | newest nativenif (#2478) — pin `d0781a48` -> `e201a816` | `merge/u3` | merged, pin taken is **`3ec73fef`**, not upstream's `e201a816` (see §3) |
 | 4 | `c6be04e1` | no globals in nifcore (#2482) | `merge/u4` | merged; A2a's two `nifcore.fallback*` re-points are now **redundant and deleted** (see §4) |
 | 5 | `38f67463` | std/http: thread the tag space instead of keeping one per process (#2484) | `merge/u5` | merged |
-| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6` | pending; `f9af5b24` does not exist in `nim-lang/nativenif` (it is `2c30a9ef` rebased away), so step 6 pins **`9d7fcf78`**, the current tip of `jit/upstream-master`. That is `83ced299` (this file's earlier figure) plus two notes-only commits: `git diff --stat 83ced299 9d7fcf78 -- . ':(exclude)notes'` is empty, so the code is identical and either would build the same |
+| 6 | `e1da48e9` | nifsyms refactor (#2483) — pin `e201a816` -> `f9af5b24` | `merge/u6b` | merged; pin taken is **`9d7fcf78`** (`f9af5b24` does not exist upstream), and the merge was preceded by the F1 respelling (`643569c2`) — see §6 |
 
 Plus a parallel track in `../nativenif`: rebase our `jit/b1 .. jit/b3e-native`
 chain (fork point `d0781a48`) onto upstream nativenif master, which steps 3
@@ -874,6 +874,156 @@ assumed, on §2's precedent.
 **Numbers.** None taken. The commit touches only `lib/std/http`, which no
 compiler phase imports, so it cannot reach the loop. §4's 0.260/0.261 against
 §3's 0.261 is the live reference.
+
+
+## 6. `e1da48e9` — nifsyms refactor (and the pin to nativenif `9d7fcf78`)
+
+**What upstream changed.** `Pool` stops storing a symbol as a string and
+stores a decomposed `NifSymbol{name, disamb, dedup, module}` instead, so every
+question about a symbol becomes a field read (`symBasename`, `symModule`,
+`symWithoutModule`, `symIsInstantiation`) and only the places that genuinely
+need a spelling build one (`symString`). The reader gains a split-symbol mode
+that interns each component without ever assembling the whole name. 95 files,
++1594/-922. A compatibility view keeps `pool.syms[...]` working, but it BUILDS
+a string now where it used to lend one.
+
+**The precondition, and why this entry has two attempts behind it.** The
+refactor also enforces a rule `symparser` never had: a disambiguator is digits
+only, no leading zero (`nifcore.parseDisamb`). F1's `` x.3`semExpr`0 `` failed
+it by construction, so `splitSpelling` filed the whole spelling under `name`
+and `symBasename` answered `""` — silently, for ~30 migrated call sites, with
+`decl-stability` and the splice counts green throughout. The first attempt
+(`notes/merge-u6.md`) measured that and was abandoned; the owner respelled F1
+to `` x`semExpr`0.3 `` first (`643569c2`), and this merge is onto that base.
+The respelling is visible in the merge itself: **46 conflicted files instead
+of 30**, because sites that used to take upstream's accessor silently now
+collide and get read.
+
+**How it collided with us.** 46 files, ~130 hunks. Two mechanical shapes cover
+~110 of them:
+
+- ours calls `namer.fresh*` / `freshCfSym` / `freshErrSym` where upstream keeps
+  a manual counter — F2's `TempNamer` subsumes the counter, **ours**;
+- ours reads a spelling and strips it, upstream calls the new accessor —
+  **ours**, rewritten onto upstream's API (`pool.syms.getOrIncl` ->
+  `pool.symId`, `pool.syms[x]` -> `pool.symString(x)`).
+
+The rest are named below. `passes.nim`'s `freshSym`/`freshGlobalSym` moved onto
+`pool.symId` once, which is why no F2 call site needed editing.
+
+**What we did.** Per file, where it was not one of the two shapes:
+
+| file | resolution |
+|---|---|
+| `sembasics.symToIdent` | **the one that got through a clean merge.** git took our body (`symString` + `extractBasename` + `stripLocalNs`) AND upstream's `result = pool.symNameId(s)`, which discards all of it. Every line correct, the value thrown away, no warning. Restored to `pool.strings.getOrIncl name`, with a comment saying why `symNameId` is wrong here |
+| `sem.nim` | upstream inserts a private `asNimSym = pool.symBasename` where our side is empty. **Dropped**: it shadows `renderer.asNimSym` for every unqualified call in that file, and post-respell `symBasename` returns the OWNER-TAGGED identifier, so diagnostics would print `` a`escapeViaBlock`0 `` |
+| `hexer/dce2.nim` | upstream re-adds the pre-P0c aggregate `writeLiveFile`; **dropped** (P0c's `mode`-taking version and the per-module `<M>.live.nif` are ours). Separately, P0b's `prefersOffer` kept, asking for the spelling directly because the `offerName` binding was dropped by a clean hunk above |
+| `hexer/dce1.nim` | P0c's `sortedSymNames`/`cmpSymNames` determinism kept over upstream's unordered `mpairs` |
+| `lengc/nifmodules.nim` | our `vfsExists` (A1b) on **upstream's** `module` binding — "ours" alone no longer compiles, because a clean hunk renamed `splitted` two lines above |
+| `lengc/genexprs.nim` | same shape: re-bind `x`, keep our two-step extraction |
+| `dagon/dagon.nim` | upstream's `basename(sym: SymId)` signature, our two-step body |
+| `nifmake/nifmake.nim` | ours (A2b moved the graph into `dag.nim`); upstream's real payload — two accessor renames — ported by hand into `dag.nim:1081,1118` |
+| `hexer/intramodinliner.nim` | ours; the doc comment rewritten, because BOTH sides' comments were stale after the respell moved this pass onto `taggedName` |
+| `nimony/lib/plugins.nim` | our comment and argument, upstream's **qualified** `nifcore.symId(pluginPool, ...)` — that qualification is a compile requirement, the module imports nifcore `except symId` |
+| `tests/symspelling/setup.nim` | the vendored `parseDisamb`/`splitSpelling` block deleted and `nifcore` imported for real, as its own header instructs. The sixteen shapes and the negative case are unchanged |
+
+**Was anything of ours made redundant?** No. The respelling already did that
+work: `intramodinliner`'s pass letter now rides in the identifier the way
+upstream spells its own, so the two designs stopped competing.
+
+**Was anything of ours broken?** Yes, and it is the entry's main finding.
+`sembasics.symToIdent` came out of a **clean** merge returning the owner-tagged
+identifier, which broke the scope key for every parameter: `{.untyped.}`
+generics across the stdlib failed with `undeclared identifier: x`
+(`arithmetics.\`+=\``). Restored as above. `tests/incremental` caught it; no
+gate that was on the brief would have.
+
+**Evidence.** Worktree `/tmp/merge-u1`, branch `merge/u6b` off
+`origin/fast-devloop` at `643569c2`, `XDG_CACHE_HOME=/tmp/cache-u1`,
+`NIMONY_NATIVENIF=/tmp/u6/nativenif` (the symlink layout — see
+`notes/merge-u6b.md` §5). `../nativenif` moved to `jit/upstream-master`
+(`9d7fcf78`) as part of this merge; `build all` printed **no `[deps]` line**.
+Nothing pushed.
+
+```
+$ nim c -r src/hastur/hastur build all           → exit 0, 0 [deps] lines
+$ bin/hastur test tests/symspelling              → symspelling: all checks passed
+$ bin/hastur test tests/incremental
+decl-stability: ... sem-input changed 1/0/1/1 | lowering-output changed 1/-/1/1
+decl-stability: 4 / 4 phases successful.   SUCCESS.
+$ bin/hastur tests/inproc
+  ok: nimsem: 6 output files byte-identical to two processes
+3 / 3 tests successful.  SUCCESS.
+$ bin/hastur test tests/ctfe_diff   → 19 file(s), 50 artifact(s), 79 .s.nif, 0 difference(s)
+$ bin/hastur test tests/nifcache    → nifcache: all checks passed
+$ bin/hastur test tests/nimony_r    → nimony_r: all checks passed
+$ bin/hastur test tests/ctfe_engine → ctfe_engine: all checks passed
+$ bin/hastur test tests/ledger      → [ledger] all ledger tests passed
+$ bin/hastur tests/nimony           → 795 / 795 tests successful.  SUCCESS.
+$ bin/hastur boot --boot-backend:native
+[boot] stages 1 and 2 are byte-identical.
+[boot] stages 2 and 3 are byte-identical.   SUCCESS.
+```
+
+**795 -> 795.** `tests/symspelling` does not change it: it is a `setup.nim`
+runner in `tests/`, not a member of the `tests/nimony` subtree the count comes
+from. It runs under the `all` sweep and was run explicitly above.
+
+**Splice counts.** On the fork-point corpus (`/tmp/devloop_base/src`, the one
+`devloop_bench.sh` uses and the one `b3e.txt` recorded), steady from the first
+edit and unchanged on the second and third:
+
+```
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+```
+
+identical to `bench/results/2026-09-07/b3e.txt`. On the branch's own corpus
+(`643569c2:src`) it reads 11/1, 82/2, 525/3 — which is **not** the 11/1, 83/1,
+527/1 given as the new reference. That difference is not this merge: the
+**pre-merge** toolchain on the **same** corpus produces 11/1, 82/2, 525/3 too,
+so the merge changes splice behaviour by exactly zero and it is the reference
+that needs re-taking. (Totals agree either way: 12, 84, 528.)
+
+**Goldens touched.** Two, both listed per rule 4:
+
+- `bench/nifbench.output` — upstream's own, `checksum: 133797427` ->
+  `133798294`, same token/tree/sym counts; the `NifSymbol` encoding change.
+- `tests/nativecg/tinlinecond.arm64.asm.nif` — 3 lines, checked BY HAND
+  because the directory is `hastur.mode = skip`:
+
+  ```
+  -(.indexat 15933            )      +(.indexat 15935            )
+  -     (prepare _exit.c.sysvq0asl   +     (prepare _exit`c.0.sysvq0asl
+  - (x isLe.0. 15200))               + (x isLe.0. 15202))
+  ```
+
+  That is nativenif `2c30a9ef` ("arkham: the role goes in the identifier")
+  arriving with the pin — the same #2457 rule the respelling applied on our
+  side — plus the two index offsets shifting by the two bytes the name grew.
+  No instruction changed. The x64 sibling contains no syproc/extproc spelling
+  in either form, so it is not stale.
+
+**Numbers.** Interleaved, one run, two branches:
+
+```
+$ bench/devloop_ab.sh /private/tmp/f1-respell . self.editbody 5
+A (643569c2) wall median 0.971 | cpu median 0.980 | peak rss 107 MB
+B (this)     wall median 1.041 | cpu median 1.053 | peak rss 107 MB
+B/A cpu (median): 1.074   B/A peak rss: 1.00
+```
+
+**A ~7 % cpu regression, consistent across all five rounds** — the first in the
+chain. Swapping only the assembler splits it: merged nimony with the OLD
+arkham/nifasm reads **1.047**, with the new one **1.070**, so roughly +4.7 %
+from `e1da48e9` and +2.3 % from the pin. Both are upstream's: the refactor
+makes every spelling a BUILT string where `pool.syms[id]` lent one, and the
+newer nifasm links slower (`--stats` `link` 212 -> 383 ms). Tested and
+rejected as the cause: memoizing `decldigest`'s per-token spelling lookup
+(digests bit-identical) moved 1.074 -> 1.070, i.e. nothing, and was reverted
+rather than carried — the cost is spread across accessor calls, not
+concentrated there.
 
 ## nativenif track
 

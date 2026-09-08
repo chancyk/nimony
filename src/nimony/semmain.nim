@@ -186,7 +186,7 @@ proc buildOutputs(c: var SemContext; dest: var TokenBuf; outfile: string): SemOu
           if tk.isTagLit:
             echo "  [", k, "] TagLit ", globalTags.tags[tk.tagId], " jump=", uint32(tk) shr JumpShift
           elif tk.kind in {Symbol, SymbolDef}:
-            echo "  [", k, "] ", tk.kind, " ", pool.syms[tk.symId]
+            echo "  [", k, "] ", tk.kind, " ", pool.symString(tk.symId)
           else:
             echo "  [", k, "] ", tk.kind
         break
@@ -300,7 +300,7 @@ proc requestHookInstance(c: var SemContext; decl: Cursor) =
   # For types from the current module, use typeHooks (hooks haven't been embedded
   # in type pragmas yet - that happens in injectDerefs at the end).
   # For types from other modules, use tryLoadAllHooks which reads from type pragmas.
-  let moduleSuffix = extractModule(pool.syms[symId])
+  let moduleSuffix = pool.symModule(symId)
   let hooks = if moduleSuffix == c.thisModuleSuffix:
       c.typeHooks.getOrDefault(symId)
     else:
@@ -342,7 +342,7 @@ proc requestHookInstance(c: var SemContext; decl: Cursor) =
           inc counter
         discard requestRoutineInstance(c, hook, typeArgs, inferred, info)
       else:
-        quit "BUG: Could not load hook: " & pool.syms[hook]
+        quit "BUG: Could not load hook: " & pool.symString(hook)
 
 proc instantiateMethodForType(c: var SemContext; dest: var TokenBuf; methodSym, typeInstSym: SymId): SymId =
   # check if instance actually matches method
@@ -590,12 +590,10 @@ proc resolveCyclicImports(c: var SemContext) =
   for (targetSuffix, moduleSym) in c.deferredCyclicImports:
     let module = addr c.importedModules.mgetOrPut(moduleSym, ImportedModule())
     for symId in prog.mem.symIds:
-      let symName = pool.syms[symId]
-      let modSuffix = extractModule(symName)
+      let symName = pool.symString(symId)
+      let modSuffix = pool.symModule(symId)
       if modSuffix == targetSuffix:
-        var baseName = symName
-        extractBasename(baseName)
-        let nameId = pool.strings.getOrIncl(baseName)
+        let nameId = pool.symNameId(symId)
         c.importTab.mgetOrPut(nameId, @[]).addIfAbsent(moduleSym)
         module.iface.mgetOrPut(nameId, @[]).addIfAbsent(symId)
 

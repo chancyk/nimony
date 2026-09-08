@@ -69,11 +69,14 @@ proc kindLabel(k: NimonyStmt): string =
   of GletS, TletS: "let"
   else: "?"
 
-proc basename(symName: string): string =
-  var work = symName
-  extractBasename(work)
-  stripLocalNs(work)
-  result = work
+proc basename(sym: SymId): string =
+  ## Upstream's signature (a `SymId`, not a spelling), with the respelling's
+  ## two-step extraction: `symBasename` stops at the disambiguator and so still
+  ## returns the OWNER-TAGGED identifier; the documentation wants the source
+  ## one. See `notes/f1-respell.md`.
+  result = pool.symString(sym)
+  extractBasename(result)
+  stripLocalNs(result)
 
 const UnreservedUrlChar = {'A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~'}
 proc urlEscape(s: string): string =
@@ -95,8 +98,8 @@ proc symHref(ctx: RenderCtx; sym: SymId): string =
   ## `<relative-path-to-target>#…`, computed as the relative path from the
   ## *current* page to the target page under the shared outdir, so the link
   ## works without any web-server config.
-  let s = pool.syms[sym]
-  let m = extractModule(s)
+  let s = pool.symString(sym)
+  let m = pool.symModule(sym)
   let anchor = urlEscape(s)
   if m.len == 0 or m == ctx.currentModule:
     return "#" & anchor
@@ -137,7 +140,7 @@ proc emitTyperef(b: var HtmlBuilder; ctx: RenderCtx; sym: SymId) =
   ## Cross-module-aware type reference. HTML: `<a class="typeref" href="…">name</a>`.
   ## NIF: `(typeref "href" "name")` — the href becomes the link target if a
   ## downstream tool wants to re-resolve.
-  let name = basename(pool.syms[sym])
+  let name = basename(sym)
   let href = symHref(ctx, sym)
   case b.format
   of hofHtml:
@@ -286,7 +289,7 @@ proc summarise(doc: string): string =
 proc declAnchor(sym: SymId): string =
   ## Anchor id for a decl. Same value byte-for-byte as the URL fragment
   ## produced by `symHref`, so internal links land cleanly.
-  urlEscape(pool.syms[sym])
+  urlEscape(pool.symString(sym))
 
 template emitDeclItem(b: var HtmlBuilder; sym: SymId; body: untyped) =
   ## `<li id="…"><code>…</code></li>` (or NIF `(li "anchor" (code …))`).
@@ -303,8 +306,8 @@ template emitDeclItem(b: var HtmlBuilder; sym: SymId; body: untyped) =
 proc recordEntry(idx: var seq[DocIdxEntry]; sk: NimonyStmt; sym: SymId; doc: string) =
   idx.add DocIdxEntry(
     kind: kindLabel(sk),
-    basename: basename(pool.syms[sym]),
-    symid: pool.syms[sym],
+    basename: basename(sym),
+    symid: pool.symString(sym),
     summary: summarise(doc))
 
 proc isExported(exported: Cursor): bool =
@@ -324,7 +327,7 @@ proc renderRoutine(b: var HtmlBuilder; idx: var seq[DocIdxEntry];
     emitTag(b, "code"):
       emitKw(b, kindLabel(sk))
       emitText(b, " ")
-      emitName(b, basename(pool.syms[r.name.symId]))
+      emitName(b, basename(r.name.symId))
       emitOp(b, "(")
       var p = r.params
       if p.isTagLit and p.substructureKind == ParamsU:
@@ -334,7 +337,7 @@ proc renderRoutine(b: var HtmlBuilder; idx: var seq[DocIdxEntry];
           if not first: emitOp(b, "; ")
           first = false
           let local = asLocal(p)
-          emitText(b, basename(pool.syms[local.name.symId]))
+          emitText(b, basename(local.name.symId))
           emitOp(b, ": ")
           var typ = local.typ
           renderTypeExpr(b, ctx,typ)
@@ -371,14 +374,14 @@ proc renderTypeDecl(b: var HtmlBuilder; idx: var seq[DocIdxEntry];
       emitTagAttr(b, wrapper, [("class", "sig")]):
         emitKw(b, "type")
         emitText(b, " ")
-        emitName(b, basename(pool.syms[t.name.symId]))
+        emitName(b, basename(t.name.symId))
         emitOp(b, " = ")
         emitSrcGen(b, ctx, bodyG)
     else:
       emitTag(b, wrapper):
         emitKw(b, "type")
         emitText(b, " ")
-        emitName(b, basename(pool.syms[t.name.symId]))
+        emitName(b, basename(t.name.symId))
         if hasBody:
           emitOp(b, " = ")
           emitSrcGen(b, ctx, bodyG)
@@ -397,7 +400,7 @@ proc renderLocal(b: var HtmlBuilder; idx: var seq[DocIdxEntry];
     emitTag(b, "code"):
       emitKw(b, kindLabel(sk))
       emitText(b, " ")
-      emitName(b, basename(pool.syms[l.name.symId]))
+      emitName(b, basename(l.name.symId))
       var typ = l.typ
       if typ.hasMore and typ.kind != DotToken:
         emitOp(b, ": ")
@@ -439,8 +442,8 @@ proc parseImports(n: var Cursor; ctx: var RenderCtx) =
 proc buildNameLookup(ctx: var RenderCtx) =
   for i in 1 ..< pool.syms.len:
     let sid = SymId(i)
-    let full = pool.syms[sid]
-    let modid = extractModule(full)
+    let full = pool.symString(sid)
+    let modid = pool.symModule(sid)
     if modid.len > 0 and modid != ctx.currentModule and modid notin ctx.importMap:
       continue
     var base = full

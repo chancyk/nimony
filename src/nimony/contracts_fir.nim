@@ -281,7 +281,7 @@ proc extractPath(c: var FirContext; n: Cursor; followInlineVars=true): BorrowInf
 proc `$`(b: BorrowInfo): string =
   result = "BorrowInfo(mode: " & $b.mode & ", path: "
   for i in 0 ..< b.path.len:
-    result.add " :: " & pool.syms[b.path[i]]
+    result.add " :: " & pool.symString(b.path[i])
   result.add ")"
 
 proc pathsOverlap(a, b: BorrowInfo): bool =
@@ -735,7 +735,7 @@ proc wantNotNil(c: var FirContext; n: Cursor) =
         if n.exprKind == TupconstrX:
           inc n
           skip n # skip type
-          if n.isSymbol and pool.syms[n.symId] == ("Success.0." & SystemModuleSuffix):
+          if n.isSymbol and pool.symString(n.symId) == ("Success.0." & SystemModuleSuffix):
             inc n
         if n.exprKind == NewobjX and c.procCanRaise:
           discard "fine, nil value is mapped to OOM by the compiler"
@@ -913,7 +913,7 @@ proc analyseOconstr(c: var FirContext; n: var Cursor) =
       n.into:
         assert n.isSymbol
         let expected = lookupField(c.typeCache, objType, n.symId)
-        assert not cursorIsNil(expected), "could not lookup type for " & pool.syms[n.symId]
+        assert not cursorIsNil(expected), "could not lookup type for " & pool.symString(n.symId)
         skip n # field name
         checkNilMatch c, n, expected
         skip n # value

@@ -330,7 +330,7 @@ proc addEmpty3*(dest: var TokenBuf; info: NifLineInfo = NoLineInfo) =
   dest.addDotToken(info)
 
 proc symNameId(s: SymId): StrId =
-  var name = pool.syms[s]
+  var name = pool.symString(s)
   extractBasename name
   # `sameTreesButIgnoreSymIds` matches a forward declaration's parameters
   # against the implementation's; those are locals whose namespaces differ,

@@ -262,8 +262,7 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
     res.add ImportedFilename(path: s, name: s)
     inc n
   of Symbol:
-    var s = pool.syms[n.symId]
-    extractBasename s
+    var s = pool.symBasename(n.symId)
     res.add ImportedFilename(path: s, name: s)
     inc n
   of TagLit:
@@ -644,7 +643,7 @@ proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
     "invalid .unusedname returned by plugin"
 
   for disamb in firstDisamb ..< nextDisamb:
-    c.freshSyms.incl pool.syms.getOrIncl(
+    c.freshSyms.incl pool.symId(
       localSymName(pluginTempBase, disamb, c.localNs))
 
   if nextDisamb > firstDisamb:

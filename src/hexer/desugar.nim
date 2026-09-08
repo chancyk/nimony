@@ -145,7 +145,7 @@ proc emitRequiresGuard(c: var Context; dest: var TokenBuf; cond: Cursor;
         tr(c, dest, n)
       dest.copyIntoKind StmtsS, info:
         dest.copyIntoKind CallS, info:
-          dest.addSymUse pool.syms.getOrIncl("panic.0." & SystemModuleSuffix), info
+          dest.addSymUse pool.symId("panic.0." & SystemModuleSuffix), info
           dest.addStrLit msg, info
 
 proc emitRequires(c: var Context; dest: var TokenBuf; cond: Cursor;
@@ -504,7 +504,7 @@ proc genSetOp(c: var Context; dest: var TokenBuf; n: var Cursor) =
                 dest.addSubtree res
                 addIntTypedOp dest, NeqX, -1, info:
                   copyIntoKind dest, CallX, info:
-                    dest.addSymUse(pool.syms.getOrIncl("cmpMem.0." & SystemModuleSuffix), info)
+                    dest.addSymUse(pool.symId("cmpMem.0." & SystemModuleSuffix), info)
                     dest.arrayToPointer(a, info)
                     dest.arrayToPointer(b, info)
                     dest.addIntLit(size, info)
@@ -514,7 +514,7 @@ proc genSetOp(c: var Context; dest: var TokenBuf; n: var Cursor) =
     of EqsetX:
       addIntTypedOp dest, EqX, -1, info:
         copyIntoKind dest, CallX, info:
-          dest.addSymUse(pool.syms.getOrIncl("cmpMem.0." & SystemModuleSuffix), info)
+          dest.addSymUse(pool.symId("cmpMem.0." & SystemModuleSuffix), info)
           dest.arrayToPointer(a, info)
           dest.arrayToPointer(b, info)
           dest.addIntLit(size, info)
@@ -598,20 +598,20 @@ proc genCard(c: var Context; dest: var TokenBuf; n: var Cursor) =
   case size
   of 1, 2:
     copyIntoKind dest, CallX, info:
-      dest.addSymUse(pool.syms.getOrIncl("countBits32.0." & SystemModuleSuffix), info)
+      dest.addSymUse(pool.symId("countBits32.0." & SystemModuleSuffix), info)
       addUIntTypedOp dest, CastX, 32, info:
         dest.addSubtree a
   of 4:
     copyIntoKind dest, CallX, info:
-      dest.addSymUse(pool.syms.getOrIncl("countBits32.0." & SystemModuleSuffix), info)
+      dest.addSymUse(pool.symId("countBits32.0." & SystemModuleSuffix), info)
       dest.addSubtree a
   of 8:
     copyIntoKind dest, CallX, info:
-      dest.addSymUse(pool.syms.getOrIncl("countBits64.0." & SystemModuleSuffix), info)
+      dest.addSymUse(pool.symId("countBits64.0." & SystemModuleSuffix), info)
       dest.addSubtree a
   else:
     copyIntoKind dest, CallX, info:
-      dest.addSymUse(pool.syms.getOrIncl("cardSet.0." & SystemModuleSuffix), info)
+      dest.addSymUse(pool.symId("cardSet.0." & SystemModuleSuffix), info)
       dest.arrayToPointer(a, info)
       dest.addIntLit(size, info)
 
@@ -669,7 +669,7 @@ proc genSetConstrRuntime(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let res = liftTemp(c, dest, beginRead(resValueBuf), cType, info)
   if big:
     copyIntoKind dest, CallX, info:
-      dest.addSymUse(pool.syms.getOrIncl("zeroMem.0." & SystemModuleSuffix), info)
+      dest.addSymUse(pool.symId("zeroMem.0." & SystemModuleSuffix), info)
       dest.arrayToPointer(res, info)
       dest.addIntLit(size, info)
   while n.hasMore:
@@ -870,7 +870,7 @@ proc isStringConcatCall(n: Cursor): bool =
   if n.exprKind in CallKinds:
     var c = n
     inc c                       # past call tag
-    if c.kind == Symbol and startsWith(pool.syms[c.symId], "&."):
+    if c.kind == Symbol and startsWith(pool.symString(c.symId), "&."):
       result = isConcat(c.symId)
 
 proc isChainedStringConcatCall(n: Cursor): bool =
@@ -955,9 +955,9 @@ proc genStringConcatChain(c: var Context; dest: var TokenBuf; n: var Cursor) =
   # these numbers must shift. (`len(string)` is `len.4`, not `.5`: object
   # fields no longer share the global per-name counter, so the `len` field
   # of `seq`/`openArray` no longer pushes the `len` overloads up by one.)
-  let newStrSym = pool.syms.getOrIncl("newStringOfCap.0." & SystemModuleSuffix)
-  let lenSym    = pool.syms.getOrIncl("len.4."           & SystemModuleSuffix)
-  let addSym    = pool.syms.getOrIncl("add.2."           & SystemModuleSuffix)
+  let newStrSym = pool.symId("newStringOfCap.0." & SystemModuleSuffix)
+  let lenSym    = pool.symId("len.4."           & SystemModuleSuffix)
+  let addSym    = pool.symId("add.2."           & SystemModuleSuffix)
 
   let tmp = declareTemp(c, dest, stringType, info)
   copyIntoKind dest, CallX, info:
@@ -1185,7 +1185,7 @@ proc trArrAt(c: var Context; dest: var TokenBuf; n: var Cursor) =
         var loBuf = createTokenBuf(8)
         tr(c, loBuf, n)
         if BoundCheck in c.activeChecks:
-          let p = pool.syms.getOrIncl(
+          let p = pool.symId(
             (if isUnsigned: "nimUcheckAB" else: "nimIcheckAB") & ".0." & SystemModuleSuffix)
           copyIntoKind dest, CallX, info:
             dest.addSymUse p, info
@@ -1205,7 +1205,7 @@ proc trArrAt(c: var Context; dest: var TokenBuf; n: var Cursor) =
               dest.add loBuf
       else:
         if BoundCheck in c.activeChecks:
-          let p = pool.syms.getOrIncl(
+          let p = pool.symId(
             (if isUnsigned: "nimUcheckB" else: "nimIcheckB") & ".0." & SystemModuleSuffix)
           copyIntoKind dest, CallX, info:
             dest.addSymUse p, info

@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 15933            )
+(.indexat 15935            )
 (stmts
  (arch arm64)
  (type :`cchar.0.
@@ -702,7 +702,7 @@
       (call))
      (mov
       (x0)0)
-     (prepare _exit.c.sysvq0asl
+     (prepare _exit`c.0.sysvq0asl
       (extcall))
      (lab :returnLabel`x.40)))
    (mov
@@ -764,4 +764,4 @@
    (ret))))(.index
  (x `cchar.0. 58)
  (x `iniGuard.0. 151)
- (x isLe.0. 15200))
+ (x isLe.0. 15202))

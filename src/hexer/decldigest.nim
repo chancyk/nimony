@@ -132,8 +132,8 @@ proc hashTree(n: var Cursor; h: var DeclHash) =
         hashTree(n, h)
     mix(h, 2)
   else:
-    if n.isSymbolDef: mix(h, 3); mixStr(h, pool.syms[n.symId])
-    elif n.isSymbol: mix(h, 4); mixStr(h, pool.syms[n.symId])
+    if n.isSymbolDef: mix(h, 3); mixStr(h, pool.symString(n.symId))
+    elif n.isSymbol: mix(h, 4); mixStr(h, pool.symString(n.symId))
     elif n.isIdent: mix(h, 5); mixStr(h, pool.strings[n.strId])
     elif n.isStringLit: mix(h, 6); mixStr(h, pool.strings[n.strId])
     elif n.isIntLit: mix(h, 7); mix(h, cast[uint64](n.intVal))
@@ -195,10 +195,10 @@ proc merge*(input, output: DeclHashes): ModuleDecls =
   for s in output.keys:
     if not input.hasKey(s): syms.add s
   var names = newSeq[string](syms.len)
-  for i in 0 ..< syms.len: names[i] = pool.syms[syms[i]]
+  for i in 0 ..< syms.len: names[i] = pool.symString(syms[i])
   sort names, cmpNames
   var bySym = initTable[string, SymId]()
-  for s in syms: bySym[pool.syms[s]] = s
+  for s in syms: bySym[pool.symString(s)] = s
   result = ModuleDecls(decls: newSeq[DeclDigest](0))
   for n in names:
     let s = bySym.getOrDefault(n)
@@ -236,7 +236,7 @@ proc parseDeclDigests*(n0: Cursor): ModuleDecls =
         var d = DeclDigest()
         n.into:
           if n.hasMore and n.isSymbol:
-            d.sym = pool.syms[n.symId]
+            d.sym = pool.symString(n.symId)
             inc n
           if n.hasMore and n.isStringLit:
             d.input = pool.strings[n.strId]

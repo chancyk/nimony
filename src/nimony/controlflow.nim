@@ -199,7 +199,7 @@ proc freshCfSym(c: var ControlFlow): SymId =
   ## away, so the count was already routine-local; writing the routine's name
   ## next to it makes the temporary unique across the module as well, which is
   ## what any module-lifetime table keyed on a `SymId` needs (`notes/f1.md` §3).
-  result = pool.syms.getOrIncl(localSymName("`cf", c.nextVar, c.localNs))
+  result = pool.symId(localSymName("`cf", c.nextVar, c.localNs))
   inc c.nextVar
 
 proc openTempVar(c: var ControlFlow; kind: StmtKind; typ: Cursor; info: NifLineInfo): SymId =
@@ -923,7 +923,7 @@ proc trRaise(c: var ControlFlow; n: var Cursor) =
     var aa = initTarget(IsEmpty)
     trExpr c, n, aa
     c.dest.addParLe(AsgnS, info)
-    c.dest.addSymUse pool.syms.getOrIncl("localErr.0." & SystemModuleSuffix), info
+    c.dest.addSymUse pool.symId("localErr.0." & SystemModuleSuffix), info
     c.flush aa
     c.dest.addParRi()
   var it {.cursor.} = c.currentBlock

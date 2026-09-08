@@ -57,7 +57,7 @@ proc localNamespaceOf*(sym: SymId): string =
   ## numbering — a declaration that has no name has no identity to be stable
   ## for either.
   if sym == SymId(0): return ""
-  result = removeModule(pool.syms[sym])
+  result = removeModule(pool.symString(sym))
   for i in 0 ..< result.len:
     if result[i] == '.': result[i] = LocalNsSep
 
@@ -85,7 +85,7 @@ proc freshName*(t: var TempNamer; base: string): string =
   localSymName(base, nextNumber(t, base), t.ns)
 
 proc freshSym*(t: var TempNamer; base: string): SymId =
-  pool.syms.getOrIncl(freshName(t, base))
+  pool.symId(freshName(t, base))
 
 proc freshGlobalName*(t: var TempNamer; base, moduleSuffix: string): string =
   ## A global-layout name: the module suffix stays the LAST dotted segment, so
@@ -99,7 +99,7 @@ proc freshGlobalName*(t: var TempNamer; base, moduleSuffix: string): string =
   result.add moduleSuffix
 
 proc freshGlobalSym*(t: var TempNamer; base, moduleSuffix: string): SymId =
-  pool.syms.getOrIncl(freshGlobalName(t, base, moduleSuffix))
+  pool.symId(freshGlobalName(t, base, moduleSuffix))
 
 proc taggedName*(base, tag, ns: string): string =
   ## For the callers that keep a counter of their own and additionally own a
