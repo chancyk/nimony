@@ -8,7 +8,7 @@
  (proc@,2 :defined.0.@5
   (defined). .
   (params@C
-   (param@1 :x.0`defined`0 . .
+   (param@1 :x`defined`0.0 . .
     (untyped@3).)).
   (pragmas@P
    (magic@2 Defined@7)). .)

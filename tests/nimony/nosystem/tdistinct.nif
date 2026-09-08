@@ -36,10 +36,10 @@
     (tup 1 "typeOfIter"))))
  (func@2,9 :dollar`.TypeOfMode.0. x . .
   (params
-   (param :e.0`dollar``TypeOfMode`0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
+   (param :e`dollar``TypeOfMode`0.0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
   (stmts
-   (result@E :result.0`dollar``TypeOfMode`0 . . string.0.sysvq0asl .)
-   (case@E e.0`dollar``TypeOfMode`0
+   (result@E :result`dollar``TypeOfMode`0.0 . . string.0.sysvq0asl .)
+   (case@E e`dollar``TypeOfMode`0.0
     (of~C,1
      (ranges typeOfProc.0.)
      (stmts
@@ -48,13 +48,13 @@
      (ranges typeOfIter.0.)
      (stmts
       (ret "typeOfIter"))))
-   (ret@2,2 result.0`dollar``TypeOfMode`0)))
+   (ret@2,2 result`dollar``TypeOfMode`0.0)))
  (proc@,D :typeof.0.@5
   (typeof). .
   (params@B
-   (param@1 :x.0`typeof`0 . .
+   (param@1 :x`typeof`0.0 . .
     (untyped@3).)
-   (param@D :mode.0`typeof`0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
+   (param@D :mode`typeof`0.0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
   (typekind@X
    (typedesc))
   (pragmas@r
@@ -63,9 +63,9 @@
  (proc@,J :\2B.0.@5
   (add -3). .
   (params@9
-   (param@1 :x.0`+`0 . .
+   (param@1 :x`+`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`+`0 . .
+   (param@4 :y`+`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -73,9 +73,9 @@
  (proc@,K :\2D.0.@5
   (sub -3). .
   (params@9
-   (param@1 :x.0`-`0 . .
+   (param@1 :x`-`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`-`0 . .
+   (param@4 :y`-`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -83,9 +83,9 @@
  (proc@,M :<=.0.@5
   (le -3). .
   (params@A
-   (param@1 :x.0`<=`0 . .
+   (param@1 :x`<=`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`<=`0 . .
+   (param@4 :y`<=`0.0 . .
     (i@3 64).))
   (bool@D)
   (pragmas@S
@@ -96,21 +96,21 @@
    (i@9 64)))
  (proc@,S :\2B.1.@5 x . .
   (params@9
-   (param@1 :x.0`+`1 . . VarId.0.@6 .)
-   (param@4 :y.0`+`1 . . VarId.0.@3 .))VarId.0.@F
+   (param@1 :x`+`1.0 . . VarId.0.@6 .)
+   (param@4 :y`+`1.0 . . VarId.0.@3 .))VarId.0.@F
   (pragmas@U
    (borrow@2)).
   (stmts@9
-   (result :result.0`+`1 . . VarId.0.@7 .@7)
-   (asgn result.0`+`1
+   (result :result`+`1.0 . . VarId.0.@7 .@7)
+   (asgn result`+`1.0
     (dconv VarId.0.@6
      (add
       (i@7,~9 64)
       (dconv
-       (i@B,~2 64)x.0`+`1)
+       (i@B,~2 64)x`+`1.0)
       (dconv
-       (i@B,~2 64)y.0`+`1))))
-   (ret result.0`+`1)))
+       (i@B,~2 64)y`+`1.0))))
+   (ret result`+`1.0)))
  (gvar@4,Z :x.0. . . VarId.0.@3 .)
  (asgn@2,b x.0.~2
   (infix@4 \2B.1. x.0.~2 x.0.@2))

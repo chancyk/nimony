@@ -32,10 +32,10 @@
     (tup 1 "typeOfIter"))))
  (func@2,7 :dollar`.TypeOfMode.0. x . .
   (params
-   (param :e.0`dollar``TypeOfMode`0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
+   (param :e`dollar``TypeOfMode`0.0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
   (stmts
-   (result@E :result.0`dollar``TypeOfMode`0 . . string.0.sysvq0asl .)
-   (case@E e.0`dollar``TypeOfMode`0
+   (result@E :result`dollar``TypeOfMode`0.0 . . string.0.sysvq0asl .)
+   (case@E e`dollar``TypeOfMode`0.0
     (of~C,1
      (ranges typeOfProc.0.)
      (stmts
@@ -44,13 +44,13 @@
      (ranges typeOfIter.0.)
      (stmts
       (ret "typeOfIter"))))
-   (ret@2,2 result.0`dollar``TypeOfMode`0)))
+   (ret@2,2 result`dollar``TypeOfMode`0.0)))
  (func@,B :typeof.0.@5
   (typeof). .
   (params@B
-   (param@1 :x.0`typeof`0 . .
+   (param@1 :x`typeof`0.0 . .
     (untyped@3).)
-   (param@D :mode.0`typeof`0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
+   (param@D :mode`typeof`0.0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
   (typekind@X
    (typedesc))
   (pragmas@r
@@ -59,9 +59,9 @@
  (func@,G :\2B.0.@5
   (add -3). .
   (params@9
-   (param@1 :x.0`+`0 . .
+   (param@1 :x`+`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`+`0 . .
+   (param@4 :y`+`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -69,9 +69,9 @@
  (func@,H :\2D.0.@5
   (sub -3). .
   (params@9
-   (param@1 :x.0`-`0 . .
+   (param@1 :x`-`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`-`0 . .
+   (param@4 :y`-`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -79,9 +79,9 @@
  (func@,J :<=.0.@5
   (le -3). .
   (params@A
-   (param@1 :x.0`<=`0 . .
+   (param@1 :x`<=`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`<=`0 . .
+   (param@4 :y`<=`0.0 . .
     (i@3 64).))
   (bool@D)
   (pragmas@S
@@ -92,17 +92,17 @@
  (gvar@4,O :stdout.0. . . File.0.@8 .)
  (proc@,Q :write.0.@5 . . .
   (params@A
-   (param@1 :f.0`write`0 . .
+   (param@1 :f`write`0.0 . .
     (mut@3 File.0.@4).)
-   (param@E :c.0`write`0 . .
+   (param@E :c`write`0.0 . .
     (c@3 8).)). . .
   (stmts@Z
    (discard .)))
  (proc@,R :write.1.@5 . . .
   (params@A
-   (param@1 :f.0`write`1 . .
+   (param@1 :f`write`1.0 . .
     (mut@3 File.0.@4).)
-   (param@E :s.0`write`1 . . string.0.sysvq0asl .)). . .
+   (param@E :s`write`1.0 . . string.0.sysvq0asl .)). . .
   (stmts@b
    (discard .)))
  (cmd@,T write.0.
@@ -115,7 +115,7 @@
    (magic@2 Unpack@7)). .)
  (template@,X :echo.0.@9 x . .
   (params@E
-   (param@5 :vanon.0`echo`0 . .
+   (param@5 :vanon`echo`0.0 . .
     (varargs).)).
   (pragmas@H
    (varargs@2)).
@@ -123,11 +123,11 @@
    (for@4
     (unpack@B)
     (unpackflat
-     (let :x.0`echo`0 . .
+     (let :x`echo`0.0 . .
       (untyped@9,~N).))
     (expr~2,1
      (cmd
-      (ochoice write.0. write.1.)stdout.0.@6 x.0`echo`0@E)))
+      (ochoice write.0. write.1.)stdout.0.@6 x`echo`0.0@E)))
    (cmd@,2 write.0. stdout.0.@6 '\0A'@E)))
  (gvar@4,c :someVar.0. . . string.0.sysvq0asl ""@A)
  (stmts@2,Y

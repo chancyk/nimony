@@ -72,6 +72,7 @@ proc kindLabel(k: NimonyStmt): string =
 proc basename(symName: string): string =
   var work = symName
   extractBasename(work)
+  stripLocalNs(work)
   result = work
 
 const UnreservedUrlChar = {'A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~'}
@@ -444,6 +445,7 @@ proc buildNameLookup(ctx: var RenderCtx) =
       continue
     var base = full
     extractBasename(base)
+    stripLocalNs(base)
     if base.len == 0: continue
     let old = ctx.nameToSym.getOrDefault(base, 0)
     if old == 0:

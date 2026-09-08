@@ -1120,6 +1120,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
         let s = Sym(kind: kind, name: symId, pos: beforeName)
         var name = pool.syms[symId]
         extractBasename(name)
+        stripLocalNs(name)
         # go up a scope for the parameter scope:
         c.currentScope.up.addOverloadable(pool.strings.getOrIncl(name), s)
       # An intrinsic's signature is unified against its row here, where the
@@ -1380,7 +1381,11 @@ proc buildInnerObjDecl(c: var SemContext; decl: Cursor; sym: var SymId): TokenBu
 
   # make anon object symbol from `sym` and set `sym` to it:
   var isGlobal = false
-  let basename = extractBasename(pool.syms[sym], isGlobal)
+  var basename = extractBasename(pool.syms[sym], isGlobal)
+  # The source identifier, not the namespaced one: `makeLocalSym` below adds
+  # the current routine's namespace, and a stem that kept the original's would
+  # stack a second tag onto the first.
+  stripLocalNs(basename)
   var objName = basename & ".Obj"
   if isGlobal: c.makeGlobalSym(objName)
   else: c.makeLocalSym(objName)

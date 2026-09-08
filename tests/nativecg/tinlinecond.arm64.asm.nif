@@ -99,7 +99,7 @@
      (gload `tmp4.0 `iniGuard.0.)
      (cbz `tmp4.0 `L2.0)
      (kill `tmp4.0)
-     (b returnLabel.0h2``main`0)
+     (b returnLabel`h``main`0.2)
      (b `L1.0)
      (lab :`L2.0)
      (lab :`L1.0)
@@ -117,7 +117,7 @@
        (gload `tmp6.0 `iniGuard.0.sysvq0asl)
        (cbz `tmp6.0 `L4.0)
        (kill `tmp6.0)
-       (b returnLabel.0x2)
+       (b returnLabel`x.2)
        (b `L3.0)
        (lab :`L4.0)
        (lab :`L3.0)
@@ -143,8 +143,8 @@
           (mem `tmp9.0)`tmp8.0)
          (kill `tmp9.0)
          (kill `tmp8.0)
-         (lab :returnLabel.0x1)))
-       (lab :returnLabel.0x2)))
+         (lab :returnLabel`x.1)))
+       (lab :returnLabel`x.2)))
      (scope
       (scope
        (rebind :`tmp10.0
@@ -153,7 +153,7 @@
        (gload `tmp10.0 `iniGuard.0.syn1lfpjv)
        (cbz `tmp10.0 `L6.0)
        (kill `tmp10.0)
-       (b returnLabel.0x3)
+       (b returnLabel`x.3)
        (b `L5.0)
        (lab :`L6.0)
        (lab :`L5.0)
@@ -171,7 +171,7 @@
          (gload `tmp12.0 `iniGuard.0.sysvq0asl)
          (cbz `tmp12.0 `L8.0)
          (kill `tmp12.0)
-         (b returnLabel.0x5)
+         (b returnLabel`x.5)
          (b `L7.0)
          (lab :`L8.0)
          (lab :`L7.0)
@@ -197,8 +197,8 @@
             (mem `tmp15.0)`tmp14.0)
            (kill `tmp15.0)
            (kill `tmp14.0)
-           (lab :returnLabel.0x4)))
-         (lab :returnLabel.0x5)))
+           (lab :returnLabel`x.4)))
+         (lab :returnLabel`x.5)))
        (scope
         (scope
          (rebind :`tmp16.0
@@ -207,7 +207,7 @@
          (gload `tmp16.0 `iniGuard.0.for2ybv4p1)
          (cbz `tmp16.0 `L10.0)
          (kill `tmp16.0)
-         (b returnLabel.0x6)
+         (b returnLabel`x.6)
          (b `L9.0)
          (lab :`L10.0)
          (lab :`L9.0)
@@ -225,7 +225,7 @@
            (gload `tmp18.0 `iniGuard.0.sysvq0asl)
            (cbz `tmp18.0 `L12.0)
            (kill `tmp18.0)
-           (b returnLabel.0x8)
+           (b returnLabel`x.8)
            (b `L11.0)
            (lab :`L12.0)
            (lab :`L11.0)
@@ -251,9 +251,9 @@
               (mem `tmp21.0)`tmp20.0)
              (kill `tmp21.0)
              (kill `tmp20.0)
-             (lab :returnLabel.0x7)))
-           (lab :returnLabel.0x8)))
-         (lab :returnLabel.0x6)))
+             (lab :returnLabel`x.7)))
+           (lab :returnLabel`x.8)))
+         (lab :returnLabel`x.6)))
        (prepare newFile.0.syn1lfpjv
         (mov
          (x0)0)
@@ -306,7 +306,7 @@
        (gstore
         (x0)stderr.0.syn1lfpjv)
        (scope
-        (var :p.0x9
+        (var :p`x.9
          (x3)
          (proctype
           (params)
@@ -328,22 +328,22 @@
            (x13)
            (x14)
            (x15))))
-        (adr p.0x9 flushStdStreams.0.syn1lfpjv)
+        (adr p`x.9 flushStdStreams.0.syn1lfpjv)
         (scope
-         (gstore p.0x9 gExitFlush.0.sysvq0asl)
-         (lab :returnLabel.0x10))
-        (kill p.0x9))
-       (lab :returnLabel.0x3)))
-     (var :`x.0h1``main`0
+         (gstore p`x.9 gExitFlush.0.sysvq0asl)
+         (lab :returnLabel`x.10))
+        (kill p`x.9))
+       (lab :returnLabel`x.3)))
+     (var :`x`h``main`0.1
       (x9)
       (i 64))
      (scope
       (scope
-       (mov `x.0h1``main`0 0)
-       (var :i.0h5``main`0
+       (mov `x`h``main`0.1 0)
+       (var :i`h``main`0.5
         (x3)
         (i 64))
-       (mov i.0h5``main`0 0)
+       (mov i`h``main`0.5 0)
        (scope
         (loop
          (stmts
@@ -353,53 +353,53 @@
           (mov `tmp22.0 1)
           (cbz `tmp22.0 `L13.0)
           (kill `tmp22.0)
-          (cmp i.0h5``main`0 3)
+          (cmp i`h``main`0.5 3)
           (bgt `L15.0)
-          (var :`x.0h7``main`0
+          (var :`x`h``main`0.7
            (x4)
            (i 64))
           (scope
            (scope
-            (cmp i.0h5``main`0 2)
+            (cmp i`h``main`0.5 2)
             (rebind :`tmp23.0
              (i 64)
              (x14))
             (mov `tmp23.0 1)
-            (mov `x.0h7``main`0 2)
-            (cselle `x.0h7``main`0 `tmp23.0 `x.0h7``main`0)
+            (mov `x`h``main`0.7 2)
+            (cselle `x`h``main`0.7 `tmp23.0 `x`h``main`0.7)
             (kill `tmp23.0)
-            (lab :returnLabel.0h16``main`0)))
-          (rebind :`x.0h1``main`0
+            (lab :returnLabel`h``main`0.16)))
+          (rebind :`x`h``main`0.1
            (i 64)
            (x9))
-          (add `x.0h1``main`0 `x.0h7``main`0)
+          (add `x`h``main`0.1 `x`h``main`0.7)
           (scope
            (scope
-            (rebind :i.0h5``main`0
+            (rebind :i`h``main`0.5
              (i 64)
              (x3))
-            (add i.0h5``main`0 1)
-            (lab :returnLabel.0h18``main`0)))
+            (add i`h``main`0.5 1)
+            (lab :returnLabel`h``main`0.18)))
           (b `L14.0)
           (lab :`L15.0)
           (b `L13.0)
           (lab :`L14.0)))
         (lab :`L13.0)
-        (kill `x.0h7``main`0))
-       (lab :whileStmtLabel.0h8``main`0)
-       (lab :returnLabel.0h9``main`0)
-       (kill i.0h5``main`0)))
+        (kill `x`h``main`0.7))
+       (lab :whileStmtLabel`h``main`0.8)
+       (lab :returnLabel`h``main`0.9)
+       (kill i`h``main`0.5)))
      (scope
-      (var :f.0x13
+      (var :f`x.13
        (x20)
        (ptr `t.0.IArefSX46ileX4fbj0syn1lfpjv.syn1lfpjv))
-      (gload f.0x13 stdout.0.syn1lfpjv)
+      (gload f`x.13 stdout.0.syn1lfpjv)
       (scope
-       (var :`tmp.0x15
+       (var :`tmp`x.15
         (s)string.0.sysvq0asl)
        (prepare $.1.sysvq0asl
         (mov
-         (x0)`x.0h1``main`0)
+         (x0)`x`h``main`0.1)
         (mov
          (arg `p0.0)
          (x0))
@@ -407,7 +407,7 @@
        (rebind :`tmp24.0
         (i 64)
         (x14))
-       (lea `tmp24.0 `tmp.0x15)
+       (lea `tmp24.0 `tmp`x.15)
        (mov
         (mem
          (at
@@ -424,16 +424,16 @@
         (x1))
        (kill `tmp24.0)
        (scope
-        (var :s.0x16
+        (var :s`x.16
          (s)string.0.sysvq0asl)
         (rebind :`tmp25.0
          (i 64)
          (x11))
-        (lea `tmp25.0 s.0x16)
+        (lea `tmp25.0 s`x.16)
         (rebind :`tmp26.0
          (i 64)
          (x12))
-        (lea `tmp26.0 `tmp.0x15)
+        (lea `tmp26.0 `tmp`x.15)
         (rebind :`tmp27.0
          (i 64)
          (x14))
@@ -465,38 +465,38 @@
         (kill `tmp26.0)
         (kill `tmp25.0)
         (scope
-         (var :`x.0x17
+         (var :`x`x.17
           (x9)
           (aptr
            (c 8)))
          (scope
           (scope
-           (var :`x.0x24
+           (var :`x`x.24
             (x3)
             (i 64))
            (scope
-            (var :bytes.0x25
+            (var :bytes`x.25
              (x4)
              (u 64))
-            (mov bytes.0x25
+            (mov bytes`x.25
              (mem
-              (dot s.0x16 bytes.0)))
+              (dot s`x.16 bytes.0)))
             (scope
-             (rebind :`x.0x24
+             (rebind :`x`x.24
               (u 64)
               (x3))
-             (rebind :`x.0x24
+             (rebind :`x`x.24
               (u 64)
               (x3))
-             (and3 `x.0x24 bytes.0x25 255)
-             (rebind :`x.0x24
+             (and3 `x`x.24 bytes`x.25 255)
+             (rebind :`x`x.24
               (i 64)
               (x3))
-             (lab :returnLabel.0x26))
-            (kill bytes.0x25))
-           (cmp `x.0x24 14)
+             (lab :returnLabel`x.26))
+            (kill bytes`x.25))
+           (cmp `x`x.24 14)
            (ble `L17.0)
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (u 64)
             (x9))
            (rebind :`tmp28.0
@@ -511,7 +511,7 @@
             (x13))
            (mov `tmp30.0
             (mem
-             (dot s.0x16 more.0)))
+             (dot s`x.16 more.0)))
            (lea `tmp29.0
             (dot
              (cast
@@ -526,18 +526,18 @@
            (rebind :`tmp31.0
             (i 64)
             (x11))
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (u 64)
             (x9))
-           (add3 `x.0x17 `tmp31.0 0)
+           (add3 `x`x.17 `tmp31.0 0)
            (kill `tmp31.0)
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (aptr
              (c 8))
             (x9))
            (b `L16.0)
            (lab :`L17.0)
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (u 64)
             (x9))
            (rebind :`tmp32.0
@@ -545,7 +545,7 @@
              (u 64))
             (x11))
            (lea `tmp32.0
-            (dot s.0x16 bytes.0))
+            (dot s`x.16 bytes.0))
            (rebind :`tmp33.0
             (i 64)
             (x11))
@@ -560,56 +560,56 @@
            (rebind :`tmp36.0
             (i 64)
             (x11))
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (u 64)
             (x9))
-           (add3 `x.0x17 `tmp36.0 0)
+           (add3 `x`x.17 `tmp36.0 0)
            (kill `tmp36.0)
-           (rebind :`x.0x17
+           (rebind :`x`x.17
             (aptr
              (c 8))
             (x9))
            (lab :`L16.0)
-           (lab :returnLabel.0x27)
-           (kill `x.0x24)))
-         (var :`x.0x18
+           (lab :returnLabel`x.27)
+           (kill `x`x.24)))
+         (var :`x`x.18
           (x10)
           (i 64))
          (scope
           (scope
-           (var :`x.0x30
+           (var :`x`x.30
             (x3)
             (i 64))
            (scope
-            (var :bytes.0x31
+            (var :bytes`x.31
              (x4)
              (u 64))
-            (mov bytes.0x31
+            (mov bytes`x.31
              (mem
-              (dot s.0x16 bytes.0)))
+              (dot s`x.16 bytes.0)))
             (scope
-             (rebind :`x.0x30
+             (rebind :`x`x.30
               (u 64)
               (x3))
-             (rebind :`x.0x30
+             (rebind :`x`x.30
               (u 64)
               (x3))
-             (and3 `x.0x30 bytes.0x31 255)
-             (rebind :`x.0x30
+             (and3 `x`x.30 bytes`x.31 255)
+             (rebind :`x`x.30
               (i 64)
               (x3))
-             (lab :returnLabel.0x32))
-            (kill bytes.0x31))
-           (mov `x.0x18 `x.0x30)
-           (cmp `x.0x30 14)
+             (lab :returnLabel`x.32))
+            (kill bytes`x.31))
+           (mov `x`x.18 `x`x.30)
+           (cmp `x`x.30 14)
            (ble `L19.0)
            (rebind :`tmp37.0
             (ptr LongString.0.sysvq0asl)
             (x11))
            (mov `tmp37.0
             (mem
-             (dot s.0x16 more.0)))
-           (mov `x.0x18
+             (dot s`x.16 more.0)))
+           (mov `x`x.18
             (mem
              (dot
               (cast
@@ -618,60 +618,60 @@
            (b `L18.0)
            (lab :`L19.0)
            (lab :`L18.0)
-           (lab :returnLabel.0x33)
-           (kill `x.0x30)))
+           (lab :returnLabel`x.33)
+           (kill `x`x.30)))
          (prepare writeBytes.0.syn1lfpjv
           (mov
-           (x0)f.0x13)
+           (x0)f`x.13)
           (mov
            (arg `p0.0)
            (x0))
           (mov
-           (x1)`x.0x17)
+           (x1)`x`x.17)
           (mov
            (arg `p1.0)
            (x1))
           (mov
-           (x2)`x.0x18)
+           (x2)`x`x.18)
           (mov
            (arg `p2.0)
            (x2))
           (call))
-         (lab :returnLabel.0x19)
-         (kill `x.0x17)
-         (kill `x.0x18)))
+         (lab :returnLabel`x.19)
+         (kill `x`x.17)
+         (kill `x`x.18)))
        (scope
         (scope
-         (var :`x.0x35
+         (var :`x`x.35
           (x3)
           (i 64))
          (scope
-          (var :bytes.0x36
+          (var :bytes`x.36
            (x4)
            (u 64))
-          (mov bytes.0x36
+          (mov bytes`x.36
            (mem
-            (dot `tmp.0x15 bytes.0)))
+            (dot `tmp`x.15 bytes.0)))
           (scope
-           (rebind :`x.0x35
+           (rebind :`x`x.35
             (u 64)
             (x3))
-           (rebind :`x.0x35
+           (rebind :`x`x.35
             (u 64)
             (x3))
-           (and3 `x.0x35 bytes.0x36 255)
-           (rebind :`x.0x35
+           (and3 `x`x.35 bytes`x.36 255)
+           (rebind :`x`x.35
             (i 64)
             (x3))
-           (lab :returnLabel.0x37))
-          (kill bytes.0x36))
-         (cmp `x.0x35 255)
+           (lab :returnLabel`x.37))
+          (kill bytes`x.36))
+         (cmp `x`x.35 255)
          (bne `L21.0)
          (prepare destroyHeapStr.0.sysvq0asl
           (mov
            (x0)
            (mem
-            (dot `tmp.0x15 more.0)))
+            (dot `tmp`x.15 more.0)))
           (mov
            (arg `p0.0)
            (x0))
@@ -679,10 +679,10 @@
          (b `L20.0)
          (lab :`L21.0)
          (lab :`L20.0)
-         (lab :returnLabel.0x38)
-         (kill `x.0x35)))
-       (lab :returnLabel.0x20))
-      (kill f.0x13))
+         (lab :returnLabel`x.38)
+         (kill `x`x.35)))
+       (lab :returnLabel`x.20))
+      (kill f`x.13))
      (prepare write.7.syn1lfpjv
       (gload
        (x0)stdout.0.syn1lfpjv)
@@ -695,7 +695,7 @@
        (arg `p1.0)
        (x1))
       (call))
-     (lab :returnLabel.0h2``main`0)))
+     (lab :returnLabel`h``main`0.2)))
    (scope
     (scope
      (prepare gExitFlush.0.sysvq0asl
@@ -704,7 +704,7 @@
       (x0)0)
      (prepare _exit.c.sysvq0asl
       (extcall))
-     (lab :returnLabel.0x40)))
+     (lab :returnLabel`x.40)))
    (mov
     (x0)0)
    (add
@@ -748,19 +748,19 @@
    (x14)
    (x15))
   (stmts
-   (var :result.0`isLe`0
+   (var :result`isLe`0.0
     (x2)
     (bool))
-   (mov result.0`isLe`0 1)
+   (mov result`isLe`0.0 1)
    (cmp
     (x0)
     (x1))
    (ble `L1.0)
-   (mov result.0`isLe`0 0)
+   (mov result`isLe`0.0 0)
    (lab :`L1.0)
    (mov
-    (x0)result.0`isLe`0)
-   (kill result.0`isLe`0)
+    (x0)result`isLe`0.0)
+   (kill result`isLe`0.0)
    (ret))))(.index
  (x `cchar.0. 58)
  (x `iniGuard.0. 151)

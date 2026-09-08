@@ -1,2 +1,2 @@
-use		x.0`main`0			tests/nimony/track/tvar.nim	3	10
-use		x.0`main`0			tests/nimony/track/tvar.nim	5	10
+use		x`main`0.0			tests/nimony/track/tvar.nim	3	10
+use		x`main`0.0			tests/nimony/track/tvar.nim	5	10

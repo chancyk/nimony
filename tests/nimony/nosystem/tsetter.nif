@@ -10,17 +10,17 @@
   (object@2 .))
  (proc@,4 :bar=.0.@5 . . .
   (params@B
-   (param@1 :x.0`bar=`0 . . Foo.0.@3 .)
-   (param@9 :y.0`bar=`0 . .
+   (param@1 :x`bar=`0.0 . . Foo.0.@3 .)
+   (param@9 :y`bar=`0.0 . .
     (i@3 64).)). . .
   (stmts@U
    (discard .)))
  (proc@,5 :\5B\5D=.0.@5 . . .
   (params@A
-   (param@1 :x.0`\5B\5D=`0 . . Foo.0.@3 .)
-   (param@9 :y.0`\5B\5D=`0 . .
+   (param@1 :x`\5B\5D=`0.0 . . Foo.0.@3 .)
+   (param@9 :y`\5B\5D=`0.0 . .
     (i@3 64).)
-   (param@H :z.0`\5B\5D=`0 . .
+   (param@H :z`\5B\5D=`0.0 . .
     (i@3 64).)). . .
   (stmts@b
    (discard .)))

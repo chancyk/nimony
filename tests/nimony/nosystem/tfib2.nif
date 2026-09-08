@@ -16,9 +16,9 @@
  (proc@,5 :\2B.0.@5
   (add -3). .
   (params@9
-   (param@1 :x.0`+`0 . .
+   (param@1 :x`+`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`+`0 . .
+   (param@4 :y`+`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -26,9 +26,9 @@
  (proc@,6 :\2D.0.@5
   (sub -3). .
   (params@9
-   (param@1 :x.0`-`0 . .
+   (param@1 :x`-`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`-`0 . .
+   (param@4 :y`-`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
@@ -36,9 +36,9 @@
  (proc@,8 :<=.0.@5
   (le -3). .
   (params@A
-   (param@1 :x.0`<=`0 . .
+   (param@1 :x`<=`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`<=`0 . .
+   (param@4 :y`<=`0.0 . .
     (i@3 64).))
   (bool@D)
   (pragmas@S
@@ -46,9 +46,9 @@
  (proc@,A :\2B.1.@5
   (add -3). .
   (params@9
-   (param@1 :x.0`+`1 . .
+   (param@1 :x`+`1.0 . .
     (f@6 64).)
-   (param@4 :y.0`+`1 . .
+   (param@4 :y`+`1.0 . .
     (f@3 64).))
   (f@F 64)
   (pragmas@U
@@ -56,9 +56,9 @@
  (proc@,B :\2D.1.@5
   (sub -3). .
   (params@9
-   (param@1 :x.0`-`1 . .
+   (param@1 :x`-`1.0 . .
     (f@6 64).)
-   (param@4 :y.0`-`1 . .
+   (param@4 :y`-`1.0 . .
     (f@3 64).))
   (f@F 64)
   (pragmas@U
@@ -66,9 +66,9 @@
  (proc@,D :<=.1.@5
   (le -3). .
   (params@A
-   (param@1 :x.0`<=`1 . .
+   (param@1 :x`<=`1.0 . .
     (f@6 64).)
-   (param@4 :y.0`<=`1 . .
+   (param@4 :y`<=`1.0 . .
     (f@3 64).))
   (bool@F)
   (pragmas@U
@@ -79,42 +79,42 @@
    (stmts~8,1
     (proc :<=.2.@5 . . .
      (params@9
-      (param@1 :a.0`<=`2 . . Self.0.@6 .)
-      (param@4 :b.0`<=`2 . . Self.0.@3 .))
+      (param@1 :a`<=`2.0 . . Self.0.@6 .)
+      (param@4 :b`<=`2.0 . . Self.0.@3 .))
      (bool@E).@E . .)
     (proc@,1 :\2B.2.@5 . . .
      (params@8
-      (param@1 :x.0`+`2 . . Self.0.@6 .)
-      (param@4 :y.0`+`2 . . Self.0.@3 .))Self.0.@E .@E . .)
+      (param@1 :x`+`2.0 . . Self.0.@6 .)
+      (param@4 :y`+`2.0 . . Self.0.@3 .))Self.0.@E .@E . .)
     (proc@,2 :\2D.2.@5 . . .
      (params@8
-      (param@1 :x.0`-`2 . . Self.0.@6 .)
-      (param@4 :y.0`-`2 . . Self.0.@3 .))Self.0.@E .@E . .))))
+      (param@1 :x`-`2.0 . . Self.0.@6 .)
+      (param@4 :y`-`2.0 . . Self.0.@3 .))Self.0.@E .@E . .))))
  (proc@,M :fib.0.@5 . .
   (typevars@8
    (typevar@1 :T.0. . . Fibable.0.@3 .))
   (params@K
-   (param@1 :a.0`fib`0 . . T.0.@3 .))T.0.@8 .@8 .
+   (param@1 :a`fib`0.0 . . T.0.@3 .))T.0.@8 .@8 .
   (stmts@2,1
-   (result :result.0`fib`0 . . T.0.@M,~1 .@M,~1)
+   (result :result`fib`0.0 . . T.0.@M,~1 .@M,~1)
    (if
     (elif@3
      (infix@2
-      (ochoice <=.0. <=.1.)a.0`fib`0~2 2@3)
+      (ochoice <=.0. <=.1.)a`fib`0.0~2 2@3)
      (stmts~1,1
-      (asgn@7 result.0`fib`0~7 1@2)))
+      (asgn@7 result`fib`0.0~7 1@2)))
     (else@,2
      (stmts@2,1
-      (asgn@7 result.0`fib`0~7
+      (asgn@7 result`fib`0.0~7
        (infix@B
         (ochoice \2B.0. \2B.1.)
         (call~6 fib.0.~3
          (infix@2
-          (ochoice \2D.0. \2D.1.)a.0`fib`0~1 1@1))
+          (ochoice \2D.0. \2D.1.)a`fib`0.0~1 1@1))
         (call@5 fib.0.~3
          (infix@2
-          (ochoice \2D.0. \2D.1.)a.0`fib`0~1 2@1)))))))
-   (ret@S,3 result.0`fib`0)))
+          (ochoice \2D.0. \2D.1.)a`fib`0.0~1 2@1)))))))
+   (ret@S,3 result`fib`0.0)))
  (discard@,S
   (call@8 fib.0.Intnbdb. 8@4))
  (discard@,T
@@ -124,30 +124,30 @@
   (at fib.0.
    (i 64))
   (params@9,~6
-   (param@1 :a.1`fib`0`Intnbdb . .
+   (param@1 :a`fib`0`Intnbdb.1 . .
     (i 64).))
   (i@A,~6 64).@A,~6 .~B,~6
   (stmts~9,~5
-   (result :result.0`fib`0`Intnbdb . .
+   (result :result`fib`0`Intnbdb.0 . .
     (i 64).)
    (if
     (elif@3
      (le@2
-      (i@A,~F 64)a.1`fib`0`Intnbdb~2 2@3)
+      (i@A,~F 64)a`fib`0`Intnbdb.1~2 2@3)
      (stmts~1,1
-      (asgn@7 result.0`fib`0`Intnbdb~7 1@2)))
+      (asgn@7 result`fib`0`Intnbdb.0~7 1@2)))
     (else@,2
      (stmts@2,1
-      (asgn@7 result.0`fib`0`Intnbdb~7
+      (asgn@7 result`fib`0`Intnbdb.0~7
        (add@B
         (i~6,~L 64)
         (call~9 fib.0.Intnbdb.
          (sub@5
-          (i~2,~K 64)a.1`fib`0`Intnbdb~1 1@1))
+          (i~2,~K 64)a`fib`0`Intnbdb.1~1 1@1))
         (call@2 fib.0.Intnbdb.
          (sub@5
-          (i~D,~K 64)a.1`fib`0`Intnbdb~1 2@1)))))))
-   (ret@S,3 result.0`fib`0`Intnbdb))))(.index@,2,tests/nimony/nosystem/tfib2.nim
+          (i~D,~K 64)a`fib`0`Intnbdb.1~1 2@1)))))))
+   (ret@S,3 result`fib`0`Intnbdb.0))))(.index@,2,tests/nimony/nosystem/tfib2.nim
  (x int.0. 79)
  (x bool.0. 64)
  (x float.0. 66)

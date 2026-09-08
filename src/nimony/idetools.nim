@@ -212,6 +212,7 @@ proc findLocal(file: string; sym: SymId; toTrack: NifLineInfo; mode: TrackMode; 
 
   var name = pool.syms[sym]
   extractBasename name
+  stripLocalNs name
 
   var offset = -1
   var parentOffset = 0
@@ -281,12 +282,15 @@ proc usages*(files: openArray[string]; config: NifConfig) =
       if n.isSymbol or n.isSymbolDef:
         # performance critical! May run over every symbol in the project!
         let name = pool.syms[n.symId]
-        var tokenLen = 0
+        # The token the USER typed: `sourceIdentLen` stops at the
+        # disambiguator AND at the owning routine's namespace, which since the
+        # respelling sits inside the identifier (`` x`main`0.0 ``). Counting to
+        # the first dot alone would claim a column span eight bytes wide for a
+        # one-byte `x` and match the wrong symbol.
+        let tokenLen = sourceIdentLen(name)
         var dots = 0
         for i in 0 ..< name.len:
-          if name[i] == '.':
-            inc dots
-          if dots == 0: inc tokenLen
+          if name[i] == '.': inc dots
         if lineInfoMatch(n.info, requestedInfo, tokenLen):
           isLocalSym = dots < 2
           symId = n.symId

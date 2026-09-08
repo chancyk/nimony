@@ -265,6 +265,7 @@ proc stateToProcName*(c: Context; sym: SymId; state: int): SymId =
 proc localToFieldname*(c: var Context; local: SymId): SymId =
   var name = pool.syms[local]
   extractBasename name
+  stripLocalNs name
   name.add "`f"
   result = c.namer.freshGlobalSym(name, c.thisModuleSuffix)
 

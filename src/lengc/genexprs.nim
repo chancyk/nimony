@@ -207,6 +207,7 @@ proc genField(c: var GeneratedCode; fld: Cursor; objBody: Cursor; objTypeIsImpor
     var x = c.m.pool.syms[s]
     if objTypeIsImported:
       extractBasename x
+      stripLocalNs x
       c.add x
     else:
       c.add mangleToC(x)

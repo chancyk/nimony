@@ -607,6 +607,7 @@ proc bracketKind(g: SrcGen, n: Cursor): BracketKind =
     elif n.isSymbol:
       var name = pool.syms[n.symId]
       extractBasename(name)
+      stripLocalNs(name)
 
       case name
       of "[]": result = bkBracket
@@ -1999,11 +2000,13 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
   of Symbol:
     var name = pool.syms[n.symId]
     extractBasename(name)
+    stripLocalNs(name)
     put(g, tkSymbol, name, n.symId)
     inc n
   of SymbolDef:
     var name = pool.syms[n.symId]
     extractBasename(name)
+    stripLocalNs(name)
     put(g, tkSymbol, name, n.symId, isDef = true)
     inc n
   of Ident:

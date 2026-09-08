@@ -200,6 +200,7 @@ proc readBindSymRule(arg: Cursor): string =
   of Symbol:
     var s = pool.syms[arg.symId]
     extractBasename s
+    stripLocalNs s
     result = s
   of IntLit:
     case arg.intVal

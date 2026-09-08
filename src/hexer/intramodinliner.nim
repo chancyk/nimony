@@ -265,7 +265,7 @@ type
     counterPrefix: string                   # disambiguates passes (hexer vs dce2)
     ns: string
       ## Namespace segment of the top-level declaration being rewritten
-      ## (`passes.localNamespaceOf`). It rides in the disambiguator of every
+      ## (`passes.localNamespaceOf`). It rides in the IDENTIFIER of every
       ## name `freshSym`/`inlineBody` mints, so the SPLICES INTO ONE PROC do
       ## not depend on how many splices happened in the procs before it —
       ## which is what let an edit at the end of a module rename the temps at
@@ -407,32 +407,33 @@ proc lookupBody(c: var InlinerCtx; calleeSym: SymId; outCur: var Cursor): bool =
   outCur = cursorAt(fm.buf, fm.bodies.getOrQuit(calleeSym))
   result = true
 
-proc freshDisamb(c: var InlinerCtx): string =
-  ## The disambiguator every name this pass mints carries: `0<prefix><n>`,
-  ## then the enclosing declaration's namespace. The leading `0` keeps the
-  ## byte after the dot a digit, which is what every `symparser` scanner
-  ## splits on.
-  inc c.counter
-  result = "0"
-  result.add c.counterPrefix
-  result.addInt c.counter
+proc freshStem(c: var InlinerCtx; base: string): string =
+  ## The IDENTIFIER every name this pass mints carries: the base, this pass's
+  ## letter, then the enclosing declaration's namespace. `localSymName` adds
+  ## the number.
+  ##
+  ## The letter used to ride in the disambiguator (`base.0i<n>`). It does not
+  ## any more: a NIF symbol's disambiguator carries a number and nothing else
+  ## (#2457), and upstream spells its own inliner temps `` result`i.5 `` for
+  ## exactly that reason. See `notes/f1-respell.md`.
+  taggedName(base, c.counterPrefix, c.ns)
 
 proc freshSym(c: var InlinerCtx; orig: SymId): SymId =
   ## Mint a fresh local sym for an inlined body's local. Local names must
   ## have ≤ 1 dot (per `isLocalName`) so dce2's per-module rewrite emits
   ## them unconditionally instead of consulting the global live set —
   ## these syms were minted post-`markLive` and aren't tracked there.
-  ## The `0<prefix>` prefix on the counter avoids colliding with existing
-  ## numeric-suffixed locals like `result.26`; the `prefix` further
-  ## disambiguates between the hexer-stage same-module pass and the
-  ## dce2-stage cross-module pass so the latter's fresh syms can't
-  ## collide with hexer-minted ones already baked into the `.x.nif`.
-  let disamb = freshDisamb(c)
-  let original = pool.syms[orig]
-  var base = original
+  ## The backtick-joined `prefix` makes the identifier unspellable, so it can
+  ## collide neither with a user's `result.26` nor with the other passes':
+  ## the hexer-stage same-module pass and the dce2-stage cross-module pass own
+  ## a letter each, so one pass's fresh syms can never collide with those
+  ## already baked into the `.x.nif` it is rewriting.
+  inc c.counter
+  var base = pool.syms[orig]
   let dotPos = base.find('.')
   if dotPos >= 0: base.setLen dotPos
-  result = pool.syms.getOrIncl(namespacedName(base, disamb, c.ns))
+  stripLocalNs(base)
+  result = pool.syms.getOrIncl(localSymName(freshStem(c, base), c.counter, ""))
 
 proc scoreArg(a: Cursor): int =
   ## Argument score for the inline heuristic (planned in dce1: 0-100).
@@ -1109,8 +1110,9 @@ proc emitBody(c: var InlinerCtx; dest: var TokenBuf; body: var Cursor;
     emitRenamed(dest, body, bnd)
     return
   let info = body.info
+  inc c.counter
   let returnLabel = pool.syms.getOrIncl(
-    namespacedName("returnLabel", freshDisamb(c), c.ns))
+    localSymName(freshStem(c, "returnLabel"), c.counter, ""))
   # Emit the inlined body as a real variable SCOPE, not a bare `(stmts)`: the
   # callee's fresh locals then belong to *this* scope frame, so the backend frees
   # their registers at the inlined body's end instead of leaking their live range

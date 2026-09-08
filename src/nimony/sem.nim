@@ -549,6 +549,7 @@ proc fetchSym*(c: var SemContext; s: SymId): Sym =
   # yyy find a better solution
   var name = pool.syms[s]
   extractBasename name
+  stripLocalNs name
   let identifier = pool.strings.getOrIncl(name)
   var it {.cursor.} = c.currentScope
   while it != nil:
@@ -623,6 +624,7 @@ proc sameIdent(sym: SymId; str: StrId): bool =
   # XXX speed this up by using the `fieldCache` idea
   var name = pool.syms[sym]
   extractBasename(name)
+  stripLocalNs(name)
   result = pool.strings.getOrIncl(name) == str
 
 proc sameIdent(a, b: SymId): bool =
@@ -630,8 +632,10 @@ proc sameIdent(a, b: SymId): bool =
   # XXX speed this up by using the `fieldCache` idea
   var x = pool.syms[a]
   extractBasename(x)
+  stripLocalNs(x)
   var y = pool.syms[b]
   extractBasename(y)
+  stripLocalNs(y)
   result = x == y
 
 proc requestRoutineInstance*(c: var SemContext; origin: SymId;
@@ -5221,6 +5225,7 @@ proc expandSymChoice(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
     assert n.isSymbol
     var name = pool.syms[n.symId]
     extractBasename(name)
+    stripLocalNs(name)
     var marker = initHashSet[SymId]()
     while n.hasMore:
       assert n.isSymbol

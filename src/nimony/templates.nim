@@ -390,6 +390,7 @@ proc addTemplFormalsToScope(c: var SemContext; buf: TokenBuf; at: int) =
         if param.name.isSymbolDef:
           var nameStr = pool.syms[param.name.symId]
           extractBasename(nameStr)
+          stripLocalNs(nameStr)
           if nameStr.len > 0:
             # `param.kind` is the decl's own `ParamY` / `TypevarY`, so the two
             # call sites cannot disagree with the structure they pass.

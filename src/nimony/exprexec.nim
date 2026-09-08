@@ -148,6 +148,7 @@ proc emitSymAsIdent(buf: var TokenBuf; sym: SymId; info: NifLineInfo;
       return
   var basename = symStr
   extractBasename basename
+  stripLocalNs basename
   buf.addIdent(pool.strings.getOrIncl(basename), info)
 
 proc rewriteTreeToIdents(newDest: var TokenBuf; n: var Cursor; thisMod: string) =
@@ -160,6 +161,7 @@ proc rewriteTreeToIdents(newDest: var TokenBuf; n: var Cursor; thisMod: string) 
     # so the sub-compile creates fresh decls via re-semchecking.
     var basename = pool.syms[n.symId]
     extractBasename basename
+    stripLocalNs basename
     newDest.addIdent(pool.strings.getOrIncl(basename), n.info)
     inc n
   of TagLit:

@@ -619,16 +619,18 @@ proc bifPluginInput(input: var TokenBuf; firstName: string): string =
   endRead(n)
   result = storeToString(buf)
 
-proc localNsTail(c: SemContext): string =
-  ## The trailing part a namespaced local carries after its disambiguator:
-  ## `` `semExpr`0 ``, or "" at module level.
-  if c.localNs.len == 0: "" else: LocalNsSep & c.localNs
-
 proc pluginTempCounterKey(c: SemContext): string =
   ## `makeLocalSym`'s counter key for the plugin temp base in the routine being
   ## checked: identifier plus namespace. The plugin mints names in that same
   ## namespace, so the two counters must be the SAME entry of `c.locals`.
-  result = pluginTempBase & localNsTail(c)
+  ##
+  ## Since the respelling that IS the identifier of the names minted from it
+  ## (`` `nimonyTemp`semExpr`0.7 ``), so it is also what `splitLocalSymName`
+  ## hands back as the basename — the protocol carries no tail any more.
+  result = pluginTempBase
+  if c.localNs.len > 0:
+    result.add LocalNsSep
+    result.add c.localNs
 
 proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
                               nextName: string) =
@@ -637,10 +639,8 @@ proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
 
   var nextBase = ""
   var nextDisamb = 0
-  var nextTail = ""
-  assert splitLocalSymName(nextName, nextBase, nextDisamb, nextTail) and
-    nextBase == pluginTempBase and nextDisamb >= firstDisamb and
-    nextTail == localNsTail(c),
+  assert splitLocalSymName(nextName, nextBase, nextDisamb) and
+    nextBase == pluginTempCounterKey(c) and nextDisamb >= firstDisamb,
     "invalid .unusedname returned by plugin"
 
   for disamb in firstDisamb ..< nextDisamb:

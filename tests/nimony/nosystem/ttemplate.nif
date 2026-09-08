@@ -39,10 +39,10 @@
     (tup 1 "typeOfIter"))))
  (func@2,A :dollar`.TypeOfMode.0. x . .
   (params
-   (param :e.0`dollar``TypeOfMode`0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
+   (param :e`dollar``TypeOfMode`0.0 . . TypeOfMode.0. .))string.0.sysvq0asl . .
   (stmts
-   (result@E :result.0`dollar``TypeOfMode`0 . . string.0.sysvq0asl .)
-   (case@E e.0`dollar``TypeOfMode`0
+   (result@E :result`dollar``TypeOfMode`0.0 . . string.0.sysvq0asl .)
+   (case@E e`dollar``TypeOfMode`0.0
     (of~C,1
      (ranges typeOfProc.0.)
      (stmts
@@ -51,13 +51,13 @@
      (ranges typeOfIter.0.)
      (stmts
       (ret "typeOfIter"))))
-   (ret@2,2 result.0`dollar``TypeOfMode`0)))
+   (ret@2,2 result`dollar``TypeOfMode`0.0)))
  (proc@,E :typeof.0.@5
   (typeof). .
   (params@B
-   (param@1 :x.0`typeof`0 . .
+   (param@1 :x`typeof`0.0 . .
     (untyped@3).)
-   (param@D :mode.0`typeof`0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
+   (param@D :mode`typeof`0.0 . . TypeOfMode.0.~M,~4 typeOfIter.0.@7))
   (typekind@X
    (typedesc))
   (pragmas@r
@@ -77,46 +77,46 @@
  (proc@,U :\2B.0.@5
   (add -3). .
   (params@9
-   (param@1 :x.0`+`0 . .
+   (param@1 :x`+`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`+`0 . .
+   (param@4 :y`+`0.0 . .
     (i@3 64).))
   (i@D 64)
   (pragmas@Q
    (magic@2 "AddI"@7)). .)
  (template@,W :plus.0.@9 . . .
   (params@D
-   (param@1 :x.0`plus`0 . .
+   (param@1 :x`plus`0.0 . .
     (i@6 64).)
-   (param@4 :y.0`plus`0 . .
+   (param@4 :y`plus`0.0 . .
     (i@3 64).))
   (i@D 64).@D .
   (stmts@W
    (add@2
-    (i~I,~2 64)x.0`plus`0~2 y.0`plus`0@2)))
+    (i~I,~2 64)x`plus`0.0~2 y`plus`0.0@2)))
  (proc@,Y :foo.0.@5 . . .
   (params@8
-   (param@1 :x.0`foo`0 . .
+   (param@1 :x`foo`0.0 . .
     (i@3 64).)
-   (param@9 :y.0`foo`0 . . string.0.sysvq0asl .))
+   (param@9 :y`foo`0.0 . . string.0.sysvq0asl .))
   (i@L 64).@L .
   (stmts@2,1
-   (result@4 :result.0`foo`0 . .
+   (result@4 :result`foo`0.0 . .
     (i@A,~5 64).@A,~5)
-   (var@4 :x.1`foo`0 . . string.0.sysvq0asl "abc"@4)
-   (asgn@7,1 result.0`foo`0~7
+   (var@4 :x`foo`0.1 . . string.0.sysvq0asl "abc"@4)
+   (asgn@7,1 result`foo`0.0~7
     (expr@N,~4
      (add@2
       (i~I,~2 64)4~I,4
       (expr~2
        (add@2
         (i~I,~2 64)2~A,4 89~7,4)))))
-   (asgn@2,2 x.1`foo`0~2 "34"@2)
-   (ret@4,2 result.0`foo`0)))
+   (asgn@2,2 x`foo`0.1~2 "34"@2)
+   (ret@4,2 result`foo`0.0)))
  (proc@,d :overloaded.0.@5 . . .
   (params@F). . .
   (stmts@2,1
-   (let@4 :someInt.0`overloaded`0 . .
+   (let@4 :someInt`overloaded`0.0 . .
     (i@A,~A 64)
     (add@D
      (i~3,~A 64)23@1 90@5))
@@ -132,10 +132,10 @@
   (typevars@D
    (typevar@1 :T.3. . . . .))
   (params@G
-   (param@1 :x.0`conv`0 . .
+   (param@1 :x`conv`0.0 . .
     (i@3 64).))T.3.@A .@A .
   (stmts@U
-   (conv@1 T.3. x.0`conv`0@1)))
+   (conv@1 T.3. x`conv`0.0@1)))
  (glet@4,l :val.0. . .
   (i 64)123@6)
  (discard@,m

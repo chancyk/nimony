@@ -28,27 +28,6 @@ proc extractBasename*(s: var string) =
         return
     dec i
 
-proc sourceIdent*(s: string): string =
-  ## The identifier a symbol was SPELLED with in the source: the one rendering
-  ## every user-facing diagnostic uses when it names a symbol.
-  ##
-  ##   "s.0`testMutateWhileIterating`0" -> "s"
-  ##   "Foo.0.tge70svym"                -> "Foo"
-  ##   "T"                              -> "T"
-  ##
-  ## Everything after the identifier is compiler bookkeeping — a disambiguating
-  ## count, the owning routine's namespace (`LocalNsSep`), a module suffix — and
-  ## none of it is anything the user wrote. A message that must tell two
-  ## same-named symbols apart does it with the file/line/column it already
-  ## carries, not with that bookkeeping: `a.6` and `a.9` said nothing about WHICH
-  ## `a`, and the numbers moved whenever an unrelated declaration was edited.
-  ##
-  ## A name with no `.<digit>` in it — a plain identifier that never went through
-  ## `makeGlobalSym`/`makeLocalSym` — is returned unchanged, which is why this
-  ## wraps the in-place `extractBasename` rather than the one that answers `""`.
-  result = s
-  extractBasename(result)
-
 proc genericTypeName*(key, modname: string): string =
   result = "`t.0.I" & key & "." & modname
 
@@ -168,38 +147,113 @@ proc isLocalName*(s: string): bool =
   result = dots <= 1
 
 const LocalNsSep* = '`'
-  ## Separates a local symbol's disambiguator from the NAMESPACE segment that
-  ## says which routine the local belongs to: `` x.3`semExpr`0 `` is the local
-  ## `x`, third of its name inside the routine `semExpr.0`. The owner's own dots
-  ## are written as this character too, so the whole spelling keeps exactly one
-  ## dot and stays a local name by `isLocalName`.
+  ## Joins an identifier to the NAMESPACE segment that says which routine the
+  ## symbol belongs to: `` x`semExpr`0.3 `` is the local `x`, third of its name
+  ## inside the routine `semExpr.0`. The owner's own dots are written as this
+  ## character too, so the whole spelling keeps exactly one dot and stays a
+  ## local name by `isLocalName`.
+  ##
+  ## The namespace rides in the IDENTIFIER, ahead of the dot, never in the
+  ## disambiguator: nif-spec #2457 settles that a NIF symbol's disambiguator
+  ## carries a number and nothing else, and upstream's own `derivedName`
+  ## (`` outer`env.0 ``) and inliner (`` result`i.5 ``) put their tags in the
+  ## identifier for the same reason. `notes/f1-respell.md` records the move.
   ##
   ## A backtick for the same reason `derivedName` uses one: it is legal
   ## unescaped anywhere after a symbol's first byte, it is not part of the dot
   ## grammar every scanner in this file walks, and it keeps the result out of
   ## the Nim-spellable namespace.
 
+proc localNsStart(s: string): int =
+  ## Where the namespace segment begins inside an identifier, or -1.
+  ##
+  ## The first `LocalNsSep` at index >= 1: index 0 is skipped because a
+  ## compiler-minted identifier may LEAD with a backtick (`` `err ``, `` `x ``,
+  ## `` `setlit ``) and that one is part of the name, not a separator. Every
+  ## identifier a namespace is ever appended to is a source identifier or one
+  ## of those literals, so no interior backtick reaches here except the ones
+  ## this module put there.
+  result = -1
+  for i in 1 ..< s.len:
+    if s[i] == LocalNsSep: return i
+
+proc stripLocalNs*(s: var string) =
+  ## Drop the namespace segment from an identifier, in place, leaving the name
+  ## it was built from. The inverse of what `localSymName` appends, and the
+  ## operation `extractBasename` performed before the respelling moved the
+  ## namespace to this side of the dot.
+  let i = localNsStart(s)
+  if i >= 0: s.setLen i
+
+proc sourceIdentLen*(s: string): int =
+  ## How many bytes of `s` the SOURCE identifier occupies — `sourceIdent(s).len`
+  ## without building the string, for the scanners that need it per symbol.
+  ##
+  ## The identifier ends at the first `.` (disambiguator or module suffix) or at
+  ## the first `LocalNsSep` at index >= 1 (the owning routine's namespace),
+  ## whichever comes first. `idetools` matches a tracked source column against
+  ## this, so it is the length of the token the USER typed and nothing more.
+  result = s.len
+  for i in 0 ..< s.len:
+    if s[i] == '.' or (i >= 1 and s[i] == LocalNsSep):
+      return i
+
+proc localNamespaceOfName*(s: string): string =
+  ## The namespace segment carried by the identifier `s`, or "".
+  let i = localNsStart(s)
+  result = if i >= 0: substr(s, i+1) else: ""
+
 proc localSymName*(basename: string; disamb: int; ns: string): string =
   ## The one place that assembles a local symbol out of its three parts. `ns`
   ## empty means "no enclosing routine" and reproduces the plain
   ## `identifier.<number>` spelling exactly.
   result = basename
-  result.add '.'
-  result.addInt disamb
   if ns.len > 0:
     result.add LocalNsSep
     result.add ns
+  result.add '.'
+  result.addInt disamb
 
-proc splitLocalSymName*(s: string; basename: var string; disamb: var int;
-                        tail: var string): bool =
-  ## Splits a local symbol into its identifier, its leading disambiguator
-  ## number and whatever the disambiguator carries after that number:
-  ## `tmp.14` -> (`tmp`, 14, ``) and `` tmp.14`f`0 `` -> (`tmp`, 14,
-  ## `` `f`0 ``). False for anything that is not a local symbol: more than one
-  ## dot, no dot, or no digit right after it.
+proc sourceIdent*(s: string): string =
+  ## The identifier a symbol was SPELLED with in the source: the one rendering
+  ## every user-facing diagnostic uses when it names a symbol.
+  ##
+  ##   "s`testMutateWhileIterating`0.0" -> "s"
+  ##   "Foo.0.tge70svym"                -> "Foo"
+  ##   "T"                              -> "T"
+  ##
+  ## Everything after the identifier is compiler bookkeeping — a disambiguating
+  ## count, the owning routine's namespace (`LocalNsSep`), a module suffix — and
+  ## none of it is anything the user wrote. A message that must tell two
+  ## same-named symbols apart does it with the file/line/column it already
+  ## carries, not with that bookkeeping: `a.6` and `a.9` said nothing about WHICH
+  ## `a`, and the numbers moved whenever an unrelated declaration was edited.
+  ##
+  ## A name with no `.<digit>` in it — a plain identifier that never went through
+  ## `makeGlobalSym`/`makeLocalSym` — is returned unchanged, which is why this
+  ## wraps the in-place `extractBasename` rather than the one that answers `""`.
+  ##
+  ## Two steps, because the bookkeeping sits on both sides of the identifier
+  ## since the respelling (`notes/f1-respell.md`): `extractBasename` drops the
+  ## disambiguator and the module suffix off the END, `stripLocalNs` drops the
+  ## owning routine's namespace off the identifier itself.
+  result = s
+  extractBasename(result)
+  stripLocalNs(result)
+
+proc splitLocalSymName*(s: string; basename: var string;
+                        disamb: var int): bool =
+  ## Splits a local symbol into its identifier and its disambiguator:
+  ## `tmp.14` -> (`tmp`, 14) and `` tmp`f`0.14 `` -> (`` tmp`f`0 ``, 14).
+  ## False for anything that is not a local symbol: more than one dot, no dot,
+  ## no digit right after it, or anything but digits from there to the end.
+  ##
+  ## The namespace a local carries is part of the IDENTIFIER since the
+  ## respelling, so it comes back inside `basename` and this overload — the
+  ## only one — splits every local the compiler mints. `stripLocalNs` takes
+  ## the namespace back off when the bare name is what is wanted.
   basename = ""
   disamb = 0
-  tail = ""
   var dot = -1
   for i in 0 ..< s.len:
     if s[i] == '.':
@@ -217,20 +271,13 @@ proc splitLocalSymName*(s: string; basename: var string; disamb: var int;
     inc j
   if j == dot + 1:
     return false
+  if j != s.len:
+    # Anything after the number is not a disambiguator (#2457): a NIF symbol
+    # carries a number there and nothing else.
+    return false
   basename = substr(s, 0, dot - 1)
   disamb = value
-  tail = substr(s, j)
   result = true
-
-proc splitLocalSymName*(s: string; basename: var string;
-                        disamb: var int): bool =
-  ## Splits an UNNAMESPACED local symbol such as `tmp.14` into `tmp` and `14`.
-  ## False for `` tmp.14`f`0 ``, which the four-argument overload splits.
-  var tail = ""
-  result = splitLocalSymName(s, basename, disamb, tail) and tail.len == 0
-  if not result:
-    basename = ""
-    disamb = 0
 
 proc removeModule*(s: string): string =
   # From "abc.12.Mod132a3bc" extract "abc.12".
@@ -339,30 +386,60 @@ when isMainModule:
   assert not splitLocalSymName("tmp.14.mod", basename, disamb)
   assert not splitLocalSymName("tmp.part.14", basename, disamb)
 
-  # A namespaced local splits only through the four-argument overload.
-  var tail = ""
-  assert not splitLocalSymName("tmp.14`f`0", basename, disamb)
-  assert splitLocalSymName("tmp.14`f`0", basename, disamb, tail)
-  assert basename == "tmp"
+  # A namespaced local splits through the SAME overload: its namespace is part
+  # of the identifier, and the disambiguator is a number and nothing else.
+  assert splitLocalSymName("tmp`f`0.14", basename, disamb)
+  assert basename == "tmp`f`0"
   assert disamb == 14
-  assert tail == "`f`0"
-  assert localSymName("tmp", 14, "f`0") == "tmp.14`f`0"
+  assert not splitLocalSymName("tmp.14`f`0", basename, disamb)  # the old shape
+  assert localSymName("tmp", 14, "f`0") == "tmp`f`0.14"
   assert localSymName("tmp", 14, "") == "tmp.14"
-  # ...and it is still a LOCAL name to everything that classifies one.
+
+  # The namespace comes back off the identifier the way it went on.
+  var ident = "tmp`f`0"
+  stripLocalNs(ident)
+  assert ident == "tmp"
+  ident = "`err`step6`0"
+  stripLocalNs(ident)
+  assert ident == "`err"          # a LEADING backtick is part of the name
+  ident = "plain"
+  stripLocalNs(ident)
+  assert ident == "plain"
+  assert localNamespaceOfName("tmp`f`0") == "f`0"
+  assert localNamespaceOfName("`err`step6`0") == "step6`0"
+  assert localNamespaceOfName("plain") == ""
+
   var isGlobal = false
   # The user-facing rendering of all three symbol shapes, plus the identifier
   # that never got a number at all.
-  assert sourceIdent("s.0`testMutateWhileIterating`0") == "s"
+  assert sourceIdent("s`testMutateWhileIterating`0.0") == "s"
   assert sourceIdent("Foo.0.tge70svym") == "Foo"
-  assert sourceIdent("`err.2`step6`0") == "`err"
+  assert sourceIdent("`err`step6`0.2") == "`err"
   assert sourceIdent("T") == "T"
 
-  assert isLocalName("x.3`semExpr`0")
-  assert extractBasename("x.3`semExpr`0", isGlobal) == "x"
+  # ── The local spelling, and every classifier that reads one ──────────────
+  # `notes/f1-respell.md`: one dot, the byte after it a digit, and from there
+  # to the end nothing but digits (#2457).
+  assert localSymName("x", 3, localNamespace("semExpr.0.mymod")) == "x`semExpr`0.3"
+  assert isLocalName("x`semExpr`0.3")
+  assert extractBasename("x`semExpr`0.3", isGlobal) == "x`semExpr`0"
   assert not isGlobal
-  assert extractModule("x.3`semExpr`0") == ""
-  assert not isInstantiation("x.3`semExpr`0")
-  assert removeModule("x.3`semExpr`0") == "x.3`semExpr`0"
+  assert extractModule("x`semExpr`0.3") == ""
+  assert not isInstantiation("x`semExpr`0.3")
+  assert removeModule("x`semExpr`0.3") == "x`semExpr`0.3"
+  assert extractVersionedBasename("x`semExpr`0.3") == "x`semExpr`0.3"
+  assert splitSymName("x`semExpr`0.3").module == ""
+  assert sourceIdent("x`semExpr`0.3") == "x"
+
+  # The GLOBAL layout hexer mints keeps the module suffix last, so it is still
+  # two dots and still reads back as a module-qualified name.
+  let g = localSymName("`setlit", 0, localNamespace("semStmt.0.mymod")) & ".mymod"
+  assert g == "`setlit`semStmt`0.0.mymod"
+  assert not isLocalName(g)
+  assert extractModule(g) == "mymod"
+  assert extractBasename(g, isGlobal) == "`setlit`semStmt`0"
+  assert not isInstantiation(g)
+  assert sourceIdent(g) == "`setlit"
 
   # The namespace segment every per-routine counter keys on.
   assert localNamespace("semExpr.0.mymod") == "semExpr`0"

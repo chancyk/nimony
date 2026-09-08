@@ -316,6 +316,7 @@ proc localToField(c: var Context; n: Cursor; local, typ: SymId; isCursor = false
   else:
     var name = pool.syms[local]
     extractBasename name
+    stripLocalNs name
     name.add "`f"
     result = c.coroCtx.namer.freshGlobalSym(name, c.thisModuleSuffix)
     let localTyp = c.typeCache.getType(n)

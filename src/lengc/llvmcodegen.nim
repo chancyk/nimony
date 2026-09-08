@@ -316,6 +316,7 @@ proc nifSymBaseName*(c: var LLVMCode; symId: SymId): string =
   let full = c.m.pool.syms[symId]
   var isGlobal = false
   result = extractBasename(full, isGlobal)
+  stripLocalNs(result)
   if result.len == 0:
     result = full
 
@@ -692,6 +693,7 @@ proc genSymDefLLVM(c: var LLVMCode; n: Cursor; prag: PragmaInfo): string =
       else:
         result = c.m.pool.syms[lit]
         extractBasename(result)
+        stripLocalNs(result)
     else:
       result = mangleToC(c.m.pool.syms[lit])
   else:

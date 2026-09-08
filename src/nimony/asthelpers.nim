@@ -31,7 +31,13 @@ proc takeIdent*(n: var Cursor): StrId =
   elif n.isSymbol or n.isSymbolDef:
     let sym = pool.syms[n.symId]
     var isGlobal = false
-    result = pool.strings.getOrIncl(extractBasename(sym, isGlobal))
+    # The IDENTIFIER, both halves of the bookkeeping off: this is what a named
+    # argument is matched against on both sides (`sigmatch.buildParamsInfo`
+    # keys `params.names` with it and `orderArgs` looks arguments up by it),
+    # and a parameter is a local carrying its routine's namespace.
+    var ident = extractBasename(sym, isGlobal)
+    stripLocalNs(ident)
+    result = pool.strings.getOrIncl(ident)
     inc n
   elif n.isTagLit:
     if exprKind(n) in {OchoiceX, CchoiceX}:

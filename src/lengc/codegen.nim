@@ -397,6 +397,7 @@ proc genSymDef(c: var GeneratedCode; n: Cursor; prag: PragmaInfo;
       else:
         result = c.m.pool.syms[lit]
         extractBasename(result)
+        stripLocalNs(result)
     else:
       result = mangleToC(c.m.pool.syms[lit])
     c.add result
@@ -726,6 +727,7 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
       else:
         asmName = c.m.pool.syms[prc.name.symId]
         extractBasename(asmName)
+        stripLocalNs(asmName)
       c.add " __asm__(NIM_ASM_PREFIX "
       c.add makeCString(asmName)
       c.add ")"

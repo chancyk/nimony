@@ -50,6 +50,7 @@ proc rewriteSymsToIdentsImpl(newBuf: var TokenBuf; n: var Cursor) =
   of Symbol, SymbolDef:
     var name = pool.syms[n.symId]
     extractBasename name
+    stripLocalNs name
     newBuf.addIdent(pool.strings.getOrIncl(name), n.info)
     inc n
   of TagLit:
@@ -61,6 +62,7 @@ proc rewriteSymsToIdentsImpl(newBuf: var TokenBuf; n: var Cursor) =
       n.into:
         var name = pool.syms[n.symId]
         extractBasename name
+        stripLocalNs name
         newBuf.addIdent(pool.strings.getOrIncl(name), n.info)
         while n.hasMore: skip n
     else:

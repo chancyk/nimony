@@ -996,6 +996,10 @@ proc makeLocalDeclName(c: var EContext; s: SymId): string =
   # `c.hoistedConsts` (keyed by the proc-local SymId) depends on.
   var base = pool.syms[s]
   extractBasename(base)
+  # The bare identifier: `freshGlobalName` re-attaches the OWNING
+  # declaration's namespace, and a stem that kept the const's own would
+  # write it twice.
+  stripLocalNs(base)
   result = c.namer.freshGlobalName(base, c.main)
 
 proc makeLocalSymId(c: var EContext; s: SymId): SymId =

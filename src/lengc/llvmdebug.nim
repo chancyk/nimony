@@ -180,6 +180,7 @@ proc getOrCreateInlineSP(c: var LLVMCode; origin: CrucialOrigin;
     c.debug.nullSigId = c.addMetadata("!DISubroutineType(types: !{null})")
   var isGlobal = false
   var shortName = extractBasename(origin.sym, isGlobal)
+  stripLocalNs(shortName)
   if shortName.len == 0: shortName = origin.sym
   result = c.addMetadata("distinct !DISubprogram(name: \"" &
     shortName &

@@ -119,6 +119,7 @@ proc externName*(s: SymId; n: Cursor): StrId =
   else:
     var base = p.syms[s]
     extractBasename base
+    stripLocalNs base
     result = p.strings.getOrIncl(base)
 
 proc extractExtern(c: var MainModule; n: var Cursor; pragmasAt: int;

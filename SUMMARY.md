@@ -44,7 +44,7 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 | 8 | **Tools as procs, nifmake as a library, a scheduler** (A2a/A2b): `runNifler/Nimsem/Hexer/Lengc` + `reset*Globals`; `nifmake/dag.nim`; `nimony` runs a DAG depth in-process when the ledger says its serial cost ≤ a fan-out's | `nimsem/hexer/lengc` entry files, `programs.nim`, `nifpools.nim`, `nifmake/`, `phases.nim`; `nimony` links nimsem+hexer+lengc (2.9 → 4.8 MB) | two runs in one process produce the bytes of two processes (`tests/inproc`); `--spawn:always` / `--vfs:disk` = today's process tree exactly; nifler stays a process | `hastur tests/inproc`, `--report` identical across modes |
 | 9 | **Cost ledger + artifact store** (A1, M1): every tool writes `.ledger/` timing and peak-RSS fragments, nifmake folds spawn costs, `--stats` prints them; the scheduler uses both time and memory estimates; `--vfs:memory\|memory+spill\|disk\|verify` adapter behind `vfs.nim`'s relays | `src/lib/ledger.nim`, `artifactstore.nim`, ~36 call sites moved onto the relays | disk is the default (bit-identical); `--vfs:verify` byte-compares every memory read against disk; overhead +0.5 % | `tests/ledger`, `tests/vfs`, `tests/nifcache` |
 | 10 | **Stdlib**: `std/syncio` opt-in read log; `std/writenif` writes `<sfx>.out.nif.reads` | `lib/std/syncio.nim`, `writenif.nim` | one `bool` test per open; it is what lets `const x = readFile(...)` notice the file changed (it did not before) | `tests/incremental` phase "ctfe" |
-| 11 | **Declaration-stable frontend output** (F1 + F2, on the owner's decision): hexer's synthesized names too (`passes.TempNamer`, `.x.nif` +28 % bytes); a local is spelled `` x.3`semExpr`0 `` (per-routine counter, then the owning routine in the disambiguator) and hexer writes line-info-blind per-declaration digests (`<mod>.decls.nif`) | `sembasics.makeLocalSym`, `symparser`, `hexer/decldigest.nim`; 21 goldens | one dot, so every scanner still classifies it local; module-wide uniqueness preserved (found the consumer: `hoistedConsts`); an appended proc changes 1 declaration instead of 465, which is the whole edit-loop gain since B3; costs +31 % artifact bytes and +3 % cold cpu | `decl-stability` scenario in `tests/incremental` |
+| 11 | **Declaration-stable frontend output** (F1 + F2, on the owner's decision): hexer's synthesized names too (`passes.TempNamer`, `.x.nif` +28 % bytes); a local is spelled `` x`semExpr`0.3 `` (the owning routine joins the identifier, then a per-routine counter) and hexer writes line-info-blind per-declaration digests (`<mod>.decls.nif`) | `sembasics.makeLocalSym`, `symparser`, `hexer/decldigest.nim`; 21 goldens | one dot, so every scanner still classifies it local, and the disambiguator is a number and nothing else, which is what nif-spec #2457 requires (`notes/f1-respell.md`); module-wide uniqueness preserved (found the consumer: `hoistedConsts`); an appended proc changes 1 declaration instead of 465, which is the whole edit-loop gain since B3; costs +31 % artifact bytes and +3 % cold cpu | `tests/symspelling`, and the `decl-stability` scenario in `tests/incremental` |
 
 ## Things you may not want (decide these)
 
@@ -66,13 +66,18 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
   budgets in-process work by peak RSS from the ledger (`--inproc-mem-budget`,
   `--stats` shows a `peak MB` column), so the driver itself stays under
   128 MB here.
-- **Local symbol spelling** (F1, row 11): `` x.3`semExpr`0 `` is a new shape
-  in the symbol namespace, argued legal from the scanners rather than from
-  nifspec's text; it makes `.s.nif`/`.x.nif` 31 % larger, and diagnostics
-  currently print it verbatim (`'s.0`testMutateWhileIterating`0' is
-  borrowed`) where `s` is wanted -- a follow-up. It is the single change
-  that took the edit loop from 1.26 s to 0.77 s; everything above stands
-  without it, and reverting it is one commit plus the 21 goldens.
+- **Local symbol spelling** (F1, row 11): `` x`semExpr`0.3 `` is a new shape
+  in the symbol namespace. It is no longer argued from the scanners: the
+  owning routine rides in the IDENTIFIER and the disambiguator is a number
+  and nothing else, which is what nif-spec #2457 requires and what upstream
+  spells its own minted names (`` result`i.5 ``, `` write`sys.0.<module> ``).
+  `notes/f1-respell.md` records the move and `tests/symspelling` is the gate;
+  it checks our spelling against upstream's own parser, vendored, so it holds
+  before the merge as well as after. The shape makes `.s.nif`/`.x.nif` 31 %
+  larger, and diagnostics render `symparser.sourceIdent` rather than the
+  spelling. It is the single change that took the edit loop from 1.26 s to
+  0.77 s; everything above stands without it, and reverting it is two commits
+  plus the 21 goldens.
 
 ## Not done
 

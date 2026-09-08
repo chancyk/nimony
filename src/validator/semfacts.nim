@@ -121,6 +121,7 @@ proc baseName*(s: SymId): string =
   if s == NoSymId: return ""
   result = pool.syms[s]
   extractBasename result
+  stripLocalNs result
 
 proc isDeclaredIn*(s: SymId; fileTail: string): bool =
   ## True when `s` was declared in a file whose path ends in `fileTail`

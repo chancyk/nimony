@@ -417,30 +417,31 @@ proc localNamespaceOf*(sym: SymId): string =
   localNamespace(pool.syms[sym])
 
 proc makeLocalSym*(c: var SemContext; result: var string) =
-  ## `x` -> `` x.3`semExpr`0 ``: the disambiguator counts this NAME inside this
-  ## ROUTINE, and the routine's name follows it so the string stays unique in
-  ## the module. Nothing about the spelling depends on what the module declared
-  ## before, which is the whole point of `notes/f1.md`.
+  ## `x` -> `` x`semExpr`0.3 ``: the owning routine's name joins the IDENTIFIER
+  ## and the disambiguator then counts that whole identifier inside this
+  ## routine, so the string stays unique in the module. Nothing about the
+  ## spelling depends on what the module declared before, which is the whole
+  ## point of `notes/f1.md`.
   ##
-  ## The counter is keyed by identifier + namespace and lives in `c.locals` for
-  ## the whole module, i.e. it is per owner and PERSISTENT rather than pushed
-  ## and popped: a generic instantiation's parameters are minted twice — once
-  ## for the signature `requestRoutineInstance` builds and once for the body
-  ## `subsGenericProc` emits — and a counter that restarted would hand both the
-  ## same names.
-  let baseLen = result.len
+  ## The namespace goes ahead of the dot, never after it: a NIF symbol's
+  ## disambiguator carries a number and nothing else (#2457, and
+  ## `notes/f1-respell.md` for why this moved).
+  ##
+  ## The counter is keyed by that same namespaced identifier and lives in
+  ## `c.locals` for the whole module, i.e. it is per owner and PERSISTENT
+  ## rather than pushed and popped: a generic instantiation's parameters are
+  ## minted twice — once for the signature `requestRoutineInstance` builds and
+  ## once for the body `subsGenericProc` emits — and a counter that restarted
+  ## would hand both the same names.
   if c.localNs.len > 0:
     result.add LocalNsSep
     result.add c.localNs
+  # `result` IS the counter key now: identifier plus namespace, the two parts
+  # the number disambiguates between.
   var counter = addr c.locals.mgetOrPut(result, -1)
   counter[] += 1
-  let disamb = counter[]
-  result.setLen baseLen
   result.add '.'
-  result.addInt disamb
-  if c.localNs.len > 0:
-    result.add LocalNsSep
-    result.add c.localNs
+  result.addInt counter[]
 
 proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
   ## A fresh name for a copy of `s`, keeping its layout — `forceGlobal` promotes
@@ -449,6 +450,10 @@ proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
   ## toplevel puts the declaration in the module). See `expandTemplateImpl`.
   var isGlobal = false
   var name = extractBasename(pool.syms[s], isGlobal)
+  # Back to the name the source spelled: `makeLocalSym` appends the CURRENT
+  # routine's namespace, and a copy that kept the original's would stack a
+  # second tag onto the first every time a template body is re-emitted.
+  stripLocalNs(name)
   if isGlobal or forceGlobal:
     c.makeGlobalSym(name)
   else:
@@ -530,8 +535,12 @@ proc identToSym*(c: var SemContext; lit: StrId; kind: SymKind): SymId =
   result = identToSym(c, pool.strings[lit], kind)
 
 proc symToIdent*(s: SymId): StrId =
+  ## The identifier `s` goes back into scope under — the one the source wrote.
+  ## Both halves of the bookkeeping come off: the disambiguator and module
+  ## suffix after the identifier, and the owning routine's namespace inside it.
   var name = pool.syms[s]
   extractBasename name
+  stripLocalNs name
   when false:
     # XXX activate this later!
     for i in 0..<name.len:

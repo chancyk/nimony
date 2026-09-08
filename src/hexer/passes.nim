@@ -28,8 +28,11 @@ import ../lib/[nifpools, symparser]
 # the disambiguator, so the string is unique in the module without the number
 # being a function of the module.
 #
-#     `x.3`semStmt`0            a local  (one dot, `symparser.isLocalName`)
-#     `setlit.0`semStmt`0.mymod a global (two dots, module suffix last)
+#     `x`semStmt`0.3            a local  (one dot, `symparser.isLocalName`)
+#     `setlit`semStmt`0.0.mymod a global (two dots, module suffix last)
+#
+# The namespace rides in the IDENTIFIER, ahead of the dot: a NIF symbol's
+# disambiguator carries a number and nothing else (#2457, `notes/f1-respell.md`).
 #
 # The table is PERSISTENT per owner rather than pushed and popped: `lowerExprs`
 # visits the same routine more than once (xelim1, xelim_final, and one nested
@@ -78,7 +81,7 @@ proc nextNumber*(t: var TempNamer; base: string): int =
   result = counter[]
 
 proc freshName*(t: var TempNamer; base: string): string =
-  ## A local-layout name: `` \`x `` -> `` \`x.3`semStmt`0 ``.
+  ## A local-layout name: `` \`x `` -> `` \`x`semStmt`0.3 ``.
   localSymName(base, nextNumber(t, base), t.ns)
 
 proc freshSym*(t: var TempNamer; base: string): SymId =
@@ -86,7 +89,11 @@ proc freshSym*(t: var TempNamer; base: string): SymId =
 
 proc freshGlobalName*(t: var TempNamer; base, moduleSuffix: string): string =
   ## A global-layout name: the module suffix stays the LAST dotted segment, so
-  ## `extractModule` and `isInstantiation` still read it the way they always did.
+  ## `extractModule` and `isInstantiation` still read it the way they always
+  ## did — `` `setlit`semStmt`0.0.mymod ``, the shape upstream's own
+  ## `` write`sys.0.<module> `` uses. The namespace is inside the identifier,
+  ## so this reads back with a NUMERIC disambiguator like every other symbol
+  ## (#2457); before the respelling it did not.
   result = freshName(t, base)
   result.add '.'
   result.add moduleSuffix
@@ -94,13 +101,15 @@ proc freshGlobalName*(t: var TempNamer; base, moduleSuffix: string): string =
 proc freshGlobalSym*(t: var TempNamer; base, moduleSuffix: string): SymId =
   pool.syms.getOrIncl(freshGlobalName(t, base, moduleSuffix))
 
-proc namespacedName*(base, disamb, ns: string): string =
-  ## For the callers that keep a counter of their own but still need the
-  ## namespace: `base`, `.`, an already-formatted disambiguator, then the
-  ## namespace. Keeps the one-dot shape of a local.
+proc taggedName*(base, tag, ns: string): string =
+  ## For the callers that keep a counter of their own and additionally own a
+  ## PASS LETTER: the letter joins the identifier alongside the namespace, so
+  ## the disambiguator stays a number and nothing else (#2457). `intramodinliner`
+  ## is the one caller; upstream spells its own the same way (`` result`i.5 ``).
   result = base
-  result.add '.'
-  result.add disamb
+  if tag.len > 0:
+    result.add LocalNsSep
+    result.add tag
   if ns.len > 0:
     result.add LocalNsSep
     result.add ns

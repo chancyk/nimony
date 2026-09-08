@@ -340,6 +340,10 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     elif crucial.sym != SymId(0):
       var name = pool.syms[crucial.sym]
       extractBasename name
+      # `{.importc.}`/`{.exportc.}` with no string: the identifier the source
+      # wrote IS the external name, so the namespace comes off too. A local
+      # `{.importc.}` var would otherwise export a backtick-tailed C name.
+      stripLocalNs name
       dest.addStrLit(name, info)
     else:
       c.buildErr dest, info, "invalid import/export symbol"
@@ -569,6 +573,7 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
       else:
         var basename = pool.syms[crucial.sym]
         extractBasename basename
+        stripLocalNs basename
         c.customPragmaTemplates.incl pool.strings.getOrIncl(basename)
         dest.addParLe(PragmaP, info)
         dest.addParRi()

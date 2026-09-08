@@ -332,6 +332,10 @@ proc addEmpty3*(dest: var TokenBuf; info: NifLineInfo = NoLineInfo) =
 proc symNameId(s: SymId): StrId =
   var name = pool.syms[s]
   extractBasename name
+  # `sameTreesButIgnoreSymIds` matches a forward declaration's parameters
+  # against the implementation's; those are locals whose namespaces differ,
+  # so only the source identifier may take part in the comparison.
+  stripLocalNs name
   pool.strings.getOrIncl(name)
 
 proc sameTreesNC(a, b: Cursor): bool =
