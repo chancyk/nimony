@@ -82,6 +82,42 @@ Notes that cost hours to learn:
   "did this change move the loop", interleave the two branches being compared
   and read that run's ratio alone.
 
+- **What `/tmp/devloop_base`'s assembler actually is.** Its `bin/arkham` and
+  `bin/nifasm` have neither `--blobcache` nor `--asmcache`, so they predate
+  B3/B3e and they predate BOTH upstream nativenif re-pins (`3ec73fef`,
+  `9d7fcf78`). The headline therefore spans two upstream assembler changes as
+  well as ours and the compiler's. Right for a headline, wrong to quote as a
+  compiler-only number — say which you mean.
+
+- **Building a toolchain at an arbitrary commit** (what a pre/post comparison
+  needs). The commit's `src/nativenif.commit` pin must be honoured, and
+  `syncNativenif` REFUSES to check a pin out over a sibling checkout sitting on
+  a branch — it warns and builds whatever is there. The evidence the pin took is
+  that `build all` prints **no `[deps]` line** about nativenif. Since
+  nativenif's `src/arkham/nim.cfg` reaches nimony by the sibling-relative
+  `../../../nimony/src`, and `NIMONY_NATIVENIF` chooses which nativenif and not
+  which nimony, give the commit its own sibling pair:
+
+  ```sh
+  git worktree add --detach /tmp/xbase <commit>
+  mkdir -p /tmp/xbuild && ln -sfn /tmp/xbase /tmp/xbuild/nimony
+  (cd ../nativenif && git worktree add --detach /tmp/xbuild/nativenif $(cut -d' ' -f1 /tmp/xbase/src/nativenif.commit))
+  (cd /tmp/xbase && NIMONY_NATIVENIF=/tmp/xbuild/nativenif XDG_CACHE_HOME=/tmp/cache-x \
+     nim c -r src/hastur/hastur build all)   # ~90 s; must print no nativenif [deps] line
+  ```
+
+  A DETACHED nativenif worktree at the pin is what makes `syncNativenif` return
+  silently. Do not move the shared `../nativenif` checkout to do this: another
+  toolchain's `bin/` matches where it is now.
+
+- **A toolchain root of symlinks does not work.** To vary only the assembler,
+  clone the donor root (`cp -Rc <donor> /tmp/hyb`, an APFS clone, ~4 s) and
+  replace `bin/arkham` and `bin/nifasm`. A root that is a directory of symlinks
+  into the donor with a real `bin/` self-compiles hello fine and then fails the
+  self-build with `cannot open <nimcache>/syn*.s.nif` from a CTFE sub-compile —
+  and fails identically with the donor's OWN assembler, so the symptom looks
+  like the swap and is not. Always run that control.
+
 ## 2. The A/B script (the one that produces the verdict)
 
 ```sh
@@ -165,6 +201,26 @@ bin/hastur test tests/nimony_r tests/ctfe_engine tests/ledger tests/vfs   # one 
 declarations change for an in-place edit, an inserted proc, an added
 statement and an added temp — the numbers F1/F2 are gated on (1/1/1/1).
 
+**The arkham splice reference** (B3e's gate: how many procs a live edit costs).
+`ARKHAM_CACHE_STATS=1`, cold-build the corpus, apply the `self.editbody` edit,
+read the three `[arkham cache] spliced N lowered M stale M` lines. It depends on
+the CORPUS and not on the toolchain, so it is two numbers, not one:
+
+| corpus | main module | largest neighbour | `sem.nim` |
+|---|---|---|---|
+| fork point (`f69b8afc:src`, the `SELF_SRC` default) | 8 / 1 | 76 / 2 | 523 / 3 |
+| the branch's own `src` (`643569c2` and `95fff89d` alike) | 11 / 1 | 82 / 2 | 525 / 3 |
+
+spliced / lowered, `stale` == `lowered`. The number B3e is about is the second
+of each pair — **1, 2 and 3 procs re-lowered** — and it is the same on both
+corpora; only the totals grow with the compiler's own sources. Settled over
+three toolchains and two corpora in `bench/results/2026-09-07/progress.md`
+run 20; `notes/f1-respell.md` §5's `11/1, 83/1, 527/1` does not reproduce and is
+superseded. `decldigest.hashTree` mixes the full symbol spelling, so the first
+build after a RENAME legitimately reports `spliced 0 lowered N`; a cold build
+with the same toolchain that then edits does not have that problem, and the
+counts above are steady from the first edit.
+
 ## 6. Escape hatches (each restores the fork-point behaviour of one mechanism)
 
 | flag / env | restores |
@@ -188,6 +244,13 @@ hold each phase's own before/after with its stage tables.
 
 ## 8. What to measure next, if continuing
 
+- **The upstream merge chain cost the edit loop 13.8 % of cpu** (run 20), all
+  of it in two upstream commits — `c6be04e1` "no globals in nifcore" (+5.7 %)
+  and `e1da48e9` "nifsyms refactor" (+6.6 %) — and none of it ours. Both put an
+  indirection on the pipeline's hottest read. Recovering it means profiling
+  `symString`/pool access under the new nifcore, not re-checking our phases;
+  memoizing `decldigest`'s per-token spelling is already tested and rejected
+  (1.074 -> 1.070).
 - After B3e (arkham per-proc splice): re-take `self.editbody`/`self.editcall`
   and the per-stage table; arkham should read ~0.1 s.
 - The floor then is nimsem re-checking the edited module (~0.34 s on

@@ -10,6 +10,7 @@
 #             | self.editbody (a statement inserted into a called proc of sem.nim)
 #             | self.editdead (a private, never-called proc appended: DCE removes it)
 #             | self.editcall (a new proc AND a call to it from semStmt: the call graph changes)
+#             | self.nochange (rebuild with nothing edited: the no-op floor)
 #             | self.cold | self.run   (native backend; BACKEND=c for the C path)
 # Prints per-round wall/cpu for both, then median and min of each.
 set -u
@@ -34,7 +35,7 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
-  self.editbody|self.editdead|self.editcall|self.cold|self.run)
+  self.editbody|self.editdead|self.editcall|self.nochange|self.cold|self.run)
     # The compiler compiling itself (fork-point sources, copied per side) with
     # the native backend; `self.run` is `nimony r ... --version`.
     selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
@@ -52,7 +53,7 @@ cmdfor() {  # cmdfor <side> <nc> -> prints the command line
   eval "t=\$$1"
   case $scen in
     self.editbody|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
-    self.cold)     echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.nochange|self.cold) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
     *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
   esac
@@ -76,6 +77,8 @@ proc devloopCall$i(x: int): int = x + $i
   if isNewScope: discard devloopCall$i($i)
 " $work/self_$side/src/nimony/sem.nim' ;;
   self.run)      prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
+  # Nothing edited at all: the floor a warm no-op rebuild costs.
+  self.nochange) prep=':' ;;
   self.cold)     prep='rm -rf $nc' ;;
 esac
 

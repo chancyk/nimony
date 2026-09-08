@@ -1,0 +1,486 @@
+# post-chain benchmark: the branch after six upstream merges, and what the chain cost
+#
+# Two questions, two fixed references. Question 1 is the HEADLINE (fork point
+# vs branch); question 2 is the GATE (the branch immediately before the merge
+# chain vs immediately after). Question 2 is NOT two question-1 ratios divided:
+# `devloop_ab` interleaves within a run, so the two toolchains being compared
+# must be the A and B of ONE invocation (BENCHMARK.md 1).
+
+commit:   95fff89d (fast-devloop tip; measured from worktree /tmp/merge-u1, branch merge/u6b)
+branch:   bench/post-chain (results); measured toolchains are worktrees, see below
+os:       macOS 26.6.2  arm64
+cpu:      Apple M5 (10 cores), 16 GB
+nim:      Nim Compiler Version 2.2.10 [MacOSX: arm64]
+cc:       Apple clang version 21.0.0 (clang-2100.1.1.101)
+mode:     native backend (`nimony n`), --vfs:disk, -d:release
+command:  bench/devloop_ab.sh <A> <B> <scenario> <rounds>
+runs:     A/B interleaved within one invocation, median of 5 (3 for self.cold); raw rounds below
+corpus:   SELF_SRC default = /tmp/devloop_base/src (the FORK POINT's sources), copied per
+          side, so both toolchains compile identical inputs in every self.* run
+
+toolchains
+  /tmp/devloop_base  f69b8afc  the fork point. Its bin/arkham and bin/nifasm have neither
+                               --blobcache nor --asmcache, i.e. they predate B3/B3e AND both
+                               of the chain's nativenif re-pins (3ec73fef, 9d7fcf78). The
+                               headline therefore spans two upstream assembler changes as
+                               well as our own nativenif chain and the compiler's -- that is
+                               the right fixed reference for a headline, but it is not a
+                               compiler-only number and should not be quoted as one.
+  /tmp/prechain      6870790c  fast-devloop's tip BEFORE the chain (13 commits back), built
+                               this session, nativenif pin 5f6f011e via /tmp/pcbuild/nativenif
+  /tmp/u3base        f61c0e58  after upstream steps 1-3, nativenif pin 3ec73fef
+  /tmp/u4base        450a0831  after upstream step 4, nativenif pin 3ec73fef
+  /tmp/ocbase        0ece350b  after upstream step 5, nativenif pin 3ec73fef
+  /tmp/f1-respell    643569c2  after our F1 respelling, nativenif pin 3ec73fef
+  /tmp/merge-u1      95fff89d  after upstream step 6, nativenif pin 9d7fcf78 (= fast-devloop tip)
+  /tmp/hyb15                   a clone of /tmp/f1-respell with arkham+nifasm swapped back to
+                               5f6f011e, so an A/B against it varies only the assembler
+
+Every build printed no nativenif `[deps]` line, which is how the pin reports that it took.
+
+================================================================================
+QUESTION 1 -- THE HEADLINE.  A = /tmp/devloop_base (f69b8afc), B = /tmp/merge-u1 (95fff89d)
+================================================================================
+===== hello.forced rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 3.52 3.68 3.37
+round 0  A  wall 0.335  cpu 0.473  rss 18MB
+round 0  B  wall 0.354  cpu 0.478  rss 26MB
+round 1  A  wall 0.340  cpu 0.479  rss 18MB
+round 1  B  wall 0.343  cpu 0.490  rss 23MB
+round 2  A  wall 0.334  cpu 0.475  rss 18MB
+round 2  B  wall 0.355  cpu 0.487  rss 26MB
+round 3  A  wall 0.334  cpu 0.473  rss 18MB
+round 3  B  wall 0.348  cpu 0.492  rss 22MB
+round 4  A  wall 0.336  cpu 0.473  rss 18MB
+round 4  B  wall 0.353  cpu 0.481  rss 26MB
+hello.forced: A wall median 0.335  min 0.334 | cpu median 0.473  min 0.473 | peak rss 18 MB
+hello.forced: B wall median 0.353  min 0.343 | cpu median 0.487  min 0.478 | peak rss 26 MB
+B/A cpu (median): 1.030   B/A cpu (min): 1.011   B/A peak rss: 1.44
+load after:  load averages: 3.32 3.64 3.36
+===== ctfe.forced rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 3.32 3.64 3.36
+round 0  A  wall 3.561  cpu 5.209  rss 59MB
+round 0  B  wall 0.834  cpu 0.989  rss 62MB
+round 1  A  wall 3.544  cpu 5.152  rss 59MB
+round 1  B  wall 0.839  cpu 0.974  rss 65MB
+round 2  A  wall 3.557  cpu 5.189  rss 59MB
+round 2  B  wall 0.771  cpu 1.193  rss 28MB
+round 3  A  wall 3.549  cpu 5.188  rss 59MB
+round 3  B  wall 0.841  cpu 0.973  rss 65MB
+round 4  A  wall 3.537  cpu 5.171  rss 58MB
+round 4  B  wall 0.773  cpu 1.203  rss 28MB
+ctfe.forced: A wall median 3.549  min 3.537 | cpu median 5.188  min 5.152 | peak rss 59 MB
+ctfe.forced: B wall median 0.834  min 0.771 | cpu median 0.989  min 0.973 | peak rss 62 MB
+B/A cpu (median): 0.191   B/A cpu (min): 0.189   B/A peak rss: 1.05
+load after:  load averages: 2.59 3.43 3.29
+===== self.nochange rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 2.59 3.43 3.29
+round 0  A  wall 0.096  cpu 0.093  rss 4MB
+round 0  B  wall 0.046  cpu 0.044  rss 7MB
+round 1  A  wall 0.096  cpu 0.093  rss 4MB
+round 1  B  wall 0.046  cpu 0.044  rss 7MB
+round 2  A  wall 0.096  cpu 0.093  rss 4MB
+round 2  B  wall 0.045  cpu 0.044  rss 7MB
+round 3  A  wall 0.095  cpu 0.092  rss 4MB
+round 3  B  wall 0.045  cpu 0.044  rss 7MB
+round 4  A  wall 0.095  cpu 0.092  rss 4MB
+round 4  B  wall 0.045  cpu 0.044  rss 7MB
+self.nochange: A wall median 0.096  min 0.095 | cpu median 0.093  min 0.092 | peak rss 4 MB
+self.nochange: B wall median 0.045  min 0.045 | cpu median 0.044  min 0.044 | peak rss 7 MB
+B/A cpu (median): 0.473   B/A cpu (min): 0.478   B/A peak rss: 1.75
+load after:  load averages: 2.99 3.48 3.31
+===== self.cold rounds=3   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 2.99 3.48 3.31
+round 0  A  wall 5.228  cpu 13.538  rss 116MB
+round 0  B  wall 5.255  cpu 13.836  rss 175MB
+round 1  A  wall 5.241  cpu 13.598  rss 116MB
+round 1  B  wall 5.296  cpu 13.902  rss 175MB
+round 2  A  wall 5.273  cpu 13.606  rss 116MB
+round 2  B  wall 5.307  cpu 13.946  rss 175MB
+self.cold: A wall median 5.241  min 5.228 | cpu median 13.598  min 13.538 | peak rss 116 MB
+self.cold: B wall median 5.296  min 5.255 | cpu median 13.902  min 13.836 | peak rss 175 MB
+B/A cpu (median): 1.022   B/A cpu (min): 1.022   B/A peak rss: 1.51
+load after:  load averages: 3.07 3.44 3.31
+===== self.editdead rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 2.15 3.17 3.21
+round 0  A  wall 2.738  cpu 3.898  rss 116MB
+round 0  B  wall 0.810  cpu 0.806  rss 99MB
+round 1  A  wall 2.751  cpu 3.907  rss 116MB
+round 1  B  wall 0.810  cpu 0.806  rss 100MB
+round 2  A  wall 2.729  cpu 3.890  rss 116MB
+round 2  B  wall 0.811  cpu 0.808  rss 100MB
+round 3  A  wall 2.705  cpu 3.875  rss 116MB
+round 3  B  wall 0.812  cpu 0.808  rss 98MB
+round 4  A  wall 2.704  cpu 3.865  rss 116MB
+round 4  B  wall 0.806  cpu 0.803  rss 100MB
+self.editdead: A wall median 2.729  min 2.704 | cpu median 3.890  min 3.865 | peak rss 116 MB
+self.editdead: B wall median 0.810  min 0.806 | cpu median 0.806  min 0.803 | peak rss 100 MB
+B/A cpu (median): 0.207   B/A cpu (min): 0.208   B/A peak rss: 0.86
+load after:  load averages: 1.83 2.99 3.14
+===== self.editcall rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.83 2.99 3.14
+round 0  A  wall 2.619  cpu 3.803  rss 117MB
+round 0  B  wall 1.275  cpu 1.298  rss 146MB
+round 1  A  wall 2.618  cpu 3.798  rss 117MB
+round 1  B  wall 1.277  cpu 1.294  rss 146MB
+round 2  A  wall 2.627  cpu 3.821  rss 117MB
+round 2  B  wall 1.270  cpu 1.293  rss 146MB
+round 3  A  wall 2.594  cpu 3.789  rss 117MB
+round 3  B  wall 1.284  cpu 1.307  rss 146MB
+round 4  A  wall 2.637  cpu 3.830  rss 117MB
+round 4  B  wall 1.280  cpu 1.303  rss 146MB
+self.editcall: A wall median 2.619  min 2.594 | cpu median 3.803  min 3.789 | peak rss 117 MB
+self.editcall: B wall median 1.277  min 1.270 | cpu median 1.298  min 1.293 | peak rss 146 MB
+B/A cpu (median): 0.341   B/A cpu (min): 0.341   B/A peak rss: 1.25
+load after:  load averages: 1.62 2.83 3.08
+===== self.editbody rounds=5   A=/tmp/devloop_base(f69b8afc)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.62 2.83 3.08
+round 0  A  wall 2.577  cpu 3.776  rss 117MB
+round 0  B  wall 1.099  cpu 1.122  rss 146MB
+round 1  A  wall 2.581  cpu 3.770  rss 117MB
+round 1  B  wall 1.011  cpu 1.036  rss 107MB
+round 2  A  wall 2.577  cpu 3.783  rss 117MB
+round 2  B  wall 1.020  cpu 1.045  rss 107MB
+round 3  A  wall 2.568  cpu 3.772  rss 117MB
+round 3  B  wall 1.026  cpu 1.051  rss 107MB
+round 4  A  wall 2.564  cpu 3.755  rss 117MB
+round 4  B  wall 1.018  cpu 1.044  rss 107MB
+self.editbody: A wall median 2.577  min 2.564 | cpu median 3.772  min 3.755 | peak rss 117 MB
+self.editbody: B wall median 1.020  min 1.011 | cpu median 1.045  min 1.036 | peak rss 107 MB
+B/A cpu (median): 0.277   B/A cpu (min): 0.276   B/A peak rss: 0.91
+load after:  load averages: 1.60 2.72 3.03
+
+================================================================================
+QUESTION 2 -- WHAT THE CHAIN COST.  A = /tmp/prechain (6870790c), B = /tmp/merge-u1 (95fff89d)
+================================================================================
+===== self.editbody  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.57 2.96 3.44
+round 0  A  wall 0.976  cpu 0.984  rss 147MB
+round 0  B  wall 1.112  cpu 1.123  rss 146MB
+round 1  A  wall 0.902  cpu 0.917  rss 107MB
+round 1  B  wall 1.045  cpu 1.048  rss 107MB
+round 2  A  wall 0.909  cpu 0.921  rss 107MB
+round 2  B  wall 1.021  cpu 1.038  rss 107MB
+round 3  A  wall 0.903  cpu 0.921  rss 107MB
+round 3  B  wall 1.034  cpu 1.051  rss 107MB
+round 4  A  wall 0.907  cpu 0.918  rss 107MB
+round 4  B  wall 1.033  cpu 1.048  rss 107MB
+self.editbody: A wall median 0.907  min 0.902 | cpu median 0.921  min 0.917 | peak rss 107 MB
+self.editbody: B wall median 1.034  min 1.021 | cpu median 1.048  min 1.038 | peak rss 107 MB
+B/A cpu (median): 1.138   B/A cpu (min): 1.132   B/A peak rss: 1.00
+load after:  load averages: 1.41 2.83 3.38
+===== self.editcall  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.41 2.83 3.38
+round 0  A  wall 1.119  cpu 1.132  rss 147MB
+round 0  B  wall 1.273  cpu 1.289  rss 146MB
+round 1  A  wall 1.125  cpu 1.143  rss 147MB
+round 1  B  wall 1.287  cpu 1.310  rss 146MB
+round 2  A  wall 1.107  cpu 1.127  rss 147MB
+round 2  B  wall 1.286  cpu 1.309  rss 146MB
+round 3  A  wall 1.124  cpu 1.135  rss 147MB
+round 3  B  wall 1.275  cpu 1.298  rss 146MB
+round 4  A  wall 1.108  cpu 1.128  rss 147MB
+round 4  B  wall 1.274  cpu 1.297  rss 146MB
+self.editcall: A wall median 1.119  min 1.107 | cpu median 1.132  min 1.127 | peak rss 147 MB
+self.editcall: B wall median 1.275  min 1.273 | cpu median 1.298  min 1.289 | peak rss 146 MB
+B/A cpu (median): 1.147   B/A cpu (min): 1.144   B/A peak rss: 0.99
+load after:  load averages: 1.44 2.73 3.33
+===== self.editdead  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.34 2.65 3.28
+round 0  A  wall 0.700  cpu 0.697  rss 101MB
+round 0  B  wall 0.808  cpu 0.805  rss 100MB
+round 1  A  wall 0.707  cpu 0.704  rss 101MB
+round 1  B  wall 0.813  cpu 0.810  rss 100MB
+round 2  A  wall 0.703  cpu 0.700  rss 101MB
+round 2  B  wall 0.809  cpu 0.805  rss 100MB
+round 3  A  wall 0.701  cpu 0.698  rss 101MB
+round 3  B  wall 0.812  cpu 0.809  rss 100MB
+round 4  A  wall 0.704  cpu 0.700  rss 102MB
+round 4  B  wall 0.815  cpu 0.811  rss 100MB
+self.editdead: A wall median 0.703  min 0.700 | cpu median 0.700  min 0.697 | peak rss 101 MB
+self.editdead: B wall median 0.812  min 0.808 | cpu median 0.809  min 0.805 | peak rss 100 MB
+B/A cpu (median): 1.156   B/A cpu (min): 1.155   B/A peak rss: 0.99
+load after:  load averages: 1.79 2.67 3.28
+===== self.nochange  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.79 2.67 3.28
+round 0  A  wall 0.045  cpu 0.044  rss 7MB
+round 0  B  wall 0.045  cpu 0.044  rss 7MB
+round 1  A  wall 0.045  cpu 0.044  rss 7MB
+round 1  B  wall 0.045  cpu 0.044  rss 7MB
+round 2  A  wall 0.045  cpu 0.044  rss 7MB
+round 2  B  wall 0.045  cpu 0.044  rss 7MB
+round 3  A  wall 0.046  cpu 0.045  rss 7MB
+round 3  B  wall 0.045  cpu 0.044  rss 7MB
+round 4  A  wall 0.045  cpu 0.044  rss 7MB
+round 4  B  wall 0.045  cpu 0.044  rss 7MB
+self.nochange: A wall median 0.045  min 0.045 | cpu median 0.044  min 0.044 | peak rss 7 MB
+self.nochange: B wall median 0.045  min 0.045 | cpu median 0.044  min 0.044 | peak rss 7 MB
+B/A cpu (median): 1.000   B/A cpu (min): 1.000   B/A peak rss: 1.00
+load after:  load averages: 3.05 2.91 3.35
+===== self.cold  A=/tmp/prechain  B=/tmp/merge-u1 =====
+load before: load averages: 3.05 2.91 3.35
+round 0  A  wall 4.829  cpu 12.830  rss 176MB
+round 0  B  wall 5.257  cpu 13.757  rss 175MB
+round 1  A  wall 4.801  cpu 12.850  rss 176MB
+round 1  B  wall 5.249  cpu 13.775  rss 175MB
+round 2  A  wall 4.809  cpu 12.851  rss 176MB
+round 2  B  wall 5.302  cpu 13.856  rss 175MB
+self.cold: A wall median 4.809  min 4.801 | cpu median 12.850  min 12.830 | peak rss 176 MB
+self.cold: B wall median 5.257  min 5.249 | cpu median 13.775  min 13.757 | peak rss 175 MB
+B/A cpu (median): 1.072   B/A cpu (min): 1.072   B/A peak rss: 0.99
+load after:  load averages: 3.62 3.07 3.39
+===== hello.forced  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.47 2.63 2.99
+round 0  A  wall 0.316  cpu 0.438  rss 28MB
+round 0  B  wall 0.360  cpu 0.479  rss 26MB
+round 1  A  wall 0.311  cpu 0.451  rss 24MB
+round 1  B  wall 0.349  cpu 0.492  rss 23MB
+round 2  A  wall 0.320  cpu 0.442  rss 28MB
+round 2  B  wall 0.349  cpu 0.471  rss 25MB
+round 3  A  wall 0.311  cpu 0.452  rss 24MB
+round 3  B  wall 0.347  cpu 0.494  rss 23MB
+round 4  A  wall 0.315  cpu 0.435  rss 28MB
+round 4  B  wall 0.349  cpu 0.474  rss 26MB
+hello.forced: A wall median 0.315  min 0.311 | cpu median 0.442  min 0.435 | peak rss 28 MB
+hello.forced: B wall median 0.349  min 0.347 | cpu median 0.479  min 0.471 | peak rss 25 MB
+B/A cpu (median): 1.084   B/A cpu (min): 1.083   B/A peak rss: 0.89
+load after:  load averages: 1.51 2.62 2.99
+===== ctfe.forced  A=/tmp/prechain(6870790c)  B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 1.51 2.62 2.99
+round 0  A  wall 0.771  cpu 0.932  rss 64MB
+round 0  B  wall 0.830  cpu 0.993  rss 61MB
+round 1  A  wall 0.777  cpu 0.906  rss 66MB
+round 1  B  wall 0.837  cpu 0.971  rss 65MB
+round 2  A  wall 0.718  cpu 1.135  rss 26MB
+round 2  B  wall 0.769  cpu 1.198  rss 28MB
+round 3  A  wall 0.767  cpu 0.903  rss 67MB
+round 3  B  wall 0.839  cpu 0.968  rss 65MB
+round 4  A  wall 0.713  cpu 1.132  rss 29MB
+round 4  B  wall 0.771  cpu 1.194  rss 28MB
+ctfe.forced: A wall median 0.767  min 0.713 | cpu median 0.932  min 0.903 | peak rss 64 MB
+ctfe.forced: B wall median 0.830  min 0.769 | cpu median 0.993  min 0.968 | peak rss 61 MB
+B/A cpu (median): 1.065   B/A cpu (min): 1.072   B/A peak rss: 0.95
+load after:  load averages: 2.15 2.72 3.02
+
+================================================================================
+QUESTION 2, DECOMPOSED.  Each block is its own interleaved run; ratios are only
+comparable to the A side they were measured beside (BENCHMARK.md 1).
+================================================================================
+===== DECOMP a: steps1-5+respell   A=/tmp/prechain(6870790c) B=/tmp/f1-respell(643569c2) =====
+load before: load averages: 2.57 2.87 3.31
+round 0  A  wall 0.956  cpu 0.976  rss 147MB
+round 0  B  wall 1.012  cpu 1.032  rss 147MB
+round 1  A  wall 0.900  cpu 0.922  rss 107MB
+round 1  B  wall 0.965  cpu 0.987  rss 107MB
+round 2  A  wall 0.910  cpu 0.932  rss 107MB
+round 2  B  wall 0.962  cpu 0.983  rss 107MB
+round 3  A  wall 0.896  cpu 0.918  rss 107MB
+round 3  B  wall 0.972  cpu 0.994  rss 107MB
+round 4  A  wall 0.894  cpu 0.915  rss 107MB
+round 4  B  wall 0.966  cpu 0.987  rss 107MB
+self.editbody: A wall median 0.900  min 0.894 | cpu median 0.922  min 0.915 | peak rss 107 MB
+self.editbody: B wall median 0.966  min 0.962 | cpu median 0.987  min 0.983 | peak rss 107 MB
+B/A cpu (median): 1.070   B/A cpu (min): 1.074   B/A peak rss: 1.00
+load after: load averages: 2.19 2.77 3.26
+===== DECOMP b: step6            A=/tmp/f1-respell(643569c2) B=/tmp/merge-u1(95fff89d) =====
+load before: load averages: 2.19 2.77 3.26
+round 0  A  wall 1.031  cpu 1.051  rss 147MB
+round 0  B  wall 1.103  cpu 1.127  rss 146MB
+round 1  A  wall 0.958  cpu 0.980  rss 107MB
+round 1  B  wall 1.027  cpu 1.052  rss 107MB
+round 2  A  wall 0.967  cpu 0.989  rss 107MB
+round 2  B  wall 1.034  cpu 1.059  rss 107MB
+round 3  A  wall 0.968  cpu 0.990  rss 107MB
+round 3  B  wall 1.016  cpu 1.041  rss 107MB
+round 4  A  wall 0.959  cpu 0.981  rss 107MB
+round 4  B  wall 1.029  cpu 1.054  rss 107MB
+self.editbody: A wall median 0.967  min 0.958 | cpu median 0.989  min 0.980 | peak rss 107 MB
+self.editbody: B wall median 1.029  min 1.016 | cpu median 1.054  min 1.041 | peak rss 107 MB
+B/A cpu (median): 1.066   B/A cpu (min): 1.062   B/A peak rss: 1.00
+load after: load averages: 1.93 2.67 3.21
+===== a1: steps1-5+respell, COMPILER half (arkham/nifasm 5f6f011e on BOTH sides)  A=/tmp/prechain B=/tmp/hyb15 =====
+load before: load averages: 1.66 2.26 2.92
+round 0  A  wall 0.956  cpu 0.978  rss 147MB
+round 0  B  wall 1.018  cpu 1.039  rss 147MB
+round 1  A  wall 0.891  cpu 0.914  rss 107MB
+round 1  B  wall 0.969  cpu 0.992  rss 107MB
+round 2  A  wall 0.892  cpu 0.916  rss 107MB
+round 2  B  wall 0.960  cpu 0.982  rss 107MB
+round 3  A  wall 0.895  cpu 0.918  rss 107MB
+round 3  B  wall 0.975  cpu 0.998  rss 107MB
+round 4  A  wall 0.897  cpu 0.919  rss 107MB
+round 4  B  wall 0.965  cpu 0.985  rss 107MB
+self.editbody: A wall median 0.895  min 0.891 | cpu median 0.918  min 0.914 | peak rss 107 MB
+self.editbody: B wall median 0.969  min 0.960 | cpu median 0.992  min 0.982 | peak rss 107 MB
+B/A cpu (median): 1.081   B/A cpu (min): 1.074   B/A peak rss: 1.00
+===== a2: step-3 nativenif re-pin ONLY (same nimony both sides)  A=/tmp/hyb15(asm 5f6f011e) B=/tmp/f1-respell(asm 3ec73fef) =====
+load before: load averages: 1.47 2.18 2.87
+round 0  A  wall 1.012  cpu 1.032  rss 147MB
+round 0  B  wall 1.025  cpu 1.046  rss 147MB
+round 1  A  wall 0.957  cpu 0.979  rss 107MB
+round 1  B  wall 0.995  cpu 1.017  rss 107MB
+round 2  A  wall 0.963  cpu 0.985  rss 107MB
+round 2  B  wall 0.955  cpu 0.977  rss 107MB
+round 3  A  wall 0.957  cpu 0.979  rss 107MB
+round 3  B  wall 0.972  cpu 0.994  rss 107MB
+round 4  A  wall 0.960  cpu 0.982  rss 107MB
+round 4  B  wall 0.960  cpu 0.982  rss 107MB
+self.editbody: A wall median 0.960  min 0.957 | cpu median 0.982  min 0.979 | peak rss 107 MB
+self.editbody: B wall median 0.972  min 0.955 | cpu median 0.994  min 0.977 | peak rss 107 MB
+B/A cpu (median): 1.012   B/A cpu (min): 0.998   B/A peak rss: 1.00
+load after: load averages: 1.34 2.10 2.83
+===== b1: upstream steps 1-5 alone  A=/tmp/prechain(6870790c) B=/tmp/ocbase(0ece350b) =====
+load before: load averages: 2.88 2.65 2.94
+round 0  A  wall 1.002  cpu 0.979  rss 147MB
+round 0  B  wall 1.021  cpu 1.031  rss 147MB
+round 1  A  wall 0.897  cpu 0.916  rss 107MB
+round 1  B  wall 0.961  cpu 0.978  rss 107MB
+round 2  A  wall 0.893  cpu 0.912  rss 107MB
+round 2  B  wall 0.965  cpu 0.979  rss 107MB
+round 3  A  wall 0.908  cpu 0.918  rss 107MB
+round 3  B  wall 0.977  cpu 0.992  rss 107MB
+round 4  A  wall 0.909  cpu 0.921  rss 107MB
+round 4  B  wall 0.960  cpu 0.971  rss 107MB
+self.editbody: A wall median 0.908  min 0.893 | cpu median 0.918  min 0.912 | peak rss 107 MB
+self.editbody: B wall median 0.965  min 0.960 | cpu median 0.979  min 0.971 | peak rss 107 MB
+B/A cpu (median): 1.066   B/A cpu (min): 1.065   B/A peak rss: 1.00
+===== b2: OUR F1 respell alone  A=/tmp/ocbase(0ece350b) B=/tmp/f1-respell(643569c2) =====
+load before: load averages: 3.71 2.87 3.02
+round 0  A  wall 1.011  cpu 1.031  rss 147MB
+round 0  B  wall 1.014  cpu 1.034  rss 147MB
+round 1  A  wall 0.957  cpu 0.979  rss 107MB
+round 1  B  wall 0.954  cpu 0.976  rss 107MB
+round 2  A  wall 0.952  cpu 0.974  rss 107MB
+round 2  B  wall 0.955  cpu 0.977  rss 107MB
+round 3  A  wall 0.957  cpu 0.979  rss 107MB
+round 3  B  wall 0.964  cpu 0.985  rss 107MB
+round 4  A  wall 0.952  cpu 0.974  rss 107MB
+round 4  B  wall 0.964  cpu 0.986  rss 107MB
+self.editbody: A wall median 0.957  min 0.952 | cpu median 0.979  min 0.974 | peak rss 107 MB
+self.editbody: B wall median 0.964  min 0.954 | cpu median 0.985  min 0.976 | peak rss 107 MB
+B/A cpu (median): 1.006   B/A cpu (min): 1.002   B/A peak rss: 1.00
+load after: load averages: 4.33 3.09 3.09
+===== c1: upstream steps 1-3 (import shadowing, ref sum-ctor, nativenif pin 3ec73fef)  6870790c -> f61c0e58  A=/tmp/prechain B=/tmp/u3base =====
+load before: load averages: 4.15 3.75 3.36
+round 0  A  wall 1.037  cpu 1.010  rss 147MB
+round 0  B  wall 0.981  cpu 0.991  rss 147MB
+round 1  A  wall 0.905  cpu 0.920  rss 107MB
+round 1  B  wall 0.896  cpu 0.915  rss 107MB
+round 2  A  wall 0.903  cpu 0.920  rss 107MB
+round 2  B  wall 0.905  cpu 0.918  rss 107MB
+round 3  A  wall 0.898  cpu 0.916  rss 107MB
+round 3  B  wall 0.900  cpu 0.917  rss 107MB
+round 4  A  wall 0.901  cpu 0.914  rss 107MB
+round 4  B  wall 0.911  cpu 0.925  rss 107MB
+self.editbody: A wall median 0.903  min 0.898 | cpu median 0.920  min 0.914 | peak rss 107 MB
+self.editbody: B wall median 0.905  min 0.896 | cpu median 0.918  min 0.915 | peak rss 107 MB
+B/A cpu (median): 0.998   B/A cpu (min): 1.001   B/A peak rss: 1.00
+===== c2: upstream step 4 ALONE (c6be04e1 'no globals in nifcore')  f61c0e58 -> 450a0831  A=/tmp/u3base B=/tmp/u4base =====
+load before: load averages: 3.32 3.58 3.31
+round 0  A  wall 0.965  cpu 0.975  rss 147MB
+round 0  B  wall 1.020  cpu 1.035  rss 147MB
+round 1  A  wall 0.913  cpu 0.923  rss 107MB
+round 1  B  wall 0.957  cpu 0.975  rss 107MB
+round 2  A  wall 0.910  cpu 0.923  rss 107MB
+round 2  B  wall 0.960  cpu 0.974  rss 107MB
+round 3  A  wall 0.902  cpu 0.915  rss 107MB
+round 3  B  wall 0.963  cpu 0.982  rss 107MB
+round 4  A  wall 0.893  cpu 0.915  rss 107MB
+round 4  B  wall 0.958  cpu 0.976  rss 107MB
+self.editbody: A wall median 0.910  min 0.893 | cpu median 0.923  min 0.915 | peak rss 107 MB
+self.editbody: B wall median 0.960  min 0.957 | cpu median 0.976  min 0.974 | peak rss 107 MB
+B/A cpu (median): 1.057   B/A cpu (min): 1.064   B/A peak rss: 1.00
+===== c3: upstream step 5 ALONE (38f67463 std/http tag space)  450a0831 -> 0ece350b  A=/tmp/u4base B=/tmp/ocbase =====
+load before: load averages: 3.70 3.66 3.35
+round 0  A  wall 1.017  cpu 1.037  rss 147MB
+round 0  B  wall 1.012  cpu 1.033  rss 147MB
+round 1  A  wall 0.959  cpu 0.981  rss 107MB
+round 1  B  wall 0.957  cpu 0.979  rss 107MB
+round 2  A  wall 0.966  cpu 0.987  rss 107MB
+round 2  B  wall 0.959  cpu 0.978  rss 107MB
+round 3  A  wall 0.961  cpu 0.978  rss 107MB
+round 3  B  wall 0.966  cpu 0.987  rss 107MB
+round 4  A  wall 0.948  cpu 0.970  rss 107MB
+round 4  B  wall 0.964  cpu 0.986  rss 107MB
+self.editbody: A wall median 0.961  min 0.948 | cpu median 0.981  min 0.970 | peak rss 107 MB
+self.editbody: B wall median 0.964  min 0.957 | cpu median 0.986  min 0.978 | peak rss 107 MB
+B/A cpu (median): 1.005   B/A cpu (min): 1.008   B/A peak rss: 1.00
+load after: load averages: 4.43 3.85 3.42
+
+================================================================================
+SPLICE COUNTS (ARKHAM_CACHE_STATS=1) -- settling the contested reference.
+Method: cold-build the corpus, then apply the `self.editbody` edit three times,
+reading the counts after each. Steady from the FIRST edit in every combination
+below, so the "measure on the second edit" caution did not bite here (the cache
+is built by the cold run of the same toolchain, so no rename intervenes).
+================================================================================
+### pre-F  toolchain=/tmp/prechain corpus=/tmp/devloop_base/src
+--- cold ---
+--- edit 1 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+--- edit 2 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+--- edit 3 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+### post-F  toolchain=/tmp/merge-u1 corpus=/tmp/devloop_base/src
+--- cold ---
+--- edit 1 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+--- edit 2 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+--- edit 3 ---
+[arkham cache] spliced 8 lowered 1 stale 1
+[arkham cache] spliced 76 lowered 2 stale 2
+[arkham cache] spliced 523 lowered 3 stale 3
+### pre-R  toolchain=/tmp/prechain corpus=/tmp/f1-respell/src
+--- cold ---
+--- edit 1 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 2 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 3 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+### post-R  toolchain=/tmp/merge-u1 corpus=/tmp/f1-respell/src
+--- cold ---
+--- edit 1 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 2 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 3 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+### post-H  toolchain=/tmp/merge-u1 corpus=/tmp/merge-u1/src
+--- cold ---
+--- edit 1 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 2 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3
+--- edit 3 ---
+[arkham cache] spliced 11 lowered 1 stale 1
+[arkham cache] spliced 82 lowered 2 stale 2
+[arkham cache] spliced 525 lowered 3 stale 3

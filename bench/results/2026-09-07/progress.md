@@ -237,3 +237,159 @@ nativenif 5f6f011. Paused here (owner's instruction). What is left in the
 0.92 s: nimsem ~0.34 (the per-module re-check, owner's decision), hexer
 ~0.27 (whole-module lowering; B3b's incremental `expand`, floor ~0.11 s),
 link 0.12, arkham 0.09, dceEmit 0.05.
+
+## Run 19: the headline re-taken after the six-commit upstream merge chain -- interleaved, machine quiet, load 1.6-3.5 decaying
+
+head = `95fff89d` (fast-devloop tip; measured from the worktree `/tmp/merge-u1`,
+branch `merge/u6b`, same commit). Base = `/tmp/devloop_base` (`f69b8afc`).
+Raw rounds: `bench/results/2026-09-07/postchain.txt`.
+
+| scenario | fork point wall / cpu / peak MB | head wall / cpu / peak MB | wall | cpu |
+|---|---|---|---|---|
+| `self.editbody` (the verdict: live edit in `sem.nim`) | 2.577 / 3.772 / 117 | 1.020 / 1.045 / 107 | 2.53x | 3.61x |
+| `self.editcall` (edit adds a proc AND a call) | 2.619 / 3.803 / 117 | 1.277 / 1.298 / 146 | 2.05x | 2.93x |
+| `self.editdead` (private never-called proc; DCE deletes it) | 2.729 / 3.890 / 116 | 0.810 / 0.806 / 100 | 3.37x | 4.83x |
+| `self.nochange` (nothing edited) | 0.096 / 0.093 / 4 | 0.045 / 0.044 / 7 | 2.13x | 2.11x |
+| `self.cold` | 5.241 / 13.598 / 116 | 5.296 / 13.902 / 175 | 0.99x | 0.98x |
+| `hello.forced` (attribution) | 0.335 / 0.473 / 18 | 0.353 / 0.487 / 26 | 0.95x | 0.97x |
+| `ctfe.forced` (attribution) | 3.549 / 5.188 / 59 | 0.834 / 0.989 / 62 | 4.26x | 5.25x |
+
+`self.nochange` is a new `devloop_ab` scenario (prep is a no-op) added with this
+run, so that the "compiler, no change" row of `SUMMARY.md` is taken the same
+interleaved way as the rest of the table instead of out of `devloop_bench.sh`.
+
+Two things about this reference that were implicit before and are now stated.
+**First**, `/tmp/devloop_base`'s `bin/arkham` and `bin/nifasm` have neither
+`--blobcache` nor `--asmcache`: they predate B3/B3e and they predate BOTH of the
+chain's nativenif re-pins (`3ec73fef` and `9d7fcf78`). The headline therefore
+spans two upstream assembler changes as well as our own nativenif chain and the
+compiler's. That is the right fixed reference for a headline -- it is what a
+user at the fork point actually had -- but it is not a compiler-only number.
+**Second**, the fork-point A side drifts between sessions and these absolutes
+are only quotable as the pair taken in this run: `self.editbody` A reads
+3.772 s cpu here against 3.562 in run 18 and 3.541 in run 17, with nothing
+about A changed (BENCHMARK.md 1).
+
+Two numbers moved against run 18 for reasons that are NOT this chain, and are
+recorded rather than smoothed:
+
+* `self.cold` head is now level with the fork point (0.98x cpu) where run 18 read
+  1.05x in our favour. That is the chain: run 20 measures it directly at 1.072.
+* `self.cold` head peak RSS reads **175 MB** where run 18 logged 147 MB. This is
+  not the chain either -- the PRE-chain toolchain reads 176 MB in the same
+  session (run 20), i.e. the chain moved it by -1 MB. Both sides are stable to
+  1 MB within a session and differ from run 18's session for a reason this run
+  did not establish; the ledger that feeds M1's scheduler lives under the
+  nimcache and `self.cold` wipes it every round, so the usual explanation does
+  not apply. Flagged as unexplained: the low-memory gate should be re-read on a
+  fresh session before it is trusted either way.
+
+## Run 20: what the six-commit merge chain cost -- pre-chain vs post-chain, interleaved, load 1.3-3.7
+
+**The question run 19 cannot answer.** `devloop_ab` interleaves within a run, so
+a chain cost is one invocation with the pre-chain toolchain as A and the
+post-chain toolchain as B -- never two fork-point ratios divided (BENCHMARK.md 1;
+that trap was hit earlier in this session and cost the A side 3.536 -> 3.879).
+
+A = `/tmp/prechain` (`6870790c`, fast-devloop's tip before the chain, built this
+session against nativenif `5f6f011e`), B = `/tmp/merge-u1` (`95fff89d`).
+
+| scenario | pre-chain wall / cpu / peak MB | post-chain wall / cpu / peak MB | cpu ratio |
+|---|---|---|---|
+| `self.editbody` | 0.907 / 0.921 / 107 | 1.034 / 1.048 / 107 | **1.138** |
+| `self.editcall` | 1.119 / 1.132 / 147 | 1.275 / 1.298 / 146 | **1.147** |
+| `self.editdead` | 0.703 / 0.700 / 101 | 0.812 / 0.809 / 100 | **1.156** |
+| `self.nochange` | 0.045 / 0.044 / 7 | 0.045 / 0.044 / 7 | 1.000 |
+| `self.cold` | 4.809 / 12.850 / 176 | 5.257 / 13.775 / 175 | 1.072 |
+| `hello.forced` | 0.315 / 0.442 / 28 | 0.349 / 0.479 / 25 | 1.084 |
+| `ctfe.forced` | 0.767 / 0.932 / 64 | 0.830 / 0.993 / 61 | 1.065 |
+
+**Every compiling scenario is over the 5 % rule; peak RSS is untouched (1.00,
+0.99).** `self.nochange` is 1.000 to three digits, which is the shape of the
+thing: the no-op path does no compilation and costs exactly what it did, so the
+regression is in work done per module, not in startup, tool discovery or the
+build graph.
+
+### Where it comes from: five interleaved runs, one per segment of the chain
+
+Each row is its own `devloop_ab` invocation on `self.editbody`, A and B adjacent
+commits, so each ratio is read only against the A it was measured beside.
+
+| segment | A -> B | what it is | cpu ratio |
+|---|---|---|---|
+| upstream steps 1-3 | `6870790c` -> `f61c0e58` | `import` shadowing, `ref` sum-type ctor, and the nativenif re-pin to `3ec73fef` | 0.998 |
+| upstream step 4 | `f61c0e58` -> `450a0831` | **`c6be04e1` "no globals in nifcore"** | **1.057** |
+| upstream step 5 | `450a0831` -> `0ece350b` | `38f67463` std/http tag space | 1.005 |
+| **ours** | `0ece350b` -> `643569c2` | the F1 respelling | **1.006** |
+| upstream step 6 | `643569c2` -> `95fff89d` | **`e1da48e9` nifsyms refactor + pin `9d7fcf78`** | **1.066** |
+| | product | | **1.137** |
+| | direct | `6870790c` -> `95fff89d` | **1.138** |
+
+The product of the five segments and the single end-to-end measurement agree to
+one part in a thousand, which is the check that no segment was double-counted or
+missed.
+
+**Two upstream commits are the whole of it, and they are the same kind of
+commit.** `c6be04e1` takes nifcore's globals out (+5.7 %) and `e1da48e9`
+decomposes a symbol into a record whose compatibility view BUILDS a spelling
+where `pool.syms[id]` used to lend one (+6.6 %). Both put an indirection on the
+hottest read in the pipeline. **Nothing of ours is in the number**: our only
+non-upstream commit in the chain, the F1 respelling, is 1.006 -- confirming,
+against a proper interleaved A side this time, the 0.990 its own author
+measured (`notes/f1-respell.md` 5).
+
+Two supporting runs, coarser and consistent:
+
+| A -> B | what it varies | cpu ratio |
+|---|---|---|
+| `/tmp/prechain` -> `/tmp/f1-respell` | steps 1-5 + the respell together | 1.070 |
+| `/tmp/f1-respell` -> `/tmp/merge-u1` | step 6 together | 1.066 |
+| `/tmp/hyb15` -> `/tmp/f1-respell` | ONLY the assembler (arkham+nifasm `5f6f011e` vs `3ec73fef`), same nimony both sides | 1.012 |
+| `/tmp/prechain` -> `/tmp/hyb15` | steps 1-5 + respell with the OLD assembler on both sides | 1.081 |
+
+`1.070 x 1.066 = 1.140`, and the step-6 figure reproduces the step-6 agent's
+own `1.074` independently. The assembler-swap pair says the step-3 re-pin
+carries ~1 % of it and the compiler side carries the rest, which the
+commit-by-commit split then confirms exactly (steps 1-3 as a block: 0.998).
+
+A note on method, because it cost a wrong number before it was caught: the
+first attempt at the assembler swap built the hybrid as a directory of symlinks
+to the donor worktree with a real `bin/`. The self-compile fails on it
+(`cannot open <nimcache>/syn*.s.nif` -- a CTFE sub-compile), and it fails
+IDENTICALLY with the donor's own unmodified assembler, so the failure is the
+symlinked root, not the swap. `/tmp/hyb15` is an APFS clone (`cp -Rc`) of the
+donor with two binaries replaced, and self-compiles.
+
+### The splice reference, settled
+
+`ARKHAM_CACHE_STATS=1`, cold build then the `self.editbody` edit applied three
+times. Steady from the first edit in every combination -- the cache is written
+by the cold run of the same toolchain, so no rename intervenes and the
+"`spliced 0 lowered N` on the first build after a rename" caution does not bite.
+
+| corpus | toolchain | main module | largest neighbour | `sem.nim` |
+|---|---|---|---|---|
+| fork point (`f69b8afc:src`) | pre-chain `6870790c` | 8 / 1 | 76 / 2 | 523 / 3 |
+| fork point (`f69b8afc:src`) | post-chain `95fff89d` | 8 / 1 | 76 / 2 | 523 / 3 |
+| branch (`643569c2:src`) | pre-chain `6870790c` | 11 / 1 | 82 / 2 | 525 / 3 |
+| branch (`643569c2:src`) | post-chain `95fff89d` | 11 / 1 | 82 / 2 | 525 / 3 |
+| branch (`95fff89d:src`) | post-chain `95fff89d` | 11 / 1 | 82 / 2 | 525 / 3 |
+
+(spliced / lowered; `stale` equals `lowered` in every line above.)
+
+**The reference is a pair of numbers, one per corpus, and the toolchain is not a
+variable in it.** On the fork-point corpus -- the one `devloop_bench.sh` and
+`devloop_ab.sh` use by default, and the one `notes/b3e.md` recorded -- it is
+**8/1, 76/2, 523/3**, reproducing `b3e.md` line for line. On the branch's own
+corpus it is **11/1, 82/2, 525/3**; the totals are larger (12, 84, 528 against
+9, 78, 526) only because the compiler's own sources have grown, and the number
+B3e is about, how many procs an edit costs, is **1, 2 and 3 either way**. The
+two branch corpora `643569c2:src` and `95fff89d:src` give the same counts, so
+the merge chain moved splice behaviour by exactly zero, confirmed here by
+running the pre-chain and post-chain toolchains over the same corpus.
+
+`notes/f1-respell.md` 5's **11/1, 83/1, 527/1** does not reproduce. Its totals
+(12, 84, 528) are right for the branch corpus, so it is the split that is
+wrong: it claims 1 proc re-lowered in all three modules where three toolchains
+over two corpora give 1, 2 and 3. Treat the two rows above as the reference and
+`11/1, 83/1, 527/1` as superseded.

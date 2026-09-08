@@ -9,19 +9,43 @@ how to take them again.
 
 ## Numbers (native backend, interleaved A/B, fork point vs branch)
 
+Re-taken 2026-09-07 after the six-commit upstream merge chain, branch tip
+`95fff89d` against fork point `f69b8afc`, one interleaved run per row
+(`bench/results/2026-09-07/progress.md` run 19, raw in `postchain.txt`).
+
 | scenario | before | after | peak RSS before / after |
 |---|---|---|---|
-| compiler compiling itself, a statement added to a called proc in `sem.nim` | 2.30 s | 0.92 s | 117 / 107 MB |
-| same, the edit also adds a proc and a call to it (call graph changes) | 2.69 s | 1.14 s | 117 / 147 MB |
-| same file, a private never-called proc appended (DCE deletes it) | 2.31 s | 0.71 s | 116 / 101 MB |
+| compiler compiling itself, a statement added to a called proc in `sem.nim` | 2.58 s | 1.02 s | 117 / 107 MB |
+| same, the edit also adds a proc and a call to it (call graph changes) | 2.62 s | 1.28 s | 117 / 146 MB |
+| same file, a private never-called proc appended (DCE deletes it) | 2.73 s | 0.81 s | 116 / 100 MB |
 | after the edit, run the compiler from memory (`nimony r`) | no such command | build + ~20 ms | |
 | hello world, edit, build and run | 0.32 s | 0.033 s | 18 / 26 MB |
 | one compile-time evaluation (`const` needing a sub-compile) | 450–490 ms, 32 processes | ~27 ms, 0 processes | 59 / 61 MB |
-| compiler, no change | 74 ms | 35 ms | |
-| compiler, cold | 5.68 s | 5.20 s | 116 / 147 MB |
+| compiler, no change | 96 ms | 45 ms | 4 / 7 MB |
+| compiler, cold | 5.24 s | 5.30 s | 116 / 175 MB |
+
+Read as a pair per row and not against another session's: the fork-point A side
+drifts (this run's `self.editbody` A is 3.772 s cpu against 3.562 in run 18,
+with nothing about A changed), which is why `BENCHMARK.md` §1 forbids
+comparing ratios across invocations. `/tmp/devloop_base`'s `arkham`/`nifasm`
+have neither `--blobcache` nor `--asmcache`, so they predate B3/B3e **and both
+of the chain's nativenif re-pins** (`3ec73fef`, `9d7fcf78`): this table spans two
+upstream assembler changes as well as ours and the compiler's. It is the right
+fixed reference for a headline — it is what a user at the fork point had —
+but it is not a compiler-only number.
+
+Two rows carry the six upstream commits merged on 2026-09-07, which cost the
+edit loop 13.8 % of cpu on their own (run 20, measured pre-chain against
+post-chain directly): **cold is now level with the fork point** where it was
+5 % ahead, and the live edit is 1.02 s where it was 0.92 s. The two rows not
+re-taken this round (`nimony r`, hello edit-and-run, one CTFE evaluation) come
+from `devloop_bench.sh` and are 10x-class numbers that the chain's ~14 % cannot
+have changed in kind. The cold peak RSS of 175 MB is 147 MB in run 18's session
+for the same code and reads 176 MB for the PRE-chain toolchain in this one —
+i.e. not the chain, and not yet explained; see run 19.
 
 Correctness evidence, all automated and green: `hastur boot --boot-backend:native`
-stages 1 = 2 = 3 byte-identical; `hastur tests/nimony` 794/794 in every mode;
+stages 1 = 2 = 3 byte-identical; `hastur tests/nimony` 795/795 in every mode;
 `tests/ctfe_diff` byte-compares every compile-time result and the calling
 module's `.s.nif` across every mode pair (0 differences); nativenif's
 `tools/refactor_gate.sh` byte-identical (2583 artifacts).
