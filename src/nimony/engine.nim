@@ -51,7 +51,8 @@
 
 import std / [os, monotimes, times, syncio, strutils, algorithm]
 
-import ".." / lib / [nifcore, nifcoreparse, nifchecksums]
+import ".." / lib / [nifcore, nifcoreparse, nifchecksums, tooldirs]
+import guestwire
 
 import arkham / generate
 import arkham / core / lengdecl
@@ -653,6 +654,13 @@ type
     outcome*: RunOutcome
     status*: int
     reason*: string
+    signal*: int
+      ## Non-zero only on the out-of-process path, and only when the guest died
+      ## from a signal: in-process there is nothing to report, because the
+      ## signal landed on the compiler itself and the compiler was already gone
+      ## when it did. The caller re-raises it (`guestwire.reraiseAsGuestDid`) so
+      ## that both paths hand the shell the same WAIT STATUS rather than merely
+      ## the same number.
     timings*: EngineTimings
 
 const
@@ -929,3 +937,139 @@ proc timingLine*(r: EngineResult; label: string): string =
     "B data=" & $r.timings.dataLen &
     "B ext=" & $r.timings.externals &
     (if r.timings.viaFile: " viaFile" else: "")
+
+# ── the out-of-process guest ────────────────────────────────────────────────
+#
+# `runWholeProgram` maps the arena in THIS process. That is right for `nimony
+# r`, which runs one program and exits, and it is what `nimony dev` cannot do:
+# `hostrun.guestExit` parks the thread that called `exit` forever (there is no
+# way back out of a guest frame), so the arena can never be released and every
+# run leaks a thread. JIT.md 7.3's answer is a loader process -- and this is
+# the compiler's half of it. `src/nimony/nimrun.nim` is the other half, and it
+# calls the very proc above, so the two paths are one implementation with a
+# `posix_spawn` in the middle rather than two that have to be kept in step.
+
+proc encodeRunRequest(p: RunProgram): seq[string] =
+  ## `RunProgram` -> the `run` record `nimrun.decodeRun` reads back. Positional
+  ## and flat: the argument vector is last and preceded by its own count, so a
+  ## program argument may contain anything at all.
+  var flags = ""
+  if p.verbose: flags.add 'v'
+  if p.profile: flags.add 'p'
+  result = @["run", p.backendDir, p.mainModule, p.blobCacheDir, flags,
+             $p.argv.len]
+  for a in p.argv: result.add a
+
+proc applyTiming(t: var EngineTimings; pair: string) =
+  ## One `key=value` of a reply. An unknown key is IGNORED on purpose: the
+  ## timings are diagnostics, and a `nimrun` that learned a new column must not
+  ## make an older compiler refuse a run that worked.
+  let eq = pair.find('=')
+  if eq <= 0: return
+  let key = pair[0 ..< eq]
+  let val = pair[eq+1 .. ^1]
+  var f = 0.0
+  var i = 0
+  try:
+    f = parseFloat(val)
+    i = int(f)
+  except ValueError:
+    return
+  case key
+  of "assembleMs": t.assembleMs = f
+  of "emitRootsMs": t.emitRootsMs = f
+  of "layMs": t.layMs = f
+  of "bindMs": t.bindMs = f
+  of "runMs": t.runMs = f
+  of "totalMs": t.totalMs = f
+  of "codeLen": t.codeLen = i
+  of "dataLen": t.dataLen = i
+  of "externals": t.externals = i
+  of "blobCache": t.blobCache = val == "1"
+  of "blobHits": t.blobHits = i
+  of "blobStale": t.blobStale = i
+  of "blobRecorded": t.blobRecorded = i
+  else: discard
+
+proc runWholeProgramOutOfProcess*(p: RunProgram): RunResult =
+  ## Run `p` in a `nimrun` process and report what it said. Never raises; a
+  ## refusal is `roRefused` with a reason, exactly as in-process.
+  ##
+  ## The three things this arrangement is FOR, each visible in the code below:
+  ##
+  ## * the compiler keeps no arena and no parked thread -- both die with the
+  ##   loader, which is what makes running many programs from one compiler
+  ##   process possible at all;
+  ## * a guest that faults kills the loader and nothing else. `reapGuest`
+  ##   reports it as `gxSignalled`, and the caller decides whether the shell
+  ##   should see the same wait status (`nimony r`: yes) or a diagnostic
+  ##   (`nimony dev`: a restart);
+  ## * descriptors 0, 1 and 2 were never touched, so the program's output is
+  ##   the user's terminal with nothing in between -- the reason the two paths
+  ##   are byte-identical rather than argued to be.
+  result = RunResult(outcome: roRefused, status: 0, reason: "", signal: 0)
+  let exe = findTool("nimrun")
+  if not fileExists(exe):
+    result.reason = "there is no `nimrun` in " & binDir() &
+      "; build it with `hastur build all`"
+    return
+  # The loader inherits our stdout and stderr, so anything still in our buffers
+  # would surface after the program's first line. Same flush, same reason, as
+  # the in-process path.
+  flushFile stdout
+  flushFile stderr
+  var launch = GuestLaunch(pid: 0, chan: openChannel(-1), alive: false)
+  let spawnErr = spawnGuest(exe, [], launch)
+  if spawnErr.len > 0:
+    result.reason = spawnErr
+    return
+
+  var fields: seq[string] = @[]
+  if not launch.chan.recvFields(fields) or fields.len < 2 or
+     fields[0] != "hello":
+    closeChannel launch
+    discard reapGuest(launch)
+    result.reason = "`nimrun` did not answer the handshake (" & exe & ")"
+    return
+  if fields[1] != $GuestProtocolVersion:
+    closeChannel launch
+    discard reapGuest(launch)
+    result.reason = "`nimrun` speaks guest protocol " & fields[1] &
+      " and this compiler speaks " & $GuestProtocolVersion &
+      "; rebuild the toolchain"
+    return
+
+  if not launch.chan.sendFields(encodeRunRequest(p)):
+    closeChannel launch
+    discard reapGuest(launch)
+    result.reason = "`nimrun` closed the control channel before the request"
+    return
+
+  let answered = launch.chan.recvFields(fields)
+  closeChannel launch
+  let ended = reapGuest(launch)
+
+  if not answered:
+    # No reply: the loader died mid-run. A signal is the interesting case and
+    # is reported as such, because it is what an aborting or faulting program
+    # looks like from out here -- and it is a RESULT, not an engine failure.
+    case ended.kind
+    of gxSignalled:
+      result = RunResult(outcome: roRan, status: 128 + ended.signal,
+                         reason: "", signal: ended.signal)
+    of gxExited:
+      result.reason = "`nimrun` exited " & $ended.code & " without an answer"
+    of gxUnknown:
+      result.reason = "`nimrun` disappeared without an answer"
+    return
+
+  if fields.len < 3:
+    result.reason = "`nimrun` answered with " & $fields.len & " fields"
+    return
+  var status = 0
+  for ch in fields[1]:
+    if ch in {'0' .. '9'}: status = status * 10 + (ord(ch) - ord('0'))
+  result.status = status
+  result.reason = fields[2]
+  for i in 3 ..< fields.len: applyTiming(result.timings, fields[i])
+  result.outcome = (if fields[0] == "ran": roRan else: roRefused)

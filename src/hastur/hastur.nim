@@ -389,6 +389,7 @@ proc handleCmdLine =
       buildNifler(showProgress)
       buildNimsem(showProgress)
       buildNimony(showProgress)
+      buildNimrun(showProgress)
       buildLengc(showProgress)
       buildShoggoth(showProgress)
       buildNiflink(showProgress)
@@ -403,6 +404,7 @@ proc handleCmdLine =
     of "nimony":
       buildNimsem(showProgress)
       buildNimony(showProgress)
+      buildNimrun(showProgress)
       buildHexer(showProgress)
     of "lengc":
       buildLengc(showProgress)

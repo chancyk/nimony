@@ -7,29 +7,55 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 ## State
 
-- Branch `fast-devloop`, HEAD after the F1 follow-ups merge; everything in
-  the Status table marked "merged" is on it and verified (794/794,
-  `hastur boot --boot-backend:native` byte-identical, ctfe_diff 0 diffs).
-- `../nativenif` (`/Users/chanc/Projects/nativenif`) must be at the commit in
-  `src/nativenif.commit` (c3f27fc, branch `jit/b3c`). Its branches:
-  `jit/b1` -> `jit/b3` -> `jit/b3-fixes` -> `jit/b3c` (linear). `hastur`
-  checks out the pin before building; from a worktree under `/tmp` or
-  `.claude/worktrees` set `NIMONY_NATIVENIF=/Users/chanc/Projects/nativenif`.
+- Branch `fast-devloop` at `5df66183`, pushed; the six-commit upstream merge
+  chain and the F1 respelling are on it and `MERGE.md` records them commit by
+  commit. Everything in the Status table marked "merged" is verified
+  (795/795, `hastur boot --boot-backend:native` byte-identical, ctfe_diff 0).
+- `../nativenif` (`/Users/chanc/Projects/nativenif`) is on branch
+  `jit/upstream-master` at **`9d7fcf78`**, which IS `src/nativenif.commit`'s
+  value. `syncNativenif` returns silently when head == pin, so a build that
+  prints **no `[deps]` line about nativenif** is a build that honoured it. Do
+  not move this checkout without saying so: other toolchains' `bin/` match
+  where it is now.
 - Fork-point toolchain for A/B: `/tmp/devloop_base` (worktree of f69b8afc,
   built, plus `arkham`/`nifasm` copied into its `bin/`). If it is gone:
   `git worktree add --detach /tmp/devloop_base f69b8afc && (cd /tmp/devloop_base
   && nim c -r src/hastur/hastur build all)` and build arkham/nifasm into its
   `bin/` from the nativenif checkout (`nim c -d:release --outdir:/tmp/devloop_base/bin
-  src/{arkham/arkham,nifasm/nifasm}.nim`).
+  src/{arkham/arkham,nifasm/nifasm}.nim`). **Rebuilding it changes the
+  headline number**, so leave it alone.
+- `/tmp/prechain` (6870790c, detached) and `/tmp/merge-u1` (95fff89d,
+  `merge/u6b`) are the two sides of the merge chain's gating comparison. Keep.
 - Parallel `nim c` builds share `~/.cache/nim`; every agent sets a private
   `XDG_CACHE_HOME`.
 
 ## In flight
 
-Nothing. Paused on the owner's instruction after B3e merged (2026-09-07).
-All `jit/*` branches are merged; `git worktree list` should show only the
-main tree and `/tmp/devloop_base`. `../nativenif` is at pin 5f6f011
-(`jit/b3e-native`).
+**B4 stage 1, on `jit/b4`** (worktree `/tmp/b4/nimony`, with its nativenif
+sibling worktree `/tmp/b4/nativenif` on `jit/b4-native`, still AT the pin
+`9d7fcf78` -- stage 1 needed no nativenif change). `notes/b4.md` is the
+write-up. Two things landed:
+
+* **1a, the design question the staging existed to catch**, is answered and did
+  not change the phase: JIT.md 7.4's trace-table walk is the SAME mechanism as
+  `lib/std/stacktraces.nim` -- a synchronous walk of the guest's own stack --
+  because the table's `cfaOff` is defined only past the prologue and an
+  out-of-process guest cannot be reached across the boundary without the
+  entitlement B0's design refuses. Corrections to the memo's sizing are in
+  `notes/b4.md` §1a; the short version is that a loader-side walk needs
+  nothing from arkham and a guest-side one needs THREE intrinsics, not two.
+* **1b, the `nimrun` out-of-process guest**, is built and gated:
+  `src/nimony/guestwire.nim`, `src/nimony/nimrun.nim`,
+  `engine.runWholeProgramOutOfProcess`, `nimony r --guest:inproc|subprocess`
+  (default `inproc`), `hastur build all` builds `nimrun` beside `nimony`, and
+  `tests/inproc/guest` is the gate. `tests/nimony_r` gained five differential
+  checks against the in-process run.
+
+Stage 2 (layout sidecar, classifier, slot-swap policy, the walk, the watcher,
+restart diagnostics, and a demo application that has to be WRITTEN) has not
+started. Worktrees alive: the main tree, `/tmp/devloop_base`, `/tmp/merge-u1`,
+`/tmp/prechain`, `/tmp/b4/nimony`; in nativenif, the main checkout,
+`/tmp/u6/nativenif` and `/tmp/b4/nativenif`.
 
 ## How a phase is merged (the routine used throughout)
 
@@ -49,16 +75,22 @@ main tree and `/tmp/devloop_base`. `../nativenif` is at pin 5f6f011
 
 ## Headline as of this handoff (interleaved, native backend)
 
+Run 19 of `bench/results/2026-09-07/progress.md`, head = `95fff89d`
+(= the `5df66183` tip's code), base = `/tmp/devloop_base` (`f69b8afc`).
+
 | | fork point | branch |
 |---|---|---|
-| live edit in `sem.nim`, rebuild | 2.30 s / 3.56 s cpu / 117 MB | 0.92 s / 0.94 s / 107 MB (after B3e) |
-| live edit that adds a proc + call | 2.69 / 3.87 / 117 | 1.14 / 1.15 / 147 |
-| dead-proc edit (old headline) | 2.31 / 3.59 / 116 | 0.71 / 0.70 / 101 |
-| cold | 5.61 / 14.6 / 116 | 5.37 / 13.8 / 147 |
+| live edit in `sem.nim`, rebuild (`self.editbody`) | 2.577 s / 3.772 s cpu / 117 MB | **1.020 / 1.045 / 107** |
+| live edit that adds a proc + call (`self.editcall`) | 2.619 / 3.803 / 117 | 1.277 / 1.298 / 146 |
+| dead-proc edit (old headline, `self.editdead`) | 2.729 / 3.890 / 116 | 0.810 / 0.806 / 100 |
+| nothing edited (`self.nochange`) | 0.096 / 0.093 / 4 | 0.045 / 0.044 / 7 |
+| cold (`self.cold`) | 5.241 / 13.598 / 116 | 5.296 / 13.902 / 175 |
 
-Where the live edit's 0.92 s goes: nimsem 0.34 (owner's decision), hexer
-0.27 (B3b's incremental expand, floor ~0.11 s), link 0.12, arkham 0.09,
-dceLive 0.05, dceEmit 0.05.
+The 0.92 s that stood here before the merge chain is superseded: the chain cost
+the edit loop 13.8 % cpu, all of it in two upstream commits (run 20).
+
+Where the live edit's ~1.02 s goes: nimsem, hexer (B3b's incremental expand,
+floor ~0.11 s), link 0.12, arkham 0.09, dceLive 0.05, dceEmit 0.05.
 
 ## Open decisions and follow-ups (owner's)
 
@@ -71,33 +103,13 @@ dceLive 0.05, dceEmit 0.05.
   platforms; `std/rawthreads` nimNoLibc on macOS; the C-backend bug with a
   value-returning proc catching a ref exception (`notes/f1.md` §8.3).
 
-## Upstream (checked 2026-09-07 after the pause)
+## Upstream (merged 2026-09-07)
 
-`https://github.com/nim-lang/nimony` master is at e1da48e9, six commits past
-the fork point f69b8afc (which is its ancestor):
-
-```
-e1da48e9 nifsyms refactor (#2483)
-38f67463 std/http: thread the tag space instead of keeping one per process (#2484)
-c6be04e1 no globals in nifcore (#2482)
-b7c7daa6 newest nativenif (#2478)        -> upstream pin f9af5b24; ours 5f6f011e, both from d0781a48
-c6db98b6 sem: a sum type constructor over a `ref object` produces the `ref` (#2481)
-4aa797d5 sem: `import` is not a shadowing boundary (#2479)
-```
-
-Upstream diff since the fork: 114 files, +2480/-1343. A trial merge into
-`fast-devloop` conflicts in 30 files, almost all of them the hexer passes
-F2 touched (`xelim`, `intramodinliner`, `lambdalifting`, `coro_transform`,
-`cps`, `desugar`, `duplifier`, `iterinliner`, `stringcases`,
-`vtables_backend`, `lengcgen`, `dce1`, `dce2`), plus `sem.nim`/`sembasics`
-(F1 vs the nifsyms refactor), `controlflow`/`derefs`/`contracts*` (F1
-follow-ups), `nifmake.nim`, `lengc/nifmodules.nim` and the nativenif pin.
-"no globals in nifcore" and "thread the tag space" overlap A2a's
-`resetPools`/`resetFrontendGlobals` in intent and may make parts of them
-redundant. Recommended path for a fresh session: rebase phase by phase onto
-upstream master (P0*, A1*, A2*, B* first -- they conflict little; then F1,
-F1 follow-ups, F2 on top of the nifsyms refactor, re-running
-`decl-stability` as the gate), and rebase the nativenif branches
-(`jit/b1` .. `jit/b3e-native`) onto upstream's new pin f9af5b24 with
-`tools/refactor_gate.sh` as the gate at each step. Do not merge upstream
-into `fast-devloop` blind: the 30 conflicts are semantic, not textual.
+`https://github.com/nim-lang/nimony` master's six commits past the fork point
+are **on the branch**: `MERGE.md` has the whole chain, one branch per commit,
+plus the F1 respelling (`643569c2`) that `e1da48e9` requires and the nativenif
+re-pins `3ec73fef` and `9d7fcf78`. It cost the edit loop 13.8 % cpu, all of it
+in two upstream commits (`c6be04e1` 1.057 and `e1da48e9` 1.066), and none of it
+ours (our F1 respelling measured 1.006). The headline against the fork point is
+therefore 2.58 -> 1.02 s wall on the live edit. Nothing is pending upstream as
+of this handoff; re-check before the next phase.

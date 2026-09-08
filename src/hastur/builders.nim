@@ -116,6 +116,21 @@ proc buildNimony*(showProgress = false) =
   buildTool("nimony", "src/nimony/nimony.nim", showProgress,
             validatePassesFlag() & engineFlags())
 
+proc buildNimrun*(showProgress = false) =
+  ## `nimrun` -- the out-of-process guest loader (`src/nimony/nimrun.nim`,
+  ## JIT.md 7.3). It calls `engine.runWholeProgram`, so it needs `engineFlags()`
+  ## exactly the way `nimsem` and `nimony` do, and exists only where the sibling
+  ## nativenif checkout does: without arkham and nifasm there is no image to
+  ## load and `nimony r` has nothing to run either way. Said out loud rather
+  ## than silently skipped, because `nimony r --guest:subprocess` names this
+  ## file when it is missing.
+  let flags = engineFlags()
+  if flags.len == 0:
+    echo "[build] no ../nativenif (or a 32-bit host) — skipping nimrun; ",
+         "`nimony r --guest:subprocess` needs it"
+    return
+  buildTool("nimrun", "src/nimony/nimrun.nim", showProgress, flags)
+
 proc buildControlflow*(showProgress = false) =
   buildTool("controlflow", "src/nimony/controlflow.nim", showProgress)
 

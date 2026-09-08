@@ -558,6 +558,50 @@ proc checkSharedCacheDir() =
   else:
     ok "a cached link and a scratch link produce byte-identical executables"
 
+proc checkOutOfProcess() =
+  ## `--guest:subprocess` (JIT_IMPL.md B4 step 1): the same program run in a
+  ## `nimrun` loader process instead of in the compiler's own memory.
+  ##
+  ## Differential against the IN-PROCESS run rather than against the linked
+  ## executable, because the linked executable is already covered above and
+  ## this is the narrower question: does moving the guest across a
+  ## `posix_spawn` change anything the user can see. It must not — `nimrun`
+  ## calls the very proc `nimony r` calls, and descriptors 0, 1 and 2 are
+  ## inherited untouched, so the two are one implementation with a process
+  ## boundary in it (`src/nimony/guestwire.nim`).
+  ##
+  ## The four shapes are the four ways a program can end: a plain return, an
+  ## explicit `quit(n)`, a runtime panic, and arguments reaching `main`.
+  if not fileExists(toolchainDir / "nimrun".addFileExt(ExeExt)):
+    fail "out-of-process: no `nimrun` in " & toolchainDir &
+         " (`hastur build all` builds it beside `nimony`)"
+    return
+  let dir = work / "guest"
+  proc both(name, src, args: string) =
+    let file = dir / name / (name & ".nim")
+    writeSrc file, src
+    let cache = dir / name / "nc"
+    # In-process FIRST, so the second run finds a warm blob cache and the
+    # comparison is not accidentally also a comparison of cache states.
+    let inproc = nimonyR(file, cache, args)
+    let sub = nimonyR(file, cache, args, "--guest:subprocess")
+    if sameRun(inproc, sub):
+      ok "out-of-process " & name & " (both ways: " & $inproc.code & ", " &
+         $inproc.output.strip.splitLines.len & " line(s))"
+    else:
+      if inproc.output != sub.output:
+        fail "out-of-process " & name & ": output differs" &
+             "\n    inproc: " & inproc.output.strip &
+             "\n    nimrun: " & sub.output.strip
+      if inproc.code != sub.code:
+        fail "out-of-process " & name & ": exit status differs (inproc " &
+             $inproc.code & ", nimrun " & $sub.code & ")"
+  both("hello", HelloSrc, "")
+  both("quit", QuitSrc, "")
+  both("panic", PanicSrc, "")
+  both("argv", ArgvSrc, "a b")
+  both("streams", StreamsSrc, "")
+
 proc checkCompilerItself() =
   ## The biggest program in the repository, ~130 modules: `nimony r` of the
   ## compiler, printing its version. It is here because everything smaller
@@ -607,6 +651,7 @@ checkNoExecutable()
 checkOutWritesExecutable()
 checkCrossCompileRefused()
 checkBlobCache()
+checkOutOfProcess()
 checkSharedCacheDir()
 checkCompilerItself()
 

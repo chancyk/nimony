@@ -652,17 +652,31 @@ moved them there:
 * **the `nimrun` out-of-process guest.** Nothing in the numbers asks for it
   yet: a `nimony r` process runs one program and exits, so the parked thread
   B1 accepted still costs milliseconds. It becomes necessary when a program is
-  re-run without a fresh compiler process, i.e. with `nimony dev`.
-* **the `.x.nif` feed with the cached resolve step.** This is where the
-  remaining time is, and both halves of the phase found it independently:
-  318 ms of a warm 484 ms compiler link is `blobResolve` + `blobRefs`,
-  following foreign names into their modules and validating layout stamps.
-  A code cache cannot reach it; a resolved-scope cache is its own piece of
-  work.
+  re-run without a fresh compiler process, i.e. with `nimony dev`. **Built in
+  B4 stage 1** (`notes/b4.md`), and it is that phase's step 1 rather than a
+  footnote: measured here, fifty in-process runs from one host process leave
+  fifty-one parked threads and 13.6 GB of mapped address space, against one
+  thread and no growth through `nimrun`.
+* ~~**the `.x.nif` feed with the cached resolve step.**~~ **Struck: absorbed
+  by B3c and B3d.** The justification -- "318 ms of a warm 484 ms compiler link
+  is `blobResolve` + `blobRefs`" -- **double-counted**: `blobRefs` ⊇
+  `blobResolve` (`nativenif/notes/b3c.md:43-44`, `blobRefs` is `replay`'s whole
+  per-reference loop and `blobResolve` the nested first-sighting
+  `lookupWithAutoImport` inside it), so the real figure was ~163 ms of 478, not
+  318 of 484. B3c's `core/declhead.nim` -- which IS "the cached resolve step"
+  under another name -- then cut the pair to 19.6 / 25.9 ms
+  (`b3c.md:177-178`), and B3d took the comparable `sem.nim`-edited link from
+  0.32 s to 0.12 s. Resolution inside it is now on the order of 26 ms, under
+  3 % of the 1.02 s live-edit headline. Not a phase; at most a small item.
 * **the frozen-vs-reloadable slot policy.** Every call a replayed fragment
   makes is still a direct branch patched from the final label table ("frozen
   module → load-time direct patch", JIT.md 7.3). The indirection a reloadable
-  module needs is B4's by definition.
+  module needs is B4's by definition. Note what is missing is the POLICY: the
+  `extproc` slot mechanism JIT.md 7.3 points at is implemented and exercised on
+  BOTH targets already -- arm64 through `emitA64Stub`
+  (`nativenif/src/nifasm/image/hostfixup.nim:79-98`), x86-64 through
+  `rkIatCall`'s `call [rip+d32]` (`.../image/memory.nim:185-194`). What B4 adds
+  is which modules are reloadable, a swap API and the generation counter.
 
 The cache key is also not literally the SHA-1 of the `.x.nif`: nifasm keys a
 blob on target + flags + tool build id + module NAME and validates it with a
@@ -742,16 +756,97 @@ byte-identical; `self.editbody` not worse.
 
 ## Phase B4 — hot reload and `nimony dev`
 
-Layout sidecar and classifier, slot swap with generation counter,
-trace-table stack walk (x64 first), watcher, restart diagnostics.
+Built on **macOS/arm64**, which is the platform with the evidence behind it.
+JIT.md 7.4's "(x64 first)" is inherited from a B1 premise B0 formally
+overturned (`bench/results/2026-09-06/native_status.md:242-245`) and both
+halves of that premise are false in the built system: the symbol resolver uses
+`dlsym` on every POSIX host (`nativenif/src/nifasm/core/hostsyms.nim:123-145`),
+and the "existing TLS mechanism" is precisely what x86-64 lacks under
+`--dev-single-thread` -- `emTvarAddr` (`.../src/arkham/x64/mem.nim:210-284`)
+unconditionally names `arkham.tls.self.0`, which nifasm never lays down in that
+mode, while arm64's `genTvar` asks the question itself
+(`.../src/arkham/risc/driver.nim:189-221`) and `grep -rn "oneThread"
+src/arkham` hits nothing under `x64/`. **x86-64 is the blocked target, not the
+ready one**, and unblocking it is B5's.
+
+Steps, in order:
+
+1. **the `nimrun` out-of-process guest** (carried out of B3, above). It is
+   what gates the gate: `hostrun.guestExit` parks the thread that called `exit`
+   forever, so an in-process `dev` accumulates a thread and a 256 MB arena per
+   run and can never stop a program it is about to replace. Platform-neutral.
+   **Done** -- `src/nimony/guestwire.nim`, `src/nimony/nimrun.nim`,
+   `engine.runWholeProgramOutOfProcess`, `nimony r --guest:subprocess`,
+   `tests/inproc/guest`; `notes/b4.md`.
+2. **layout sidecar and classifier** (safe/unsafe edit). Platform-neutral, and
+   materially cheaper than when JIT.md was written: F1/F2 built line-info-blind
+   per-declaration digests (`src/hexer/decldigest.nim`, `<mod>.decls.nif`), B3d
+   built the asm-side twin (`nativenif/src/arkham/core/asmdecls.nim`), and
+   B3e's fragment key already folds in every proc SIGNATURE -- which is most of
+   an interface checksum.
+3. **slot swap with generation counter.** Policy, not mechanism; see the B3
+   bullet above.
+4. **the trace-table stack walk.** `notes/b4.md` §1a settles whose stack it
+   is: the table's `cfaOff` is valid only past the prologue
+   (`nativenif/src/nifasm/image/tracetable.nim:36-39`), so no asynchronous seed
+   can start it -- the walk is synchronous, in the guest's address space,
+   seeded by a call the guest made. Two ways to build it, argued there: a
+   guest-side self-walk, which is `lib/std/stacktraces.nim` and needs two RISC
+   intrinsic lowerings PLUS a new one for the seed (`bl` leaves the return
+   address in `lr`, so an arm64 naked proc's SP points at no slot), two widened
+   target sets and a restructured seed; or a loader-side walk seeded inside an
+   intercept, which needs **nothing from arkham** and two small nifasm
+   additions (force `ctx.traceUsed`; put the table's address on `MemImage`).
+   The second is recommended for B4; arm64 `getStackTrace` is its own item.
+5. **`nimony dev` watcher and restart diagnostics.** OS-specific, not
+   CPU-specific; macOS is served by `lib/std/posix/kqueue.nim`, already here.
+6. **a demo application, which has to be written.** `examples/` holds only
+   one-shot tutorial scripts that run to completion, and JIT.md:638 already
+   said the phase "needs a real demo application to be judged". Two hard
+   constraints from the runtime: single-threaded (`image/memory.nim:27-38`
+   refuses an image carrying a thread-local, and `std/rawthreads` has no
+   `nimNoLibc` arm on macOS), and a long-lived loop with a reloadable body,
+   since the gate is "survives a body edit without restart".
 
 Gate: a demo application survives a body edit without restart and restarts
 with a named reason on a signature edit.
 
-## Phase B5 — macOS/arm64 and Windows dev runtime
+## Phase B5 — Windows dev runtime, and linux/x86-64 qualification
 
-`MAP_JIT` + entitled helper, TLV thunk, arm64 stub islands, `dlsym`;
-Windows `VirtualAlloc`, IAT patch via `pe.nim`, `TlsAlloc` thunk.
+Retitled: three of the four macOS/arm64 bullets this phase used to carry are
+already built or were designed out, so what is left is Windows plus an x86-64
+catch-up. Struck, with the evidence:
+
+* ~~`MAP_JIT` + entitled helper~~ -- **not needed.** B0 measured on macOS 26 /
+  M5 that plain RW→RX `mprotect` works for an unsigned, unentitled `nim c`
+  binary, and `MAP_JIT`/`pthread_jit_write_protect_np` are deliberately NOT
+  used because that dance is per-thread
+  (`nativenif/src/nifasm/hostrun.nim:28-34`).
+* ~~arm64 stub islands~~ -- **built**: `emitA64Stub`, a 12-byte ADRP+LDR+BR
+  through a GOT slot (`.../src/nifasm/image/hostfixup.nim:79-98`), with the
+  256 MB arena sized for `bl` reach (`hostrun.nim:17-26`).
+* ~~`dlsym` for libSystem~~ -- **built**: the three-tier resolver (intercepts →
+  arena → `dlsym(RTLD_DEFAULT)`), `.../src/nifasm/core/hostsyms.nim:62-67,
+  123-145`.
+* the **TLV thunk** moves to "later, optional": the in-memory path has no
+  thread-locals by design and refuses an image carrying one
+  (`.../src/nifasm/image/memory.nim:27-38`); `--dev-single-thread` is the
+  sanctioned answer, and JIT.md 7.4 already lists "changed thread-local set" as
+  a RESTART trigger rather than a reload case.
+
+What remains:
+
+1. **Windows dev runtime** -- `VirtualAlloc`/`VirtualProtect`/
+   `FlushInstructionCache`, IAT patch via `pe.nim`, `TlsAlloc` thunk,
+   `runImage` on Windows. Entirely unbuilt; `engine.hostIsSupported()` excludes
+   Windows outright. JIT.md:644 still calls this the largest payoff (no MinGW;
+   61 s vs 601 s bootstrap) and the least charted.
+2. **linux/x86-64 qualification** -- arkham's x86-64 `&threadvar` lowering
+   under `--dev-single-thread` (the `oneThread` arm `src/arkham/x64/` lacks),
+   then the B0/B2 suites there, then flipping `engine.engineByDefault()`.
+3. **`std/rawthreads`' `nimNoLibc` arm on macOS** -- not in the old text, but
+   adjacent: it keeps the stdlib-wide corpus off the native backend here and it
+   constrains what B4's demo application may import.
 
 Gate: B3's numbers on each platform.
 
@@ -879,4 +974,5 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3e | merged (pin nativenif 5f6f011) -- done on `jit/b3e` + nativenif `jit/b3e-native` (`notes/b3e.md`): `--asmcache:DIR` writes a `<mod>.arkham.nif` sidecar holding each proc's line-info-blind `.c.nif` digest and the BYTE RANGE its text occupies in the `.asm.nif` beside it -- no generated byte is stored, the text is copied out of the module's own previous output whose content hash the sidecar records, so the two cannot disagree. A spliced proc is a `(arkhamsplice n)` marker in the token buffer (a remembered position does not survive `finish`'s peephole) and replays what it owed the module (`rodata`, whose names are minted from the running count, and the two firmware divider flags). The key: arkham's build id + target + every non-proc declaration + every proc SIGNATURE + the ANSWERS of `cleanSigProcNames`/`noReturnProcs` (the latter walks every body, so a body edit can change another proc's frame); hexer's `(smry ...)` is excluded -- it is computed from the proc's own body and made every signature a function of it (0 of 526 spliced until that was found). Cross-module: the file stamp is asked first, and a stamp that MOVED asks about the declarations this lowering actually read out of that module, per PROC -- `notes/b3d.md` §3.3's per-reference rule one tool earlier. Live edit: 523 of 526, 76 of 78 and 8 of 9 procs spliced, arkham 0.259 -> 0.089 s, `sem.nim` alone 196 -> 63 ms; cold -2 %; headline 2.61 -> 0.92 s. Byte-identical: 651 splice self-test checks over five corpus/target pairs in eight states, 0 of 127 compiler modules differ cached vs not (also with the cache populated before the edit: 4045 procs spliced, 0 differ), the linked compiler identical, refactor gate identical to `7b838ec`, boot 1 == 2 == 3 | nativenif 5f6f011 |
 | H1 | NOT built as scoped -- the premise was a measurement artifact (`notes/h1.md`, `bench/results/2026-09-07/h1.txt`): `dceLive`'s 0.36 s was not the whole-program recomputation but an accidental deep copy. `markLive` took `moduleGraphs` non-`var`, so every lookup bound `compat2`'s BY-VALUE `getOrQuit` and `let graph = moduleGraphs.getOrQuit(moduleName)` copied a whole `ModuleAnalysis` (a `Table[SymId, HashSet[SymId]]` plus two `HashSet`s) on each of the 7867 worklist pops, plus the dependency set on top. Reading the 131 `.dce.nif` is 19 ms and the fixpoint is 7 ms; the other 305 ms was copying. Taking the table as `var` and never materializing the intermediate: `hexer dl` 0.36 -> 0.05 s, in-build `dceLive` 0.367 -> 0.062 s (gate <= 0.08), first-rebuild-after-an-edit wall 1.39 -> 1.10 s, cold 5.08 -> 4.79 s, all 131 `<M>.live.nif` + anchor byte-identical. No incremental live set built: at 51 ms against an 80 ms gate it could remove ~11 ms for a persisted graph, a delta classifier, a fallback rule and a byte-identity obligation on every live-set-SHRINKING edit (which needs the previous analysis, because minimality can only be rechecked by re-running the fixpoint). Also found: `devloop_ab.sh self.editbody`'s 5-round MEDIAN cannot measure `dceLive` -- its edit leaves `.dce.nif` byte-identical after round 0, so 4 of 5 rounds skip the node | merged from jit/h1 |
 | upstream merge chain | merged (`MERGE.md`): the six commits master gained after the fork point, one branch per commit, plus the F1 respelling (`643569c2`) that `e1da48e9` requires and the nativenif re-pins `3ec73fef` and `9d7fcf78`. 795/795, boot 1 == 2 == 3, ctfe_diff 0, decl-stability 1/0/1/1. **Costs the edit loop 13.8 % cpu** (`self.editbody`, pre-chain `6870790c` against post-chain `95fff89d` interleaved in one run; editcall 1.147, editdead 1.156, cold 1.072, no-change 1.000, peak RSS unmoved). Decomposed commit by commit into five interleaved runs whose product is 1.137 against the 1.138 measured end to end: **`c6be04e1` "no globals in nifcore" 1.057** and **`e1da48e9` "nifsyms refactor" (with its pin) 1.066** are the whole of it, both putting an indirection on the pipeline's hottest read; steps 1-3 together 0.998, step 5 1.005, and OUR F1 respelling **1.006**, i.e. nothing in the number is ours. Tested and rejected as a fix: memoizing `decldigest`'s per-token spelling (1.074 -> 1.070, digests bit-identical). The headline against the fork point is therefore 2.58 -> 1.02 s wall on the live edit (was 2.30 -> 0.92 before the chain) | run 19/20, `bench/results/2026-09-07/postchain.txt` |
-| B4, B5 | planned | |
+| B4 | stage 1 done (`notes/b4.md`), stages 2-6 planned. **1a** (the design question the staging existed to catch): the trace-table walk is the SAME mechanism as `lib/std/stacktraces.nim` -- a synchronous walk of the guest's own stack, because `cfaOff` is valid only past the prologue (`tracetable.nim:36-39`) and an out-of-process guest cannot be reached across the boundary without the entitlement B0's design refuses (`hostrun.nim:28-34`). Not a different phase; and the arm64 gap is SMALLER than estimated if the walk is loader-side (nothing from arkham), LARGER by one intrinsic if it is guest-side (`bl` leaves the return address in `lr`, so an arm64 naked proc's SP points at no slot). **1b**: `src/nimony/guestwire.nim` (socketpair on fd 3, length-framed records, `posix_spawn`, signal re-raise), `src/nimony/nimrun.nim` (the loader -- it calls `engine.runWholeProgram`, so out-of-process is not a second implementation), `engine.runWholeProgramOutOfProcess`, `nimony r --guest:inproc\|subprocess` (default `inproc`), `hastur build all` builds `nimrun`. Gate met: `tests/inproc/guest` runs two different programs from ONE host process, byte-identical stdout and exit status against two `nimony r` invocations, host thread count unchanged. 50 runs from one process: in-process 51 threads / +13.6 GB / 0.52 s, out-of-process 1 thread / 0 / 0.15 s | jit/b4 |
+| B5 | planned (retitled: Windows + linux/x86-64; three macOS/arm64 bullets struck as built or designed out) | |

@@ -40,6 +40,7 @@ when defined(nimonyEngine):
   # clone still builds a nimony -- one that says `r` needs that checkout
   # instead of pretending to have it (`compileProgram`'s `RunProject` arm).
   import engine
+  import guestwire
 
   proc cExit(code: cint) {.importc: "exit", header: "<stdlib.h>", noreturn.}
 
@@ -123,6 +124,12 @@ Options:
                             would exceed MB; 0 turns the rule off. The default
                             is physical memory / (32 * cores), clamped to
                             [128, 1024] MB
+  --guest:inproc|subprocess `nimony r`: `inproc` (default) assembles and runs
+                            the program in the compiler's own memory;
+                            `subprocess` runs it in a `nimrun` loader process,
+                            which is what isolates a crash and lets a compiler
+                            run many programs without leaking a parked thread
+                            and a 256 MB arena per run
   --no-blobcache            native backend: assemble every reachable proc from
                             scratch instead of reusing nifasm's per-symbol code
                             cache under <nimcache>/blobcache. The cache is on by
@@ -262,6 +269,14 @@ type
       ## what an in-process call must not have: the engine hands the strings to
       ## the guest's `main` one pointer at a time, so a `quoteShell` would put
       ## the quotes into argv.
+    guestOutOfProcess: bool
+      ## `nimony r --guest:subprocess`: run the program in a `nimrun` process
+      ## instead of in this one (JIT.md 7.3, `src/nimony/guestwire.nim`).
+      ## Off by default, because in-process is what every measured number in
+      ## `bench/` was taken with and a `nimony r` process runs one program and
+      ## exits, so the parked thread and the arena it cannot release both live
+      ## for milliseconds. It is `nimony dev` -- many programs, one compiler --
+      ## that has to have the boundary.
 
 proc createCmdOptions(baseDir: sink string): CmdOptions =
   CmdOptions(
@@ -270,6 +285,7 @@ proc createCmdOptions(baseDir: sink string): CmdOptions =
     fullRebuild: false,
     buildFlags: {},
     doRun: false,
+    guestOutOfProcess: false,
     moduleFlags: {},
     config: initNifConfig(baseDir),
     commandLineArgs: "",
@@ -466,6 +482,17 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
           of "profile":
             c.buildFlags.incl Profile
             forwardArg = false
+          of "guest":
+            # `nimony r` only. NOT forwarded: a `nimony s` sub-compile runs no
+            # program, and the CTFE engine's own guest is a different question
+            # with its own switch (`--ctfe:subprocess`).
+            case val.normalize
+            of "inproc", "in-process", "": c.guestOutOfProcess = false
+            of "subprocess", "outofprocess", "out-of-process":
+              c.guestOutOfProcess = true
+            else:
+              quit "invalid value for --guest; expected inproc or subprocess"
+            forwardArg = false
           of "no-blobcache", "noblobcache":
             # NOT forwarded, like `--vfs`: a `nimony s` sub-compile never
             # reaches a native link node, and the one setting that has to
@@ -575,16 +602,25 @@ proc runProject(c: var CmdOptions) =
     if target.exe.len > 0: argv.add target.exe
     else: argv.add project
     for a in c.programArgs: argv.add a
+    let program = RunProgram(backendDir: target.backendDir,
+                             mainModule: target.mainModule,
+                             argv: argv,
+                             verbose: c.config.verbose,
+                             profile: Profile in c.buildFlags or
+                                      c.config.verbose,
+                             blobCacheDir: blobDir)
     var e = initEngine()
-    let r = runWholeProgram(e, RunProgram(backendDir: target.backendDir,
-                                          mainModule: target.mainModule,
-                                          argv: argv,
-                                          verbose: c.config.verbose,
-                                          profile: Profile in c.buildFlags or
-                                                   c.config.verbose,
-                                          blobCacheDir: blobDir))
+    let r = if c.guestOutOfProcess: runWholeProgramOutOfProcess(program)
+            else: runWholeProgram(e, program)
     case r.outcome
     of roRan:
+      if r.signal != 0:
+        # Only the out-of-process path can get here: the guest died from a
+        # signal in the loader, and `nimony r` is transparent about what the
+        # program said, so the same signal is raised here rather than turned
+        # into an ordinary `128 + n` exit code that merely prints the same
+        # number (`guestwire.reraiseAsGuestDid`).
+        reraiseAsGuestDid r.signal
       exitAs r.status
     of roRefused:
       # No fallback here. JIT.md 7.5's C-backend fallback is for compile-time
