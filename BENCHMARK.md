@@ -82,6 +82,16 @@ Notes that cost hours to learn:
   "did this change move the loop", interleave the two branches being compared
   and read that run's ratio alone.
 
+- **A base is a BUILT TOOLCHAIN, not a commit.** The main checkout being at the
+  tip commit does not make its `bin/` the tip's toolchain. Measured this way in
+  the B4 stage-1 run: `devloop_ab.sh /Users/chanc/Projects/nimony <branch>
+  self.editbody 5` read **1.127 cpu**, an apparent 13 % regression, because the
+  main tree's `bin/nimony` was built at 15:50 and `6870790c` landed at 15:55 --
+  so the ratio was the merge chain (run 20: 1.138), not the change. Against
+  `/tmp/merge-u1`, which holds a build of the same code, the same change read
+  **1.003**. Check `ls -l bin/nimony` against the commit date before believing
+  a ratio, and prefer a worktree you built yourself as the base.
+
 - **What `/tmp/devloop_base`'s assembler actually is.** Its `bin/arkham` and
   `bin/nifasm` have neither `--blobcache` nor `--asmcache`, so they predate
   B3/B3e and they predate BOTH upstream nativenif re-pins (`3ec73fef`,
