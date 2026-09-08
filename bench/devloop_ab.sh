@@ -8,10 +8,12 @@
 # Usage: bench/devloop_ab.sh <toolchain-A> <toolchain-B> [scenario] [rounds]
 #   scenario: stdlib.forced (default) | stdlib.cold | hello.forced | ctfe.forced
 #             | self.editbody (a statement inserted into a called proc of sem.nim)
-#             | self.editbody2 (the same SHAPE of edit, in a different module:
-#                `registerHook` in semdecls.nim -- a second instance, so a result
-#                is not read off one proc in the largest module)
-#             | self.editdead (a private, never-called proc appended: DCE removes it)
+#             | self.editbody2 (the same shape of edit, a different PROC --
+#                `registerHook`, which `sem.nim` includes, so same module)
+#             | self.editbody3 (the same shape, a genuinely different MODULE:
+#                `fetchSymKind` in typenav.nim, imported by derefs/contracts_fir
+#                and by hexer's lambdalifting/lengcgen -- cross-module and
+#                cross-tool)
 #             | self.editcall (a new proc AND a call to it from semStmt: the call graph changes)
 #             | self.nochange (rebuild with nothing edited: the no-op floor)
 #             | self.cold | self.run   (native backend; BACKEND=c for the C path)
@@ -38,7 +40,7 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
-  self.editbody|self.editbody2|self.editdead|self.editcall|self.nochange|self.cold|self.run)
+  self.editbody|self.editbody2|self.editbody3|self.editdead|self.editcall|self.nochange|self.cold|self.run)
     # The compiler compiling itself (fork-point sources, copied per side) with
     # the native backend; `self.run` is `nimony r ... --version`.
     selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
@@ -55,7 +57,7 @@ A=$(cd "$A" && pwd); B=$(cd "$B" && pwd)
 cmdfor() {  # cmdfor <side> <nc> -> prints the command line
   eval "t=\$$1"
   case $scen in
-    self.editbody|self.editbody2|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.editbody|self.editbody2|self.editbody3|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.nochange|self.cold) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
     *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
@@ -80,6 +82,16 @@ case $scen in
   self.editbody2) prep='sed -i "" "/^proc registerHook(c: var SemContext; obj: SymId, symId: SymId, op: HookKind; isGeneric: bool) =\$/a\\
   if isGeneric: discard $i
 " $work/self_$side/src/nimony/semdecls.nim' ;;
+  # A genuinely CROSS-MODULE instance: `typenav.nim` is imported, not
+  # included, and `fetchSymKind` is public and called from `derefs.nim` and
+  # `contracts_fir.nim` as well as hexer's `lambdalifting.nim` and
+  # `lengcgen.nim` -- so the edit must propagate across module boundaries and
+  # across tools, which editbody/editbody2 (one translation unit) do not test.
+  # `c.current` is a ref the proc's own body compares against nil, so the
+  # guard cannot be folded away.
+  self.editbody3) prep='sed -i "" "/^proc fetchSymKind\*(c: var TypeCache; s: SymId): SymKind =\$/a\\
+  if c.current != nil: discard $i
+" $work/self_$side/src/nimony/typenav.nim' ;;
   self.editdead) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
   # A live edit that also changes the CALL GRAPH every round: a new private
   # proc, and a call to it from `semStmt`. That is what re-runs `dceLive`

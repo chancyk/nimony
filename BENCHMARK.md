@@ -41,10 +41,24 @@ better third test.
 Run both. On 2026-09-08 they disagreed sharply, and the disagreement is the
 useful part:
 
-| scenario | fork point cpu | ordering+lent fixes only | full branch |
-|---|---|---|---|
-| `self.editbody` | 3.82 s | 1.85 s (0.52) | 1.05 s (0.277) |
-| `self.editbody2` | 3.96 s | **3.12 s (0.79)** | 1.03 s (0.260) |
+| scenario | what it edits | fork point cpu | ordering+lent only | full branch |
+|---|---|---|---|---|
+| `self.editbody` | `semStmt`, sem.nim | 3.82 s | 1.85 s (0.52) | 1.05 s (0.277) |
+| `self.editbody2` | `registerHook` -- a different PROC of the same unit | 3.96 s | **3.12 s (0.79)** | 1.03 s (0.260) |
+| `self.editbody3` | `fetchSymKind`, typenav.nim -- a different MODULE | 3.37 s | 1.24 s (0.367) | **0.386 s (0.118)** |
+
+`editbody3` is the cross-module case: `typenav.nim` is imported rather than
+included, and `fetchSymKind` is public and called from `derefs.nim`,
+`contracts_fir.nim` and from hexer's `lambdalifting.nim` and `lengcgen.nim`,
+so the edit has to cross both a module and a tool boundary. Both toolchains
+are FLAT across six rounds on it -- no cliff -- and it is where the full
+branch looks best of all three: **0.118**, a 0.277 s wall rebuild, because a
+body-only edit to a small module is exactly what declaration-stable output
+(F1/F2) plus the per-proc caches (B3d/B3e) are built to contain. The two-fix
+toolchain improves it 2.7x; the full branch improves it 8.5x.
+
+Read the three together. A fix's worth swings by 2x across them, and the
+ordering of which toolchain wins by how much is not the same in any two.
 
 `editbody2` also is not flat across rounds on a toolchain that has only the
 DCE serialization-order fix: rounds 0-1 cost 1.82 s and rounds 2+ cost 3.12 s.
