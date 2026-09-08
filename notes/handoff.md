@@ -31,31 +31,49 @@ Read in this order: `SUMMARY.md` (what changed and why), `JIT_IMPL.md`
 
 ## In flight
 
-**B4 stage 1, on `jit/b4`** (worktree `/tmp/b4/nimony`, with its nativenif
-sibling worktree `/tmp/b4/nativenif` on `jit/b4-native`, still AT the pin
-`9d7fcf78` -- stage 1 needed no nativenif change). `notes/b4.md` is the
-write-up. Two things landed:
+**B4 is complete on `jit/b4` and its gate is met**, worktree `/tmp/b4/nimony`
+with its nativenif sibling `/tmp/b4/nativenif` on `jit/b4-native`.
+`notes/b4.md` is the write-up (stage 1 first, then stage 2).
 
-* **1a, the design question the staging existed to catch**, is answered and did
-  not change the phase: JIT.md 7.4's trace-table walk is the SAME mechanism as
-  `lib/std/stacktraces.nim` -- a synchronous walk of the guest's own stack --
-  because the table's `cfaOff` is defined only past the prologue and an
-  out-of-process guest cannot be reached across the boundary without the
-  entitlement B0's design refuses. Corrections to the memo's sizing are in
-  `notes/b4.md` §1a; the short version is that a loader-side walk needs
-  nothing from arkham and a guest-side one needs THREE intrinsics, not two.
-* **1b, the `nimrun` out-of-process guest**, is built and gated:
-  `src/nimony/guestwire.nim`, `src/nimony/nimrun.nim`,
-  `engine.runWholeProgramOutOfProcess`, `nimony r --guest:inproc|subprocess`
-  (default `inproc`), `hastur build all` builds `nimrun` beside `nimony`, and
-  `tests/inproc/guest` is the gate. `tests/nimony_r` gained five differential
-  checks against the in-process run.
+**`src/nativenif.commit` now pins `ad886112`, which is on `jit/b4-native` and
+is NOT PUSHED.** That branch has to reach the owner's fork before anything
+depends on the pin: nativenif's `origin` is nim-lang upstream and `fork` is the
+owner's, and pushing is the owner's action. The commit is two three-line
+additions -- `AsmSession.wantTraceTable` and `MemImage.traceTable` -- and
+nothing else in nativenif moved.
 
-Stage 2 (layout sidecar, classifier, slot-swap policy, the walk, the watcher,
-restart diagnostics, and a demo application that has to be WRITTEN) has not
-started. Worktrees alive: the main tree, `/tmp/devloop_base`, `/tmp/merge-u1`,
-`/tmp/prechain`, `/tmp/b4/nimony`; in nativenif, the main checkout,
-`/tmp/u6/nativenif` and `/tmp/b4/nativenif`.
+What B4 built, in one list:
+
+* `src/nimony/guestwire.nim`, `src/nimony/nimrun.nim`,
+  `engine.runWholeProgramOutOfProcess` -- the out-of-process guest, and
+  `nimony r --guest:inproc|subprocess` (default `inproc`, so no measured
+  number moved).
+* `src/nimony/devwalk.nim` -- the trace-table stack walk, run by the LOADER on
+  the guest's thread inside the safepoint intercept. Needs nothing from arkham.
+* `src/nimony/devclassify.nim` -- reload or restart, with a reason. No layout
+  sidecar; `notes/b4.md` argues why one is not needed for soundness.
+* `src/nimony/devhost.nim` -- the swap: re-assemble, relay the code into free
+  arena space against the LIVE data region, walk, patch entries through slots.
+* `src/nimony/devdriver.nim` + `nimony dev` -- the loop, the watcher
+  (`--dev-interval`), `--dev-max-edits`, and the restart diagnostics.
+* `lib/std/devreload.nim` -- `devPoll()`, the safepoint. In `tall.nim`.
+* `tests/dev/` -- the demo application and the gate; `tests/inproc/guest/` --
+  stage 1's gate.
+
+Two things a next session should know before touching it:
+
+* **JIT.md 7.3's build-time slot indirection does not exist in either tool**,
+  and B4 does not build it (`notes/b4.md` §2 has the citations). The reload
+  installs the same indirection at the first reload instead. Building the
+  `extproc` route later would make a reload assemble ONE module instead of the
+  whole program -- 0.02 s against 0.09 s, an optimization.
+* **A define set with `config.addDefine` does not reach the child that sems the
+  program.** It has to go into `c.commandLineArgs` too. Cost an hour; the
+  symptom looks exactly like a broken reloader.
+
+Nothing else is in flight. Worktrees alive: the main tree, `/tmp/devloop_base`,
+`/tmp/merge-u1`, `/tmp/prechain`, `/tmp/b4/nimony`; in nativenif, the main
+checkout, `/tmp/u6/nativenif` and `/tmp/b4/nativenif`.
 
 ## How a phase is merged (the routine used throughout)
 

@@ -28,6 +28,7 @@ import std/compilation
 import std/complex
 import std/cpuinfo
 import std/deques
+import std/devreload
 import std/dirs
 import std/editdistance
 import std/encodings

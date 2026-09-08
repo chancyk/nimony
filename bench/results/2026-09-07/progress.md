@@ -424,3 +424,28 @@ merge chain (run 20: 1.138), not the change. Run 19 measured the head from
 `bin/nimony` against the commit date before believing a ratio, or rebuild the
 base. The main checkout is not a safe default base while it holds an older
 build than its own HEAD.
+
+---
+
+## Run 22: B4 stage 2 against its parent -- interleaved
+
+A = `/tmp/merge-u1` (`95fff89d`, the code `jit/b4` branched from), B =
+`/tmp/b4/nimony` (`jit/b4`, the whole phase). Raw rounds:
+`bench/results/2026-09-07/b4stage2.txt`.
+
+| scenario | A wall / cpu / peak MB | B wall / cpu / peak MB | B/A cpu | B/A rss |
+|---|---|---|---|---|
+| `self.editbody` | 1.043 / 1.068 / 107 | 1.055 / 1.074 / 107 | **1.006** | 1.00 |
+
+Neutral, and it has to be: B4 adds five modules, a stdlib module, two nifasm
+fields and a command, and no compile-graph node reaches any of them.
+`nimony r --guest:subprocess` is opt-in and `nimony dev` is a different command,
+so the measured path is the one that was measured before.
+
+For the record, the numbers the PHASE is about, which `devloop_ab` has no
+scenario for:
+
+| | in-process | through `nimrun` |
+|---|---|---|
+| 50 runs from one host process | 51 threads, +13.56 GB mapped, 0.52 s | 1 thread, no growth, 0.15 s |
+| a body-edit reload of the demo, edit to new code running | -- | one rebuild (~1 s) plus a 0.09 s re-assemble and one 12-byte store |

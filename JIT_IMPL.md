@@ -778,35 +778,64 @@ Steps, in order:
    **Done** -- `src/nimony/guestwire.nim`, `src/nimony/nimrun.nim`,
    `engine.runWholeProgramOutOfProcess`, `nimony r --guest:subprocess`,
    `tests/inproc/guest`; `notes/b4.md`.
-2. **layout sidecar and classifier** (safe/unsafe edit). Platform-neutral, and
-   materially cheaper than when JIT.md was written: F1/F2 built line-info-blind
-   per-declaration digests (`src/hexer/decldigest.nim`, `<mod>.decls.nif`), B3d
-   built the asm-side twin (`nativenif/src/arkham/core/asmdecls.nim`), and
-   B3e's fragment key already folds in every proc SIGNATURE -- which is most of
-   an interface checksum.
-3. **slot swap with generation counter.** Policy, not mechanism; see the B3
-   bullet above.
-4. **the trace-table stack walk.** `notes/b4.md` §1a settles whose stack it
+2. **the trace-table stack walk.** `notes/b4.md` §1a settles whose stack it
    is: the table's `cfaOff` is valid only past the prologue
    (`nativenif/src/nifasm/image/tracetable.nim:36-39`), so no asynchronous seed
    can start it -- the walk is synchronous, in the guest's address space,
-   seeded by a call the guest made. Two ways to build it, argued there: a
-   guest-side self-walk, which is `lib/std/stacktraces.nim` and needs two RISC
-   intrinsic lowerings PLUS a new one for the seed (`bl` leaves the return
-   address in `lr`, so an arm64 naked proc's SP points at no slot), two widened
-   target sets and a restructured seed; or a loader-side walk seeded inside an
-   intercept, which needs **nothing from arkham** and two small nifasm
-   additions (force `ctx.traceUsed`; put the table's address on `MemImage`).
-   The second is recommended for B4; arm64 `getStackTrace` is its own item.
-5. **`nimony dev` watcher and restart diagnostics.** OS-specific, not
-   CPU-specific; macOS is served by `lib/std/posix/kqueue.nim`, already here.
-6. **a demo application, which has to be written.** `examples/` holds only
-   one-shot tutorial scripts that run to completion, and JIT.md:638 already
-   said the phase "needs a real demo application to be judged". Two hard
-   constraints from the runtime: single-threaded (`image/memory.nim:27-38`
-   refuses an image carrying a thread-local, and `std/rawthreads` has no
-   `nimNoLibc` arm on macOS), and a long-lived loop with a reloadable body,
-   since the gate is "survives a body edit without restart".
+   seeded by a call the guest made. **Done** (`src/nimony/devwalk.nim`), as the
+   loader-side variant: the guest reaches a safepoint by calling
+   `nimony_dev_poll` (`lib/std/devreload.nim`), an ordinary external, and the
+   loader's intercept answers it ON THE GUEST'S THREAD in a frame the guest
+   called -- so the seed is synchronous by construction and the walk is host Nim
+   over shared memory. Needs **nothing from arkham**; the two nifasm additions
+   are `AsmSession.wantTraceTable` and `MemImage.traceTable` (nativenif
+   `ad886112`). arm64 `getStackTrace` is its own item -- see the small-items
+   list, where its cost is now derived rather than estimated.
+3. **the loader stays alive across the program's life.** **Done**: `swap` on
+   the same framing, `swapped`/`deferred`/`failed` back,
+   `GuestChannel.hasPending` so the safepoint's check does not block, and
+   `engine.startDevGuest`/`askSwap`/`pollDevGuest`/`stopDevGuest`. A restart is
+   `SIGTERM` and a fresh loader, not a verb -- the half of JIT.md 7.4's "or
+   restart the guest" that only a process boundary can do.
+4. **the classifier.** **Done** (`src/nimony/devclassify.nim`): every
+   `<mod>.c.nif` reduced to (tag, header digest, body digest) with F1's
+   `decldigest.digestTree`, so an inserted line does not make every declaration
+   below it look changed. **No layout sidecar, and it is not needed for
+   soundness**: the classifier says *reload* only when every changed declaration
+   in every module is a proc whose header is unchanged, and a type's layout can
+   only move if it or something it embeds was edited -- both of which are
+   declarations it compares. The sidecar JIT.md 7.4 names would let it say yes
+   more often (a field that moves no offset), not more correctly. `.decls.nif`
+   is not enough on its own: `DeclDigest` has `input` and `output` and no notion
+   of KIND or of the signature/body line, which are exactly the two answers.
+5. **slot swap with generation counter.** **Done**, and not the way JIT.md 7.3
+   describes -- see the B3 bullet above and `notes/b4.md` §2. The `extproc`
+   path cannot provide the build-time half: arkham classifies `extproc` from the
+   Leng declaration alone (`core/programs.nim`'s `collect`, `ProcS`) with no
+   flag to force it, and nifasm follows a foreign symbol into its module
+   unconditionally (`core/typesem.lookupWithAutoImport`) with no exclusion set.
+   So the same indirection is installed at the FIRST RELOAD instead: the whole
+   edited program is re-assembled, its code laid into free arena space with the
+   LIVE data region as its data addresses, and each replaced proc's entry
+   overwritten with `emitA64Stub`'s 12-byte stub through a slot. Strictly more
+   general (it catches intra-module direct calls, which the extproc route would
+   not) and it costs a program that never reloads nothing at all.
+6. **`nimony dev`, its watcher and its restart diagnostics.** **Done**
+   (`src/nimony/devdriver.nim`, `--dev-interval`, `--dev-max-edits`). The
+   watcher is polled modification times: `lib/std/posix/kqueue.nim` is the
+   event-driven answer but it is the NIMONY standard library, and `nimony`
+   itself is compiled by `nim c`. An event-driven watcher is a self-contained
+   follow-up.
+7. **a demo application, which had to be written.** **Done**
+   (`tests/dev/demo.nim`). `examples/` holds only one-shot tutorial scripts that
+   run to completion, and JIT.md:638 already said the phase "needs a real demo
+   application to be judged". Two hard constraints from the runtime:
+   single-threaded (`image/memory.nim:27-38` refuses an image carrying a
+   thread-local, and `std/rawthreads` has no `nimNoLibc` arm on macOS), and a
+   long-lived loop with a reloadable body. Its three procs are three different
+   cases on purpose, and `{.noinline.}` on the reloadable ones is the phase's
+   one user-visible constraint -- an inlined proc has no entry to redirect,
+   which is what JIT.md 7.4 means by "safe: NON-INLINE body edits".
 
 Gate: a demo application survives a body edit without restart and restarts
 with a named reason on a signature edit.
@@ -908,6 +937,25 @@ machine, with one script. The rule, from 2026-09-06 on:
   `bench/results/2026-09-07/small-items.txt`.
 - `std/rawthreads` has no `nimNoLibc` arm outside linux/x64 (B0); it keeps
   the stdlib-wide corpus off the native backend on macOS.
+- **`lib/std/stacktraces.getStackTrace` on arm64.** Out of B4 by decision (B4
+  builds the loader-side walk, which needs nothing from arkham). The stdlib
+  feature is FIVE items, not the two an earlier estimate had, and the extra one
+  is not obvious: the step rule is identical on both targets (work it out from
+  `image/dwarf.bodyCfaOff` -- x86-64 seeds the entry CFA at 8 and AArch64 at 0,
+  and the step from frame P's return-address slot to its caller Q's is
+  `cfaOff(Q)` either way), but the SEED is not. On x86-64 a `{.naked.}` proc's
+  entry SP points AT the caller's pushed return address, which is why
+  `callerFrame()` is four lines. On AArch64 `bl` leaves the return address in
+  `lr` and does not move SP, so at a naked proc's entry there is no slot holding
+  a pc at all: the seed is the pair (`sp - 8`, `lr`), and `lr` is not reachable
+  through either existing intrinsic. So: RISC lowerings for `StackPointerOp` and
+  `TraceTableOp` (the latter is one line -- `risc/emit.emAdr` already is the
+  ADRP+ADD), **a new `ReturnAddress` intrinsic**, `TraceTable`'s `targets`
+  widened to `{tgX64, tgA64}`, `stackTracesAvailable` widened, and a
+  restructured seed in `getStackTrace` so the innermost pc comes from a value on
+  one target and from a slot on the other. Nothing in nifasm has to change:
+  `arm64/operands.nim:315` already flips `traceUsed` when the symbol is
+  referenced. `notes/b4.md` §1a derives it.
 - nifasm's foreign-symbol lookup is the 0.07 s left in B3's incremental
   link (notes/b3.md): a symbol-table cache beside the fragments. Done (B3c).
 - `--threads:off` for hexer, lengc, nifler and the nimony driver: -6 % on
@@ -974,5 +1022,5 @@ machine, with one script. The rule, from 2026-09-06 on:
 | B3e | merged (pin nativenif 5f6f011) -- done on `jit/b3e` + nativenif `jit/b3e-native` (`notes/b3e.md`): `--asmcache:DIR` writes a `<mod>.arkham.nif` sidecar holding each proc's line-info-blind `.c.nif` digest and the BYTE RANGE its text occupies in the `.asm.nif` beside it -- no generated byte is stored, the text is copied out of the module's own previous output whose content hash the sidecar records, so the two cannot disagree. A spliced proc is a `(arkhamsplice n)` marker in the token buffer (a remembered position does not survive `finish`'s peephole) and replays what it owed the module (`rodata`, whose names are minted from the running count, and the two firmware divider flags). The key: arkham's build id + target + every non-proc declaration + every proc SIGNATURE + the ANSWERS of `cleanSigProcNames`/`noReturnProcs` (the latter walks every body, so a body edit can change another proc's frame); hexer's `(smry ...)` is excluded -- it is computed from the proc's own body and made every signature a function of it (0 of 526 spliced until that was found). Cross-module: the file stamp is asked first, and a stamp that MOVED asks about the declarations this lowering actually read out of that module, per PROC -- `notes/b3d.md` §3.3's per-reference rule one tool earlier. Live edit: 523 of 526, 76 of 78 and 8 of 9 procs spliced, arkham 0.259 -> 0.089 s, `sem.nim` alone 196 -> 63 ms; cold -2 %; headline 2.61 -> 0.92 s. Byte-identical: 651 splice self-test checks over five corpus/target pairs in eight states, 0 of 127 compiler modules differ cached vs not (also with the cache populated before the edit: 4045 procs spliced, 0 differ), the linked compiler identical, refactor gate identical to `7b838ec`, boot 1 == 2 == 3 | nativenif 5f6f011 |
 | H1 | NOT built as scoped -- the premise was a measurement artifact (`notes/h1.md`, `bench/results/2026-09-07/h1.txt`): `dceLive`'s 0.36 s was not the whole-program recomputation but an accidental deep copy. `markLive` took `moduleGraphs` non-`var`, so every lookup bound `compat2`'s BY-VALUE `getOrQuit` and `let graph = moduleGraphs.getOrQuit(moduleName)` copied a whole `ModuleAnalysis` (a `Table[SymId, HashSet[SymId]]` plus two `HashSet`s) on each of the 7867 worklist pops, plus the dependency set on top. Reading the 131 `.dce.nif` is 19 ms and the fixpoint is 7 ms; the other 305 ms was copying. Taking the table as `var` and never materializing the intermediate: `hexer dl` 0.36 -> 0.05 s, in-build `dceLive` 0.367 -> 0.062 s (gate <= 0.08), first-rebuild-after-an-edit wall 1.39 -> 1.10 s, cold 5.08 -> 4.79 s, all 131 `<M>.live.nif` + anchor byte-identical. No incremental live set built: at 51 ms against an 80 ms gate it could remove ~11 ms for a persisted graph, a delta classifier, a fallback rule and a byte-identity obligation on every live-set-SHRINKING edit (which needs the previous analysis, because minimality can only be rechecked by re-running the fixpoint). Also found: `devloop_ab.sh self.editbody`'s 5-round MEDIAN cannot measure `dceLive` -- its edit leaves `.dce.nif` byte-identical after round 0, so 4 of 5 rounds skip the node | merged from jit/h1 |
 | upstream merge chain | merged (`MERGE.md`): the six commits master gained after the fork point, one branch per commit, plus the F1 respelling (`643569c2`) that `e1da48e9` requires and the nativenif re-pins `3ec73fef` and `9d7fcf78`. 795/795, boot 1 == 2 == 3, ctfe_diff 0, decl-stability 1/0/1/1. **Costs the edit loop 13.8 % cpu** (`self.editbody`, pre-chain `6870790c` against post-chain `95fff89d` interleaved in one run; editcall 1.147, editdead 1.156, cold 1.072, no-change 1.000, peak RSS unmoved). Decomposed commit by commit into five interleaved runs whose product is 1.137 against the 1.138 measured end to end: **`c6be04e1` "no globals in nifcore" 1.057** and **`e1da48e9` "nifsyms refactor" (with its pin) 1.066** are the whole of it, both putting an indirection on the pipeline's hottest read; steps 1-3 together 0.998, step 5 1.005, and OUR F1 respelling **1.006**, i.e. nothing in the number is ours. Tested and rejected as a fix: memoizing `decldigest`'s per-token spelling (1.074 -> 1.070, digests bit-identical). The headline against the fork point is therefore 2.58 -> 1.02 s wall on the live edit (was 2.30 -> 0.92 before the chain) | run 19/20, `bench/results/2026-09-07/postchain.txt` |
-| B4 | stage 1 done (`notes/b4.md`), stages 2-6 planned. **1a** (the design question the staging existed to catch): the trace-table walk is the SAME mechanism as `lib/std/stacktraces.nim` -- a synchronous walk of the guest's own stack, because `cfaOff` is valid only past the prologue (`tracetable.nim:36-39`) and an out-of-process guest cannot be reached across the boundary without the entitlement B0's design refuses (`hostrun.nim:28-34`). Not a different phase; and the arm64 gap is SMALLER than estimated if the walk is loader-side (nothing from arkham), LARGER by one intrinsic if it is guest-side (`bl` leaves the return address in `lr`, so an arm64 naked proc's SP points at no slot). **1b**: `src/nimony/guestwire.nim` (socketpair on fd 3, length-framed records, `posix_spawn`, signal re-raise), `src/nimony/nimrun.nim` (the loader -- it calls `engine.runWholeProgram`, so out-of-process is not a second implementation), `engine.runWholeProgramOutOfProcess`, `nimony r --guest:inproc\|subprocess` (default `inproc`), `hastur build all` builds `nimrun`. Gate met: `tests/inproc/guest` runs two different programs from ONE host process, byte-identical stdout and exit status against two `nimony r` invocations, host thread count unchanged. 50 runs from one process: in-process 51 threads / +13.6 GB / 0.52 s, out-of-process 1 thread / 0 / 0.15 s | jit/b4 |
+| B4 | **merged-ready on `jit/b4`; the gate is met** (`notes/b4.md`). **Stage 1 -- 1a**, the design question the staging existed to catch: the trace-table walk is the SAME mechanism as `lib/std/stacktraces.nim` -- synchronous, in the guest's address space -- because `cfaOff` is valid only past the prologue (`tracetable.nim:36-39`) and an out-of-process guest cannot be reached across the boundary without the entitlement B0's design refuses (`hostrun.nim:28-34`). **1b**: `guestwire.nim` (socketpair on fd 3, length-framed records, `posix_spawn`, signal re-raise), `nimrun.nim` (the loader -- it calls `engine.runWholeProgram`, so out-of-process is not a second implementation), `runWholeProgramOutOfProcess`, `nimony r --guest:inproc\|subprocess` (default `inproc`); 50 runs from one host process: in-process 51 threads / +13.6 GB / 0.52 s, out-of-process 1 thread / 0 / 0.15 s. **Stage 2**: the `extproc` path CANNOT provide JIT.md 7.3's build-time slot indirection (arkham classifies `extproc` from the Leng decl alone with no flag; nifasm follows a foreign symbol into its module with no exclusion set) -- so the same indirection is installed at the FIRST RELOAD instead: re-assemble the whole edited program, lay its code into free arena space with the LIVE data region as its data addresses (`MemRegion` separates `at` from `vaddr` for exactly this), walk the guest's stack at a safepoint, and overwrite each replaced proc's entry with `emitA64Stub`'s 12-byte stub through a slot. `devwalk.nim` (the walk), `devclassify.nim` (the classifier -- no layout sidecar needed for soundness, argued), `devhost.nim` (the swap), `devdriver.nim` + `nimony dev` (`--dev-interval`, `--dev-max-edits`), `lib/std/devreload.nim` (the safepoint), `tests/dev/` (the demo and the gate). Gate output: a body edit reloads at tick N+1 with the global counter intact and `devPoll()` reporting generation 1; a signature edit restarts with `restart: the signature of render changed`; the restarted guest is itself reloadable. nativenif `ad886112` adds `AsmSession.wantTraceTable` and `MemImage.traceTable`, both three lines. 795/795, boot 1 == 2 == 3, ctfe_diff 0, decl-stability 1/0/1/1, `self.editbody` neutral | jit/b4, nativenif ad886112 |
 | B5 | planned (retitled: Windows + linux/x86-64; three macOS/arm64 bullets struck as built or designed out) | |

@@ -105,15 +105,15 @@ speculation (JIT.md 2), and has an escape hatch to today's behaviour.
 
 ## Not done
 
-Hot reload / `nimony dev` (B4 stage 2: layout sidecar, classifier, slot-swap
-policy, the trace-table walk, the watcher, and a demo application that has to
-be written), the engine on linux/x64 and Windows (B5, arkham lacks x64
+The engine on linux/x64 and Windows (B5, arkham lacks x64
 `&threadvar` lowering under `--dev-single-thread`), an out-of-process guest
 **for compile-time evaluation** (a guest fault kills nimsem today;
-`--ctfe:subprocess` is the answer -- B4 stage 1 built the out-of-process
-guest for whole PROGRAMS, `nimony r --guest:subprocess` and
-`src/nimony/nimrun.nim`, which is a different customer with a different
-contract), a `nimNoLibc` arm of `std/rawthreads` on macOS, hexer's
+`--ctfe:subprocess` is the answer -- B4 built the out-of-process guest for
+whole PROGRAMS, `nimony r --guest:subprocess` and `src/nimony/nimrun.nim`,
+which is a different customer with a different contract), a `nimNoLibc` arm of
+`std/rawthreads` on macOS, an event-driven `nimony dev` watcher (it polls
+modification times today), `getStackTrace` on arm64 (JIT_IMPL.md's small items
+has its five parts), hexer's
 declaration-level incremental `expand` (B3b's last half: F1/F2 made the
 inputs and outputs declaration-stable and arkham/nifasm already work per
 proc; hexer itself still lowers the whole module, 0.27 s on `sem.nim`, floor

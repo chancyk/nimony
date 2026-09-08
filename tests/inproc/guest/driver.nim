@@ -72,7 +72,7 @@ proc runOne(p: Program; d: var Driver) =
   let r = runWholeProgramOutOfProcess(
     RunProgram(backendDir: p.backendDir, mainModule: p.mainModule,
                argv: @[p.mainModule], verbose: false, profile: false,
-               blobCacheDir: p.blobDir))
+               blobCacheDir: p.blobDir, dev: false))
 
   flushFile stdout
   discard dup2(saved, 1)

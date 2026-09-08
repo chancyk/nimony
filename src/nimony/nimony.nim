@@ -41,6 +41,8 @@ when defined(nimonyEngine):
   # instead of pretending to have it (`compileProgram`'s `RunProject` arm).
   import engine
   import guestwire
+  import devdriver
+  import devclassify
 
   proc cExit(code: cint) {.importc: "exit", header: "<stdlib.h>", noreturn.}
 
@@ -124,6 +126,10 @@ Options:
                             would exceed MB; 0 turns the rule off. The default
                             is physical memory / (32 * cores), clamped to
                             [128, 1024] MB
+  --dev-interval:MS         `nimony dev`: how often the watcher looks at the
+                            source files (default 150)
+  --dev-max-edits:N         `nimony dev`: stop after N edits have been handled;
+                            0 (the default) runs until the program ends
   --guest:inproc|subprocess `nimony r`: `inproc` (default) assembles and runs
                             the program in the compiler's own memory;
                             `subprocess` runs it in a `nimrun` loader process,
@@ -197,7 +203,7 @@ proc processSingleModule(nimFile: string; config: sink NifConfig; moduleFlags: s
 type
   Command = enum
     None, SingleModule, FullProject, CheckProject, SemCheckNif, DocProject,
-    RunProject
+    RunProject, DevProject
 
 proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
   case key.normalize:
@@ -228,6 +234,20 @@ proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
     config.addDefine "nimNativeAlloc"
     config.addDefine "nimNativeIo"
     RunProject
+  of "dev":
+    # `nimony r`'s build, plus the safepoint. The `nimonyDev` define is what
+    # turns `std/devreload`'s `devPoll()` from a constant 0 into a call to an
+    # external the `nimrun` loader answers -- so a program built any other way
+    # carries none of this and has no unresolved symbol to link. It is added to
+    # the FORWARDED args in `devProject`, not here: `config.addDefine` sets the
+    # define for this process, and the process that sems the program is a
+    # child (measured -- a `dev` build whose define stopped at the parent runs
+    # a program whose `devPoll` is the `else` branch, so nothing ever reaches a
+    # safepoint and every reload waits forever).
+    config.backend = backendNative
+    config.addDefine "nimNativeAlloc"
+    config.addDefine "nimNativeIo"
+    DevProject
   of "w":
     # Wasm backend: Leng -> ithaqua, producing one whole-program `.wasm`
     # module (no C compiler, no linker — the JS/wasm host resolves the fixed
@@ -269,6 +289,15 @@ type
       ## what an in-process call must not have: the engine hands the strings to
       ## the guest's `main` one pointer at a time, so a `quoteShell` would put
       ## the quotes into argv.
+    devIntervalMs: int
+      ## `nimony dev --dev-interval:MS`: how often the watcher looks at the
+      ## files. Default 150 ms, which is far under a rebuild, so it is not what
+      ## bounds the loop -- it is here so a test can make the loop tight.
+    devMaxEdits: int
+      ## `nimony dev --dev-max-edits:N`: stop after N edits have been handled.
+      ## 0 is "until the program ends or you stop it". A test needs a loop that
+      ## FINISHES, because a harness that has to kill a watcher cannot tell
+      ## "done" from "hung".
     guestOutOfProcess: bool
       ## `nimony r --guest:subprocess`: run the program in a `nimrun` process
       ## instead of in this one (JIT.md 7.3, `src/nimony/guestwire.nim`).
@@ -286,6 +315,8 @@ proc createCmdOptions(baseDir: sink string): CmdOptions =
     buildFlags: {},
     doRun: false,
     guestOutOfProcess: false,
+    devIntervalMs: 150,
+    devMaxEdits: 0,
     moduleFlags: {},
     config: initNifConfig(baseDir),
     commandLineArgs: "",
@@ -482,6 +513,19 @@ proc handleCmdLine(c: var CmdOptions; cmdLineArgs: seq[string]; mode: CmdMode) =
           of "profile":
             c.buildFlags.incl Profile
             forwardArg = false
+          of "dev-interval", "devinterval":
+            c.devIntervalMs = parsePositiveInt(val)
+            if c.devIntervalMs < 1:
+              quit "invalid value for --dev-interval; expected milliseconds >= 1"
+            forwardArg = false
+          of "dev-max-edits", "devmaxedits":
+            if val == "0":
+              c.devMaxEdits = 0
+            else:
+              c.devMaxEdits = parsePositiveInt(val)
+              if c.devMaxEdits < 1:
+                quit "invalid value for --dev-max-edits; expected a count >= 1, or 0"
+            forwardArg = false
           of "guest":
             # `nimony r` only. NOT forwarded: a `nimony s` sub-compile runs no
             # program, and the CTFE engine's own guest is a different question
@@ -608,7 +652,8 @@ proc runProject(c: var CmdOptions) =
                              verbose: c.config.verbose,
                              profile: Profile in c.buildFlags or
                                       c.config.verbose,
-                             blobCacheDir: blobDir)
+                             blobCacheDir: blobDir,
+                             dev: false)
     var e = initEngine()
     let r = if c.guestOutOfProcess: runWholeProgramOutOfProcess(program)
             else: runWholeProgram(e, program)
@@ -632,6 +677,73 @@ proc runProject(c: var CmdOptions) =
   else:
     quit "nimony r needs the sibling `../nativenif` checkout at build time " &
          "(the compiler was built without `-d:nimonyEngine`); use `nimony n -r`"
+
+type
+  DevBuildCtx = object
+    ## What `devBuild` needs to run the build graph again, threaded to it
+    ## explicitly because `devdriver.BuildOnce` is a plain proc pointer and not
+    ## a closure (AGENTS.md).
+    opts: ptr CmdOptions
+    project: string
+    blobDir: string
+
+proc devBuild(ctx: pointer; backendDir, mainModule: var string): string
+              {.nimcall.} =
+  ## One rebuild of the whole program, exactly as `nimony r` builds it. The dev
+  ## loop calls this after every edit; everything incremental about it -- the
+  ## artifact store, the scheduler, B3's blob cache, B3e's asm splice -- is
+  ## already inside `buildGraphForRun`, which is why the loop does not have to
+  ## know what changed to be fast.
+  let c = cast[ptr DevBuildCtx](ctx)
+  let target = buildGraphForRun(c.opts[].config, c.project, c.opts[].buildFlags,
+                                c.opts[].commandLineArgs,
+                                c.opts[].commandLineArgsLengc,
+                                c.opts[].moduleFlags, c.opts[].passC,
+                                c.opts[].passL, linkExe = false)
+  if not target.ok: return "the build failed"
+  backendDir = target.backendDir
+  mainModule = target.mainModule
+  result = ""
+
+proc devProject(c: var CmdOptions) =
+  ## `nimony dev`: build, run, watch, reload. JIT.md 7.4; `src/nimony/devdriver.nim`
+  ## is the loop and this is the part that knows how a build is spelled.
+  when defined(nimonyEngine):
+    if c.config.targetCPU != nameToCPU(hostCPU) or
+       c.config.targetOS != nameToOS(hostOS):
+      quit "nimony dev runs the program on this machine, so it cannot cross " &
+           "compile (--cpu/--os name another target)"
+    makeDir(c.config.nifcachePath)
+    let project = c.args[0].addFileExt(".nim")
+    let blobDir = if blobCacheEnabled(c.config): blobCacheDir(c.config) else: ""
+    # The one flag that has to reach the child that sems the program, spelled
+    # the way the forwarding loop spells one.
+    c.config.addDefine "nimonyDev"
+    c.commandLineArgs.add " --define:nimonyDev"
+    var ctx = DevBuildCtx(opts: addr c, project: project, blobDir: blobDir)
+    var backendDir = ""
+    var mainModule = ""
+    let err = devBuild(addr ctx, backendDir, mainModule)
+    if err.len > 0:
+      quit "FAILURE: could not build " & project
+
+    var argv: seq[string] = @[project]
+    for a in c.programArgs: argv.add a
+    var loop = DevLoop(
+      opts: DevOptions(intervalMs: c.devIntervalMs, verbose: c.config.verbose,
+                       once: false, maxEdits: c.devMaxEdits),
+      watcher: initWatcher(project.parentDir.absolutePath,
+                           c.config.nifcachePath.absolutePath),
+      program: RunProgram(backendDir: backendDir, mainModule: mainModule,
+                          argv: argv, verbose: c.config.verbose,
+                          profile: Profile in c.buildFlags,
+                          blobCacheDir: blobDir, dev: true),
+      build: devBuild, buildCtx: addr ctx,
+      reloads: 0, restarts: 0, edits: 0)
+    exitAs run(loop)
+  else:
+    quit "nimony dev needs the sibling `../nativenif` checkout at build time " &
+         "(the compiler was built without `-d:nimonyEngine`)"
 
 proc compileProgram(c: var CmdOptions) =
   if c.config.backend == backendNative and c.config.appType notin {appConsole, appGui}:
@@ -735,6 +847,8 @@ proc compileProgram(c: var CmdOptions) =
       c.passC, c.passL, c.executableArgs
   of RunProject:
     runProject(c)
+  of DevProject:
+    devProject(c)
 
 when isMainModule:
   var c = createCmdOptions(determineBaseDir())

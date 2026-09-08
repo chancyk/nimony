@@ -649,6 +649,32 @@ type
       ## Empty is not an error: `useBlobCache` returns on an empty string and
       ## the session assembles from scratch, which is the `--no-blobcache`
       ## behaviour and the pre-B3 one.
+    dev*: bool
+      ## `nimony dev`: the program is expected to be long-lived and to reach a
+      ## SAFEPOINT by calling `nimony_dev_poll` (`lib/std/devreload.nim`).
+      ## `runWholeProgram` itself does nothing with this -- the loader passes
+      ## the intercept that answers that call -- but it travels in the record
+      ## because it is a property of the RUN, and `nimony dev` and `nimony r`
+      ## reach the loader through the same one.
+
+  LoadedHook* = proc (ctx: pointer; arena: Arena; img: MemImage): string {.nimcall.}
+    ## Called once, after the image is laid out, bound and made executable, and
+    ## BEFORE the guest is started. "" lets the run proceed; anything else
+    ## refuses it with that as the reason.
+    ##
+    ## A proc pointer plus an explicit context pointer rather than a closure
+    ## (AGENTS.md), and a hook rather than an out-parameter because the caller
+    ## that needs this needs it while `runWholeProgram` is still running: hot
+    ## reload has to have the arena and the image before the guest's first
+    ## instruction, since the guest may reach its first safepoint immediately.
+
+  HostIntercept* = object
+    ## One name the caller wants to answer itself, ahead of the arena and the
+    ## host process (`nifasm/core/hostsyms`'s first tier). A record rather than
+    ## a tuple so the two fields are named at every call site: `fn` is a C
+    ## function pointer and nothing checks its signature.
+    name*: string
+    fn*: pointer
 
   RunResult* = object
     outcome*: RunOutcome
@@ -732,7 +758,10 @@ proc runTimingLine*(r: RunResult; label: string): string =
   else:
     result.add " blobcache=off"
 
-proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
+proc runWholeProgram*(e: var Engine; p: RunProgram;
+                      extra: openArray[HostIntercept] = [];
+                      onLoaded: LoadedHook = nil;
+                      onLoadedCtx: pointer = nil): RunResult =
   ## Assemble `<backendDir>/<mainModule>.asm.nif` and everything it reaches
   ## into an arena and call `main(argc, argv, envp)` there. Never raises: a
   ## refusal is `roRefused` with a reason the driver prints.
@@ -807,6 +836,13 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
     # other half of the same promise.
     sess = openFileSession(mainAsm, debugInfo = false, singleThread = true)
     haveSession = true
+    # `nimony dev` walks the guest's stack at a safepoint to find out whether a
+    # frame of a proc it is about to replace is live, and only the trace table
+    # says which proc a return address belongs to. Nothing in the guest
+    # references `arkham.traceinfo.0`, so the table has to be asked for
+    # (`AsmSession.wantTraceTable`). Before `beginEmit`, which is where it is
+    # read. A `nimony r` carries none of it.
+    sess.wantTraceTable = p.dev
     # Before `declare`, which is where the target becomes known and the cache
     # key is minted (`driver.useBlobCache`). An empty directory string is the
     # documented way to say "no cache" and returns without touching anything,
@@ -860,7 +896,14 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
           result.reason = "the program creates threads (" & ext.extName &
             "), and running from memory lowers every thread-local to a global"
           return
-    let host = defaultHostSymbols()
+    var host = defaultHostSymbols()
+    # `extra` before `bindExternals`, and it wins over the arena and the host
+    # process because `hostsyms` puts intercepts first -- which is what makes a
+    # SAFEPOINT possible at all: `nimony dev` answers the guest's
+    # `nimony_dev_poll` here, and the answer runs ON THE GUEST'S THREAD, in a
+    # frame the guest called into. That is the synchronous seed `notes/b4.md`
+    # 1a says the trace-table walk has to have.
+    for it in extra: host.intercept(it.name, it.fn)
     let missing = bindExternals(img, host)
     if missing.len > 0:
       result.reason = "unresolved external symbol(s): " & missing.join(", ")
@@ -871,6 +914,16 @@ proc runWholeProgram*(e: var Engine; p: RunProgram): RunResult =
     if img.entry == 0:
       result.reason = "the image has no entry point (no `main.0`)"
       return
+
+    if onLoaded != nil:
+      # After `makeExecutable`, before the guest exists. `nimony dev` builds its
+      # reload session here: the arena, the live image and its trace table are
+      # all final now, and the guest may reach its first safepoint before this
+      # proc's next statement would have run.
+      let refusal = onLoaded(onLoadedCtx, arena, img)
+      if refusal.len > 0:
+        result.reason = refusal
+        return
 
     if p.verbose or p.profile:
       # BEFORE the run, not after: everything the program writes belongs to the
@@ -956,6 +1009,7 @@ proc encodeRunRequest(p: RunProgram): seq[string] =
   var flags = ""
   if p.verbose: flags.add 'v'
   if p.profile: flags.add 'p'
+  if p.dev: flags.add 'd'
   result = @["run", p.backendDir, p.mainModule, p.blobCacheDir, flags,
              $p.argv.len]
   for a in p.argv: result.add a
@@ -1073,3 +1127,167 @@ proc runWholeProgramOutOfProcess*(p: RunProgram): RunResult =
   result.reason = fields[2]
   for i in 3 ..< fields.len: applyTiming(result.timings, fields[i])
   result.outcome = (if fields[0] == "ran": roRan else: roRefused)
+
+# ── the guest as a long-lived process (`nimony dev`) ────────────────────────
+#
+# `runWholeProgramOutOfProcess` is the one-shot: spawn, send, wait, reap. Hot
+# reload needs the three steps taken apart, because the interesting part happens
+# BETWEEN them -- the compiler rebuilds while the guest is still running and
+# then asks it to swap. What travels is the same framing and the same loader;
+# only the record verbs are new.
+
+type
+  DevGuest* = object
+    ## A `nimrun` running a program that has not finished. One object because
+    ## the process and the channel are useless apart and both have to be
+    ## released.
+    launch*: GuestLaunch
+    running*: bool
+    finished*: bool
+    final*: RunResult
+
+  SwapReply* = enum
+    srSwapped     ## the code is in
+    srDeferred    ## a replaced proc has a live frame; ask again
+    srFailed      ## the loader refused; `reason`
+    srGone        ## the guest ended instead of answering
+
+proc startDevGuest*(p: RunProgram; g: var DevGuest): string =
+  ## Spawn a loader, hand it the program, and RETURN -- the guest is running
+  ## when this comes back. "" on success.
+  g = DevGuest(launch: GuestLaunch(pid: 0, chan: openChannel(-1), alive: false),
+               running: false, finished: false,
+               final: RunResult(outcome: roRefused, status: 0, reason: "",
+                                signal: 0))
+  let exe = findTool("nimrun")
+  if not fileExists(exe):
+    return "there is no `nimrun` in " & binDir() &
+      "; build it with `hastur build all`"
+  flushFile stdout
+  flushFile stderr
+  let spawnErr = spawnGuest(exe, [], g.launch)
+  if spawnErr.len > 0: return spawnErr
+  var fields: seq[string] = @[]
+  if not g.launch.chan.recvFields(fields) or fields.len < 2 or
+     fields[0] != "hello":
+    closeChannel g.launch
+    discard reapGuest(g.launch)
+    return "`nimrun` did not answer the handshake"
+  if fields[1] != $GuestProtocolVersion:
+    closeChannel g.launch
+    discard reapGuest(g.launch)
+    return "`nimrun` speaks guest protocol " & fields[1] &
+      " and this compiler speaks " & $GuestProtocolVersion
+  if not g.launch.chan.sendFields(encodeRunRequest(p)):
+    closeChannel g.launch
+    discard reapGuest(g.launch)
+    return "`nimrun` closed the control channel before the request"
+  g.running = true
+  result = ""
+
+proc takeFinal(g: var DevGuest; fields: seq[string]) =
+  ## A `ran`/`refused` record: the program is over.
+  g.finished = true
+  g.running = false
+  var status = 0
+  if fields.len > 1:
+    for ch in fields[1]:
+      if ch in {'0' .. '9'}: status = status * 10 + (ord(ch) - ord('0'))
+  g.final = RunResult(
+    outcome: (if fields[0] == "ran": roRan else: roRefused),
+    status: status,
+    reason: (if fields.len > 2: fields[2] else: ""), signal: 0)
+  for i in 3 ..< fields.len: applyTiming(g.final.timings, fields[i])
+
+proc reapDevGuest*(g: var DevGuest) =
+  ## Collect the process. Sets `final.signal` when it died from one, so the
+  ## caller can say `restart: the program crashed (SIGSEGV)` instead of a bare
+  ## number.
+  if not g.launch.alive: return
+  closeChannel g.launch
+  let ended = reapGuest(g.launch)
+  g.running = false
+  if not g.finished:
+    g.finished = true
+    case ended.kind
+    of gxSignalled:
+      g.final = RunResult(outcome: roRan, status: 128 + ended.signal,
+                          reason: "", signal: ended.signal)
+    of gxExited:
+      g.final = RunResult(outcome: roRan, status: ended.code, reason: "",
+                          signal: 0)
+    of gxUnknown:
+      g.final = RunResult(outcome: roRefused, status: 0,
+                          reason: "the guest disappeared", signal: 0)
+
+proc stopDevGuest*(g: var DevGuest) =
+  ## End the program. `SIGTERM`, then reap.
+  ##
+  ## This is the half of JIT.md 7.4's *"or restart the guest"* that only a
+  ## process boundary can do: there is no way to stop a guest THREAD from
+  ## outside (`hostrun.nim`'s header -- the three ways out of a foreign frame
+  ## are `longjmp`, unwinding and not leaving), which is why an in-process
+  ## `nimony dev` could never restart a program it had decided to replace.
+  if g.launch.alive and g.launch.pid > 0:
+    discard signalGuest(g.launch, guestTermSignal())
+  reapDevGuest g
+
+proc pollDevGuest*(g: var DevGuest): bool =
+  ## Has the program ended? Non-blocking; true once `final` is filled in.
+  if g.finished: return true
+  if not g.launch.alive: return false
+  if g.launch.chan.hasPending():
+    var fields: seq[string] = @[]
+    if g.launch.chan.recvFields(fields) and fields.len > 0 and
+       (fields[0] == "ran" or fields[0] == "refused"):
+      takeFinal(g, fields)
+      reapDevGuest g
+      return true
+    # The channel broke, or the loader said something unexpected while nothing
+    # was asked of it: either way the program is not answering any more.
+    reapDevGuest g
+    return true
+  result = false
+
+proc askSwap*(g: var DevGuest; backendDir, mainModule, blobCacheDir: string;
+              changed: seq[string]; reason, stack: var string;
+              generation: var int): SwapReply =
+  ## Send a `swap` and block until the loader answers it — which happens at the
+  ## guest's next safepoint, i.e. its next `devPoll()`.
+  ##
+  ## Blocking is right here and nowhere else: the compiler has nothing to do
+  ## until it knows whether the code went in, and a program that never reaches a
+  ## safepoint has told the user something worth waiting to find out. A guest
+  ## that ENDS instead of answering is `srGone`, not a hang, because the loader
+  ## sends its final record on the same channel.
+  reason = ""
+  stack = ""
+  if not g.running: return srGone
+  var req = @["swap", backendDir, mainModule, blobCacheDir, $changed.len]
+  for c in changed: req.add c
+  if not g.launch.chan.sendFields(req):
+    reapDevGuest g
+    return srGone
+  while true:
+    var fields: seq[string] = @[]
+    if not g.launch.chan.recvFields(fields):
+      reapDevGuest g
+      return srGone
+    if fields.len == 0: continue
+    case fields[0]
+    of "swapped", "deferred", "failed":
+      if fields.len > 1:
+        var v = 0
+        for ch in fields[1]:
+          if ch in {'0' .. '9'}: v = v * 10 + (ord(ch) - ord('0'))
+        generation = v
+      if fields.len > 2: reason = fields[2]
+      if fields.len > 3: stack = fields[3]
+      return (if fields[0] == "swapped": srSwapped
+              elif fields[0] == "deferred": srDeferred
+              else: srFailed)
+    of "ran", "refused":
+      takeFinal(g, fields)
+      reapDevGuest g
+      return srGone
+    else: discard

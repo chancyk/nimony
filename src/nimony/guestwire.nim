@@ -111,6 +111,12 @@ type
     code*: int
     signal*: int
 
+proc guestTermSignal*(): int {.inline.} =
+  ## What `nimony dev` sends a guest it is replacing. A proc rather than a
+  ## `const` because `SIGTERM` is an imported C macro and has no compile-time
+  ## value here.
+  int(SIGTERM)
+
 # ── framing ─────────────────────────────────────────────────────────────────
 
 proc openChannel*(fd: cint): GuestChannel =
@@ -201,6 +207,23 @@ proc sendFields*(c: var GuestChannel; fields: openArray[string]): bool =
   result = writeAll(c.fd, out0)
   if not result: c.broken = true
 
+proc hasPending*(c: var GuestChannel): bool =
+  ## Is a record already readable? Asked at a safepoint, where the guest is
+  ## parked inside an intercept and must not be held there while nothing is
+  ## happening -- so the question has to be answerable without blocking.
+  ##
+  ## `poll` with a zero timeout, and buffered bytes count too: `recvFields` may
+  ## have left the head of the next record in the buffer, and a reader that only
+  ## asked the kernel would wait forever for bytes it already has.
+  if c.broken: return false
+  if c.pos < c.buf.len: return true
+  var fds: TPollfd
+  fds.fd = c.fd
+  fds.events = POLLIN
+  fds.revents = 0
+  let n = poll(addr fds, 1, 0)
+  result = n > 0 and (fds.revents and (POLLIN or POLLHUP)) != 0
+
 proc recvFields*(c: var GuestChannel; dest: var seq[string]): bool =
   ## One record. False means the peer is gone or the stream is not a record
   ## stream any more; the caller reports that, it never retries.
@@ -284,6 +307,13 @@ proc closeChannel*(launch: var GuestLaunch) =
     closeFd launch.chan.fd
     launch.chan.fd = -1
     launch.chan.broken = true
+
+proc signalGuest*(launch: var GuestLaunch; sig: int): bool =
+  ## Send `sig` to the loader. The way `nimony dev` restarts a program: there is
+  ## no way to stop a guest THREAD from outside, and this is the whole reason
+  ## the guest is a process at all.
+  if not launch.alive or launch.pid <= 0: return false
+  result = posix.kill(launch.pid, sig.cint) == 0
 
 proc reapGuest*(launch: var GuestLaunch): GuestExit =
   ## Wait for the loader and say how it ended. A guest that faulted is a

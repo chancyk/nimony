@@ -47,6 +47,10 @@
 import std / [os, posix, strutils]
 import guestwire
 import engine
+import devhost
+
+import nifasm / hostrun
+import nifasm / image / memory
 
 const
   Version = "0.1.0"
@@ -76,6 +80,35 @@ type
     chan: GuestChannel
     haveChannel: bool
 
+  DevState = object
+    ## What the safepoint intercept needs, and the ONE thing in this file that
+    ## has to be a module-level `var`.
+    ##
+    ## The same argument `nifasm/hostrun` makes for `gGuest` and `engine` makes
+    ## for `gIo`: an intercept is reached through a C function pointer the GUEST
+    ## holds, so it can carry no context but a global. It is sound for the same
+    ## reason -- one guest runs at a time in one process, and this process runs
+    ## exactly one guest -- and it is only ever touched on the guest's thread,
+    ## inside a call the guest made, while the loader's main thread is parked in
+    ## `waitForGuest`.
+    active: bool
+    session: DevSession
+    chan: ptr GuestChannel
+    backendDir, mainModule, blobCacheDir: string
+    verbose: bool
+    trace: bool
+      ## `NIMONY_DEV_TRACE=1`: say what the reload session decided, on stderr.
+      ## An environment variable rather than a flag because the interesting
+      ## moment is inside a process the user did not type a command line for --
+      ## the same reason `NIFASM_PROFILE` is one.
+    polls: int
+      ## How many safepoints the guest has reached. Reported with the final
+      ## record, because "the program never polled" and "the program polled and
+      ## nothing was pending" are different failures and look the same from
+      ## outside.
+
+var gDev: DevState
+
 proc failOut(msg: string) {.noreturn.} =
   ## A refusal that could not be reported on the channel. stderr, because
   ## stdout is the program's.
@@ -96,6 +129,7 @@ proc decodeRun(fields: openArray[string]; p: var RunProgram): string =
   p.blobCacheDir = fields[3]
   p.verbose = 'v' in fields[4]
   p.profile = 'p' in fields[4]
+  p.dev = 'd' in fields[4]
   var argc = 0
   for ch in fields[5]:
     if ch notin {'0' .. '9'}: return "a malformed argument count: " & fields[5]
@@ -106,6 +140,78 @@ proc decodeRun(fields: openArray[string]; p: var RunProgram): string =
   p.argv = @[]
   for i in 0 ..< argc: p.argv.add fields[6 + i]
   result = ""
+
+proc devPollIntercept(): int {.cdecl.} =
+  ## `nimony_dev_poll` (`lib/std/devreload.nim`), answered here.
+  ##
+  ## Three things are true at this instant and all three are what make hot
+  ## reload possible at all:
+  ##
+  ## * we are on the GUEST's thread, in a frame the guest called into, so a
+  ##   stack walk has the synchronous seed the trace table needs
+  ##   (`notes/b4.md` 1a);
+  ## * the guest is not running any of its own code, so patching a proc entry
+  ##   races with nothing (the guest is single-threaded by construction:
+  ##   `image/memory.nim` refuses an image with a thread-local, and
+  ##   `engine.ThreadSpawners` refuses one that can create a thread);
+  ## * the loader's main thread is parked in `waitForGuest` and touches neither
+  ##   `gDev` nor the channel, so both are ours alone.
+  ##
+  ## Returns the reload generation, which is what the program sees.
+  inc gDev.polls
+  if not gDev.active:
+    # The image was loaded but the reload session refused (`devLoaded` said
+    # why, on stderr). The program still runs; it just never reloads, and the
+    # generation it sees stays 0.
+    return 0
+  # Non-blocking: a program that polls every iteration must not be held up by a
+  # compiler that has nothing to say.
+  while gDev.chan[].hasPending():
+    var fields: seq[string] = @[]
+    if not gDev.chan[].recvFields(fields): break
+    if fields.len == 0 or fields[0] != "swap":
+      discard gDev.chan[].sendFields(["failed", "0",
+        "the loader expected a `swap` record at a safepoint"])
+      break
+    # ["swap", backendDir, mainModule, blobCacheDir, <n>, name...]
+    if fields.len < 5:
+      discard gDev.chan[].sendFields(["failed", "0", "a short `swap` record"])
+      break
+    var changed: seq[string] = @[]
+    for i in 5 ..< fields.len: changed.add fields[i]
+    var res: SwapResult
+    gDev.session.swap(fields[1], fields[2], fields[3], changed, res)
+    case res.outcome
+    of swSwapped:
+      if gDev.trace:
+        stderr.writeLine "[nimrun] swapped to generation " & $res.generation &
+          " at poll " & $gDev.polls & "; stack: " & res.stack
+        flushFile stderr
+      discard gDev.chan[].sendFields(["swapped", $res.generation, "", res.stack])
+    of swDeferred:
+      # NOT consumed: the compiler is told to ask again, and the state the swap
+      # needs is all in the record it will send again.
+      discard gDev.chan[].sendFields(["deferred", $res.generation, res.reason,
+                                      res.stack])
+    of swRefused:
+      discard gDev.chan[].sendFields(["failed", $res.generation, res.reason,
+                                      res.stack])
+  result = gDev.session.generation
+
+proc devLoaded(ctx: pointer; arena: Arena; img: MemImage): string {.nimcall.} =
+  ## `engine.LoadedHook`: the image is laid out, bound and executable, and the
+  ## guest has not started. Build the reload session now, because the guest may
+  ## reach its first safepoint before anything else runs.
+  ##
+  ## `ctx` is unused -- the state this fills in is `gDev`, which the intercept
+  ## has to reach through a global anyway, so a second handle on it would be a
+  ## second thing to keep in step.
+  result = initDevSession(arena, img, gDev.session)
+  if gDev.trace:
+    stderr.writeLine "[nimrun] dev session: " &
+      (if result.len == 0: "ready" else: "refused -- " & result)
+    flushFile stderr
+  if result.len == 0: gDev.active = true
 
 proc encodeResult(r: RunResult): seq[string] =
   ## `RunResult` -> a reply record. The timings go out as `key=value` pairs
@@ -165,14 +271,30 @@ proc main() =
     failOut "an unknown control verb '" & fields[0] & "'"
 
   var p = RunProgram(backendDir: "", mainModule: "", argv: @[],
-                     verbose: false, profile: false, blobCacheDir: "")
+                     verbose: false, profile: false, blobCacheDir: "",
+                     dev: false)
   let bad = decodeRun(fields, p)
   if bad.len > 0:
     discard loader.chan.sendFields(["refused", "0", "nimrun received " & bad])
     failOut "received " & bad
 
   var e = initEngine()
-  let r = runWholeProgram(e, p)
+  var r: RunResult
+  if p.dev:
+    # `nimony dev`: answer the guest's safepoint, and take the arena and the
+    # image at the moment they become final.
+    gDev.chan = addr loader.chan
+    gDev.backendDir = p.backendDir
+    gDev.mainModule = p.mainModule
+    gDev.blobCacheDir = p.blobCacheDir
+    gDev.verbose = p.verbose
+    gDev.trace = getEnv("NIMONY_DEV_TRACE").len > 0
+    r = runWholeProgram(e, p,
+      [HostIntercept(name: "nimony_dev_poll",
+                     fn: cast[pointer](devPollIntercept))],
+      devLoaded, nil)
+  else:
+    r = runWholeProgram(e, p)
 
   # The reply goes out BEFORE this process ends, and it is the only thing that
   # does: everything the program wrote went straight to the inherited
