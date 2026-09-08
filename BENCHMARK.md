@@ -29,8 +29,14 @@ ratios are robust to slow drift but not to a build starting halfway.
 `self.editbody` edits `semStmt` in `sem.nim`. That is one proc in one module,
 and a result read off it does not automatically generalise. `self.editbody2`
 is the same SHAPE of edit -- a statement inserted into the body of a reachable
-proc, no interface change -- in `registerHook` in `semdecls.nim`: a third the
-size of `sem.nim` and a different position in the dependency graph.
+proc, no interface change -- in `registerHook` in `semdecls.nim`.
+
+**It is a different PROC, not a different MODULE.** `sem.nim:1800` says
+`include semdecls`, so `semdecls.nim` is textually part of `sem.nim`'s
+translation unit and both scenarios edit the same compiled module. That is
+still a useful contrast -- they behave completely differently, see below --
+but a genuinely cross-module instance is still missing, and would be the
+better third test.
 
 Run both. On 2026-09-08 they disagreed sharply, and the disagreement is the
 useful part:

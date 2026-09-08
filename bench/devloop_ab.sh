@@ -71,10 +71,12 @@ case $scen in
 " $work/self_$side/src/nimony/sem.nim' ;;
   # The SAME shape of edit as self.editbody, in a different module and a
   # different proc, so a number is not read off one instance. `registerHook`
-  # is private but reachable (4 call sites), so DCE keeps it; `isGeneric` is a
-  # runtime bool, so the inserted statement cannot be folded away; and
-  # semdecls.nim is ~1700 lines against sem.nim's ~5600, a third the size and
-  # a different position in the dependency graph.
+  # is private but reachable (4 call sites), so DCE keeps it, and `isGeneric`
+  # is a runtime bool so the inserted statement cannot be folded away.
+  # NOTE: this is a different PROC, not a different MODULE -- `sem.nim:1800`
+  # says `include semdecls`, so both scenarios edit one translation unit.
+  # They still diverge sharply (BENCHMARK.md 0b); a cross-module instance is
+  # a further test that does not exist yet.
   self.editbody2) prep='sed -i "" "/^proc registerHook(c: var SemContext; obj: SymId, symId: SymId, op: HookKind; isGeneric: bool) =\$/a\\
   if isGeneric: discard $i
 " $work/self_$side/src/nimony/semdecls.nim' ;;
