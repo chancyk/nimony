@@ -24,6 +24,47 @@ Read cpu-sum first, wall second, peak RSS beside them. Wall on this machine
 drifts up to 3x with background load; cpu-sum is robust; interleaved A/B
 ratios are robust to slow drift but not to a build starting halfway.
 
+## 0b. One scenario is one instance: `self.editbody2`
+
+`self.editbody` edits `semStmt` in `sem.nim`. That is one proc in one module,
+and a result read off it does not automatically generalise. `self.editbody2`
+is the same SHAPE of edit -- a statement inserted into the body of a reachable
+proc, no interface change -- in `registerHook` in `semdecls.nim`: a third the
+size of `sem.nim` and a different position in the dependency graph.
+
+Run both. On 2026-09-08 they disagreed sharply, and the disagreement is the
+useful part:
+
+| scenario | fork point cpu | ordering+lent fixes only | full branch |
+|---|---|---|---|
+| `self.editbody` | 3.82 s | 1.85 s (0.52) | 1.05 s (0.277) |
+| `self.editbody2` | 3.96 s | **3.12 s (0.79)** | 1.03 s (0.260) |
+
+`editbody2` also is not flat across rounds on a toolchain that has only the
+DCE serialization-order fix: rounds 0-1 cost 1.82 s and rounds 2+ cost 3.12 s.
+`--profile` says why -- `dceEmit` goes from **1 invocation to 127** at round 2,
+and `dceLive` re-runs:
+
+```
+round 0   dceEmit 0.048s (1 invocations)
+round 1   dceEmit 0.049s (1 invocations)
+round 2   dceEmit 1.477s (127 invocations)   dceLive 0.039s
+round 3   dceEmit 1.468s (127 invocations)
+```
+
+The ordering fix only holds while an edit leaves the DCE analysis
+byte-identical. Editing `semStmt` does that indefinitely; editing
+`registerHook` stops doing it at the third edit. What survives it is P0c's
+per-module `.live.nif` split, which is why the full branch is flat on both.
+
+Two consequences for anyone taking a number here:
+
+- **Quote both scenarios, or say which one.** A ratio from `editbody` alone
+  overstates what a fix is worth by up to 2.7x on this pair.
+- **Read the per-round lines, not just the median.** `editbody2`'s median hid
+  a clean two-regime split; its `B/A cpu (min)` was 0.46 against a median of
+  0.79, and the min was measuring the first regime only.
+
 ## 1. Prerequisites (one-time)
 
 ```sh

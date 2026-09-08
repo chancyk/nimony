@@ -8,6 +8,9 @@
 # Usage: bench/devloop_ab.sh <toolchain-A> <toolchain-B> [scenario] [rounds]
 #   scenario: stdlib.forced (default) | stdlib.cold | hello.forced | ctfe.forced
 #             | self.editbody (a statement inserted into a called proc of sem.nim)
+#             | self.editbody2 (the same SHAPE of edit, in a different module:
+#                `registerHook` in semdecls.nim -- a second instance, so a result
+#                is not read off one proc in the largest module)
 #             | self.editdead (a private, never-called proc appended: DCE removes it)
 #             | self.editcall (a new proc AND a call to it from semStmt: the call graph changes)
 #             | self.nochange (rebuild with nothing edited: the no-op floor)
@@ -35,7 +38,7 @@ case $scen in
   stdlib.cold)   src="$here/tests/nimony/stdlib/tall.nim"; prep="rm -rf \$nc" ;;
   hello.forced)  src="$work/hello.nim"; printf 'import std/syncio\necho "hello"\n' > "$src"; flags="-f" ;;
   ctfe.forced)   src="$work/tmyops.nim"; cp "$here/tests/nimony/consteval/tmyops.nim" "$src"; flags="-f" ;;
-  self.editbody|self.editdead|self.editcall|self.nochange|self.cold|self.run)
+  self.editbody|self.editbody2|self.editdead|self.editcall|self.nochange|self.cold|self.run)
     # The compiler compiling itself (fork-point sources, copied per side) with
     # the native backend; `self.run` is `nimony r ... --version`.
     selfsrc=${SELF_SRC:-/tmp/devloop_base/src}
@@ -52,7 +55,7 @@ A=$(cd "$A" && pwd); B=$(cd "$B" && pwd)
 cmdfor() {  # cmdfor <side> <nc> -> prints the command line
   eval "t=\$$1"
   case $scen in
-    self.editbody|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
+    self.editbody|self.editbody2|self.editdead|self.editcall) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.nochange|self.cold) echo "cd $work/self_$1 && $t/bin/nimony $backend --silentMake --nimcache:$2 --out:$work/out_$1/nimony $src" ;;
     self.run)      echo "cd $work/self_$1 && $t/bin/nimony r --silentMake --nimcache:$2 $src --version" ;;
     *)             echo "$t/bin/nimony $backend --silentMake $flags --nimcache:$2 $src" ;;
@@ -66,6 +69,15 @@ case $scen in
   self.editbody) prep='sed -i "" "/^proc semStmt\*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =\$/a\\
   if isNewScope: discard $i
 " $work/self_$side/src/nimony/sem.nim' ;;
+  # The SAME shape of edit as self.editbody, in a different module and a
+  # different proc, so a number is not read off one instance. `registerHook`
+  # is private but reachable (4 call sites), so DCE keeps it; `isGeneric` is a
+  # runtime bool, so the inserted statement cannot be folded away; and
+  # semdecls.nim is ~1700 lines against sem.nim's ~5600, a third the size and
+  # a different position in the dependency graph.
+  self.editbody2) prep='sed -i "" "/^proc registerHook(c: var SemContext; obj: SymId, symId: SymId, op: HookKind; isGeneric: bool) =\$/a\\
+  if isGeneric: discard $i
+" $work/self_$side/src/nimony/semdecls.nim' ;;
   self.editdead) prep='printf "\nproc devloopBenchBody$i(): int = 1\n" >> $work/self_$side/src/nimony/sem.nim' ;;
   # A live edit that also changes the CALL GRAPH every round: a new private
   # proc, and a call to it from `semStmt`. That is what re-runs `dceLive`
