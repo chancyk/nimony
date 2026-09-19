@@ -27,6 +27,13 @@ else:
   # native global maintained by the freestanding wrappers.
 {.feature: "lenientnils".}
 
+when not defined(windows):
+  proc posixResult(r: clong): ErrorCode {.inline.} =
+    ## `r` is a `pcall` result: `-errno` if the call failed, on every platform.
+    ## Asking `errno()` instead is wrong under `nimony n` on Linux, where
+    ## nothing sets it: it answers 0, and 0 maps to `Success`.
+    if r >= 0: Success else: posixToErrorCode(int32(-r))
+
 proc tryCreateFinalDir*(dir: Path): ErrorCode =
   ## Tries to create the final directory in a path.
   ## In other words, it tries to create a single new directory, not a nested one.
@@ -39,10 +46,7 @@ proc tryCreateFinalDir*(dir: Path): ErrorCode =
     else:
       result = windowsToErrorCode getLastError()
   else:
-    if mkdir(dirStr.toCString, 0o777) == 0'i32:
-      result = Success
-    else:
-      result = posixToErrorCode(errno())
+    result = posixResult(pcall(mkdir(dirStr.toCString, 0o777)))
 
 proc createDir*(dir: Path) {.raises.} =
   ## Creates a new directory `dir`. If the directory already exists, no error is raised.
@@ -75,10 +79,7 @@ proc tryRemoveFinalDir*(dir: Path): ErrorCode =
     else:
       result = windowsToErrorCode getLastError()
   else:
-    if rmdir(dirStr.toCString) == 0'i32:
-      result = Success
-    else:
-      result = posixToErrorCode(errno())
+    result = posixResult(pcall(rmdir(dirStr.toCString)))
 
 proc removeDir*(dir: Path) {.raises.} =
   ## Removes the directory `dir`. If the directory does not exist, no error is raised.
@@ -96,10 +97,7 @@ proc tryRemoveFile*(file: Path): ErrorCode =
     else:
       result = windowsToErrorCode getLastError()
   else:
-    if unlink(fileStr.toCString) == 0'i32:
-      result = Success
-    else:
-      result = posixToErrorCode(errno())
+    result = posixResult(pcall(unlink(fileStr.toCString)))
 
 proc removeFile*(file: Path) {.raises.} =
   ## Removes the file `file`.
@@ -225,10 +223,12 @@ proc tryCloseDir*(w: var DirWalker): ErrorCode =
     else:
       result = windowsToErrorCode getLastError()
   else:
-    if closedir(w.pimpl) == 0'i32:
-      result = Success
+    # A walker whose `tryOpenDir` failed holds nil, and libc's `closedir`
+    # crashes on it.
+    if w.pimpl == nil:
+      result = BadDescriptor
     else:
-      result = posixToErrorCode(errno())
+      result = posixResult(pcall(closedir(w.pimpl)))
 
 iterator walkDir*(dir: Path,
                   relative = false,
