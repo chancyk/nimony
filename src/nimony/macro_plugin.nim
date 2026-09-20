@@ -10,6 +10,15 @@
 
 import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
 import std/[dirs, paths]
+when defined(nimony):
+  # For `tryClaim` and `napMs`: Nimony's `os` has no `sleep`.
+  when defined(windows):
+    from std / windows / winlean import nil
+    from std / widestrs import newWideCString
+  else:
+    from std / posix / posix import nil
+else:
+  from std / times import toUnix, nanosecond
 include ".." / lib / compat2
 
 import ".." / lib / [nifpools, bitabs, nifindexes, symparser]
@@ -288,33 +297,61 @@ proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
   ## plugin into the same nifcache we read here.
   fileExists(getMacroPluginPath(nifcachePath, macroSym))
 
-proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
-                         info: NifLineInfo;
-                         hostCommandLineArgs: string): string =
-  ## Build the plugin module straight from NIF (no Nim text round-trip), write
-  ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
-  ## entry point — same one CTFE uses in `semos.runEval`).
+const
+  HostCacheDir = "macro_plugins.host"
+  ClaimNapMs = 20
+  ClaimTimeoutMs = 600_000  # one holder's tenure; above any single plugin build
+
+proc tryClaim(dir: string): bool =
+  ## An atomic `mkdir`: true for the one process that created `dir`.
+  when defined(nimony):
+    # Not `dirs.tryCreateFinalDir`: without errno on the native runtime it
+    # answers `Success` for a directory that exists.
+    var d = dir
+    when defined(windows):
+      result = winlean.createDirectoryW(newWideCString(d).rawData) != 0'i32
+    else:
+      result = posix.mkdir(d.toCString, posix.Mode(0o777)) == 0'i32
+  else:
+    # `existsOrCreateDir` raises if the holder releases between its `mkdir`
+    # and its `dirExists`: a claim not taken, not an error.
+    try:
+      result = not existsOrCreateDir(path(dir))
+    except IOError, OSError:
+      result = false
+
+proc release(dir: string) =
+  try: removeDir(path(dir))
+  except: discard
+
+proc claimedAt(dir: string): int64 =
+  ## Its mtime names one holder's tenure: each creates it anew. 0 when gone.
+  try:
+    when defined(nimony):
+      result = getLastModificationTime(dir)
+    else:
+      let t = getLastModificationTime(dir)
+      result = toUnix(t) * 1_000_000_000 + nanosecond(t)
+  except:
+    result = 0
+
+proc napMs(ms: int) =
+  when defined(nimony):
+    when defined(windows):
+      winlean.sleep(winlean.DWORD(ms))
+    else:
+      var req = default(posix.Timespec)
+      var rem = default(posix.Timespec)
+      req.tv_nsec = clong(ms * 1_000_000)
+      discard posix.nanosleep(req, rem)
+  else:
+    os.sleep(ms)
+
+proc buildMacroPlugin(nifcachePath, pluginCache: string; macroDecl: Cursor;
+                      macroSym: SymId; info: NifLineInfo;
+                      hostCommandLineArgs: string): string =
   let exePath = getMacroPluginPath(nifcachePath, macroSym)
   let pluginBaseName = macroFileStem(macroSym)
-
-  # A macro plugin is a HOST-native executable, so it must be built with a
-  # host-consistent toolchain config (host word size, host stdlib layouts). The
-  # outer compile's nifcache may target a DIFFERENT word size — the JS backend
-  # compiles at `--bits:32` so its Leng IR matches the JS runtime — and the
-  # plugin's `nimony s` sub-compile reuses whatever stdlib artifacts already sit
-  # in the nifcache it is pointed at. Sharing the outer nifcache would hand the
-  # 64-bit plugin a 32-bit stdlib (mismatched type sizes) → a plugin that builds
-  # but SEGFAULTS at run. So give the plugin its OWN nifcache subdir, built fresh
-  # at host bits: `hostCommandLineArgs` is the outer command line minus its
-  # target triple (`parseCommonOption` decides what a compile-time-eval
-  # process may see). The `macro_*` prefix keeps it out of any target-side
-  # artifact collection.
-  let pluginCache = nifcachePath / pluginBaseName & ".host"
-  try:
-    createDir path(pluginCache)
-  except:
-    echo "Macro plugin: failed to create ", pluginCache
-    return ""
   let progfile = pluginCache / pluginBaseName.addFileExt(".p.nif")
 
   var buf = buildPluginNif(macroDecl, macroSym, info)
@@ -341,19 +378,27 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   let srcLibPath = getAppDir().parentDir() / "src" / "lib"
 
   # Pre-populate the isolated plugin cache with a HOST-bits stdlib. `nimony s`
-  # only READS its imports' `.s.nif` — it does not build them — so in a fresh
-  # per-plugin cache we must first materialise the stdlib the plugin imports.
+  # only READS its imports' `.s.nif` — it does not build them — so in the
+  # plugins' cache we must first materialise the stdlib the plugin imports.
   # The plugin scaffold imports exactly `std/[syncio, macros]` (see
   # `emitImportStdMacros`); compiling those pulls in the whole host-bits stdlib
   # closure the plugin needs (incl. the NimNode/NIF-reader machinery). The
   # native link of this setup may fail (harmless — we only need the `.s.nif`/
   # `.c.nif`), and `nimony c` is incremental so repeat calls are cheap.
   let setupFile = pluginCache / "macro_setup.nim"
-  try:
-    writeFile(setupFile, "import std/[syncio, macros]\n")
-  except:
-    echo "Macro plugin: failed to write ", setupFile
-    return ""
+  let setupSrc = "import std/[syncio, macros]\n"
+  var setupOnDisk = ""
+  if fileExists(setupFile):
+    try: setupOnDisk = readFile(setupFile)
+    except: setupOnDisk = ""
+  if setupOnDisk != setupSrc:
+    # A rewrite moves the mtime nifmake reads: every plugin would rebuild the
+    # stdlib closure.
+    try:
+      writeFile(setupFile, setupSrc)
+    except:
+      echo "Macro plugin: failed to write ", setupFile
+      return ""
   let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
                  " --path:" & quoteShell(srcLibPath) &
                  " --nimcache:" & quoteShell(pluginCache) &
@@ -397,6 +442,53 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     return ""
 
   result = exePath
+
+proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
+                         info: NifLineInfo;
+                         hostCommandLineArgs: string): string =
+  ## Build the plugin module straight from NIF (no Nim text round-trip), write
+  ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
+  ## entry point — same one CTFE uses in `semos.runEval`).
+
+  # A macro plugin is a HOST-native executable, so it must be built with a
+  # host-consistent toolchain config (host word size, host stdlib layouts). The
+  # outer compile's nifcache may target a DIFFERENT word size — the JS backend
+  # compiles at `--bits:32` so its Leng IR matches the JS runtime — and the
+  # plugin's `nimony s` sub-compile reuses whatever stdlib artifacts already sit
+  # in the nifcache it is pointed at. Sharing the outer nifcache would hand the
+  # 64-bit plugin a 32-bit stdlib (mismatched type sizes) → a plugin that builds
+  # but SEGFAULTS at run. So the plugins get a nifcache subdir of their OWN,
+  # built at host bits: `hostCommandLineArgs` is the outer command line minus
+  # its target triple (`parseCommonOption` decides what a compile-time-eval
+  # process may see). One for all of them — host versus target is all that has
+  # to stay apart, and `macroFileStem` keeps their files apart inside it.
+  let pluginCache = nifcachePath / HostCacheDir
+  try:
+    createDir path(pluginCache)
+  except:
+    echo "Macro plugin: failed to create ", pluginCache
+    return ""
+
+  # `nifmake -j` runs several nimsem in one nifcache, so plugin builds can meet
+  # in the shared cache: the claim's holder builds, the rest wait. They queue,
+  # so the timeout runs against one holder's tenure, not against the wait.
+  let claim = pluginCache & ".claim"
+  var waited = 0
+  var tenure = 0'i64
+  while not tryClaim(claim):
+    let t = claimedAt(claim)
+    if t != tenure:
+      tenure = t
+      waited = 0
+    elif waited >= ClaimTimeoutMs:
+      release claim
+      waited = 0
+    else:
+      napMs ClaimNapMs
+      waited += ClaimNapMs
+  result = buildMacroPlugin(nifcachePath, pluginCache, macroDecl, macroSym, info,
+                            hostCommandLineArgs)
+  release claim
 
 proc runMacroPlugin*(nifcachePath: string; dest: var TokenBuf;
                      info: NifLineInfo;

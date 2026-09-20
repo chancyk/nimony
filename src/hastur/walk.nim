@@ -173,14 +173,16 @@ proc collectTests*(c: var TestCounters; plan: var WalkPlan; dir, forward: string
           for f in members:
             if not walkUsesNative(f, cat): groupNative = false; break
         plan.parItems.add WorkItem(path: dir, joined: true, weight: members.len,
-                                   native: groupNative)
+                                   native: groupNative,
+                                   macros: dirUsesMacros(dir))
       for x in walkDir(dir):
         if x.kind == pcFile and x.path.endsWith(".nim") and
            not isGeneratedTestFile(x.path) and
            not (joined and joinable(x.path, cat)):
           plan.parItems.add WorkItem(path: x.path, weight: 1,
                                      native: walkUsesNative(x.path, cat),
-                                     noPrefill: not prefillable(cat))
+                                     noPrefill: not prefillable(cat),
+                                     macros: usesMacros(x.path))
     else:
       # A serial (`--jobs:1`) run keeps the in-process `testFile` path, where
       # `Basics`/`Compat` reset the one shared `nimcache/` around their loop.
