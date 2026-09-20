@@ -29,6 +29,11 @@ type WorkItem* = object
     ## has no use for it, and `--noSystem`/`--compat` compiles must not see a
     ## `system` built without those flags: nifmake's staleness check is by
     ## mtime only, so it would take the prefilled one as up to date.
+  macros*: bool
+    ## Prefill from the warmup that built a macro plugin. Its
+    ## `macro_plugins.host` (`src/nimony/macro_plugin.nim`) is named after no
+    ## macro, so it is a hit for every one; at ~100 MB it goes only to the
+    ## items that will use it.
 
 
 proc canRunParallel*(cat: Category): bool {.inline.} =
@@ -40,6 +45,31 @@ proc canRunParallel*(cat: Category): bool {.inline.} =
 proc prefillable*(cat: Category): bool {.inline.} =
   ## See `WorkItem.noPrefill`.
   cat notin {Compat, Basics}
+
+proc usesMacros*(file: string): bool =
+  ## See `WorkItem.macros`: a `macro` declaration or an import line naming
+  ## `macros`. Line shapes, so that a comment saying "macros" does not buy the
+  ## big prefill; a miss only costs the item its cold plugin build.
+  var src = ""
+  try:
+    src = readFile(file)
+  except IOError, OSError:
+    return false
+  for raw in src.splitLines:
+    let line = raw.strip
+    if line.startsWith("macro "): return true
+    if line.contains("macros") and (line.startsWith("import") or
+                                    line.startsWith("from") or
+                                    line.startsWith("export")):
+      return true
+  result = false
+
+proc dirUsesMacros*(dir: string): bool =
+  ## For a joined group. Fixture subdirectories count: a group's only macro may
+  ## live there (`tests/nimony/plugins/deps/mimportedmacro.nim`).
+  for f in walkDirRec(dir, yieldFilter = {pcFile}):
+    if f.endsWith(".nim") and usesMacros(f): return true
+  result = false
 
 # ---- scheduling: longest first, by what the previous runs measured ----------
 
@@ -92,21 +122,27 @@ proc scheduleLongestFirst*(items: var seq[WorkItem]) =
     result = cmp(estimate(b), estimate(a))
     if result == 0: result = cmp(a.path, b.path)
 
-proc warmupSharedCache(native = false): string =
-  ## Compile `tools/warmup.nim` once into `nimcache/warmup/` so each
+type Warmup = enum
+  CWarmup       ## `nimony c tools/warmup.nim`
+  NativeWarmup  ## `nimony n` of the same file
+  MacroWarmup   ## `nimony c tools/warmup_macros.nim` — see `WorkItem.macros`
+
+proc warmupSharedCache(kind = CWarmup): string =
+  ## Compile this kind's warmup source once into a cache of its own so each
   ## parallel test can start with system + common stdlib bundles already
   ## present. Returns the warmup cache directory, or "" on opt-out
   ## (warmup source missing or compile failed — tests still work, just
   ## without the savings).
   ##
-  ## `native` seeds the OTHER pipeline's cache, in a directory of its own.
+  ## `NativeWarmup` seeds the OTHER pipeline's cache, in a directory of its own.
   ## The two must not mix: the intermediates the C and native backends read
   ## share file names but not content — a native compile handed the C run's
   ## bundle of `system` gets one whose externs have lost their `dynlib`, and
   ## arkham stops at the first of them ("`GetStdHandle` names no import
   ## library"). So a native work item prefills from here and a C one from
   ## there, and neither ever sees the other's files.
-  const warmupSrc = "tools/warmup.nim"
+  let warmupSrc = if kind == MacroWarmup: "tools/warmup_macros.nim"
+                  else: "tools/warmup.nim"
   if not fileExists(warmupSrc):
     # Loud, because the fallback is silent-but-slow: without the prefill every
     # test recompiles `system` from scratch (~3s each on Windows CI, ~700
@@ -115,16 +151,25 @@ proc warmupSharedCache(native = false): string =
     stderr.writeLine "warmup: " & warmupSrc &
       " missing; every test will recompile the stdlib from scratch"
     return ""
-  result = nimcacheDir / (if native: "warmup_native" else: "warmup")
+  result = nimcacheDir / (case kind
+                          of CWarmup: "warmup"
+                          of NativeWarmup: "warmup_native"
+                          of MacroWarmup: "warmup_macros")
   let nimony = toolExe("nimony")
   if not fileExists(nimony):
     stderr.writeLine "warmup: skipping, no nimony at " & nimony
     return ""
+  if kind == MacroWarmup:
+    # This cache outlives its run: a claim a killed warmup left here would cost
+    # the next one `macro_plugin`'s ten-minute takeover.
+    try: removeDir(result / "macro_plugins.host.claim")
+    except OSError: discard
   # The same command the work items are compiled with, so what lands here is
   # exactly what they would have produced themselves (`execNimonyNative` for
   # the native side, `execNimony`'s `c` for the other).
   let cmd = nimony.quoteShell &
-            (if native: " n --silentMake --isMain --nimcache:" else: " c --nimcache:") &
+            (if kind == NativeWarmup: " n --silentMake --isMain --nimcache:"
+             else: " c --nimcache:") &
             result.quoteShell & " " & warmupSrc.quoteShell
   let t0 = epochTime()
   let exit = execShellCmd(cmd)
@@ -224,7 +269,9 @@ proc copyPreservingMtime(src, dst: string) =
   ## sees the truncated/partial content and crashes. Copying gives each
   ## test an independent inode, paid for once at prefill.
   try:
-    copyFile(src, dst)
+    # With permissions: the macro warmup holds plugin executables, which
+    # nifmake finds up to date and nimsem then runs.
+    copyFileWithPermissions(src, dst)
     try: setLastModificationTime(dst, getLastModificationTime(src))
     except: discard
   except OSError, IOError:
@@ -256,15 +303,19 @@ proc parallelTestDir*(c: var TestCounters; items: openArray[WorkItem];
   prebuildSharedObjects(forward)
   var anyPrefill = false
   var anyNative = false
+  var macroItems = 0
   for it in items:
     if not it.noPrefill:
       anyPrefill = true
       if it.native: anyNative = true
+      elif it.macros: inc macroItems
   let warmupCache = if anyPrefill: warmupSharedCache() else: ""
   # Seeded only when something in this run actually wants it: on every host but
   # Windows no item is native, and paying for a second warmup compile there
-  # would be pure loss.
-  let nativeWarmupCache = if anyNative: warmupSharedCache(native = true) else: ""
+  # would be pure loss. The macro warmup is serial and costs one item's cold
+  # plugin build, so it takes two items to repay it.
+  let nativeWarmupCache = if anyNative: warmupSharedCache(NativeWarmup) else: ""
+  let macroWarmupCache = if macroItems > 1: warmupSharedCache(MacroWarmup) else: ""
   let parallelStart = epochTime()
   var times = loadTimes()
   let queue = @items   # `launch` captures it; an openArray cannot be
@@ -290,7 +341,10 @@ proc parallelTestDir*(c: var TestCounters; items: openArray[WorkItem];
     var args = @[(if item.joined: "joined" else: "test"),
                  "--no-build", "--cachedir:" & cacheDir, "--scratch"]
     if not item.noPrefill:
-      let warmup = if item.native: nativeWarmupCache else: warmupCache
+      # Native first: a native build breaks on the C intermediates.
+      let warmup = if item.native: nativeWarmupCache
+                   elif item.macros and macroWarmupCache.len > 0: macroWarmupCache
+                   else: warmupCache
       if warmup.len > 0: args.add "--prefill:" & warmup
     # Forward the parent's resolved toolchain dir so each worker uses the
     # exact same binaries (the default is now hastur's own sibling dir, an

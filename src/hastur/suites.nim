@@ -4,7 +4,7 @@
 import std / [syncio, os, osproc, strutils, times]
 import ".." / lib / nifindexes
 from ".." / lib / nifpools import NoLineInfo
-import context, counters, builders
+import context, counters, builders, concurrent
 
 proc runNifToolTests*(tool, testDir, inputExt, expectedExt: string; overwrite: bool) =
   ## Run tests for a NIF tool.
@@ -55,23 +55,27 @@ proc runNifToolTests*(tool, testDir, inputExt, expectedExt: string; overwrite: b
 # `tests/` that call `runNifToolTests` directly; their old wrapper procs and
 # subcommands are gone.
 
-proc semcheckInto(root, cache: string; extraArgs = ""): bool =
-  ## Produce the artefacts the validator reads: `check` stops after sem, so
-  ## this is a fraction of a build (about two seconds for the whole compiler,
-  ## and only the changed modules on a warm cache).
-  createDir cache
-  let (msgs, code) = execLocal("nimony",
-    "--nimcache:" & os.quoteShell(cache) & " --keepsemtree" & extraArgs &
-    " check " & os.quoteShell(root))
-  result = code == 0
-  if not result:
-    echo "FAILURE: cannot semcheck ", root, "\n", msgs
+type SemcheckPart = object
+  ## One `nimony check` the validator then reads. Each owns its cache, so they
+  ## can all run at once.
+  src, cache, extraArgs: string
+
+proc semcheckCmds(parts: openArray[SemcheckPart]): seq[string] =
+  ## Command lines for `runConcurrently`, one per part. `check` stops after
+  ## sem, so a part is a fraction of a build (about two seconds for the whole
+  ## compiler, and only the changed modules on a warm cache).
+  result = newSeq[string](parts.len)
+  for i in 0 ..< parts.len:
+    createDir parts[i].cache
+    result[i] = os.quoteShell(toolExe("nimony")) &
+      " --nimcache:" & os.quoteShell(parts[i].cache) & " --keepsemtree" &
+      parts[i].extraArgs & " check " & os.quoteShell(parts[i].src)
 
 proc validatorTests*(overwrite: bool) =
   ## Two halves, one engine.
   ##
   ## The compiler's own passes must come back clean: the validator reads what
-  ## sem produced for each of them, so both roots are semchecked first.
+  ## sem produced for each of them, so every root is semchecked first.
   ##
   ## The `tests/validator_sem` fixtures must come back with exactly the
   ## diagnostics their `.expected` files name. `tconforms.nim` is the important
@@ -105,38 +109,51 @@ proc validatorTests*(overwrite: bool) =
     ("src/nimony/controlflow.nim", @[
       "src/nimony/controlflow.nim"])]
 
-  for (root, passFiles) in passRoots:
-    let cache = nimcacheDir / "validate" / splitFile(root).name
-    if not semcheckInto(root, cache):
+  const fixtureDir = "tests/validator_sem"
+  let fixtureCache = nimcacheDir / "validate" / "fixtures"
+
+  # The semchecks are the suite's whole cost, so they run at once. The checks
+  # below walk `parts` in order: counts and failures do not depend on who
+  # finished first.
+  var parts: seq[SemcheckPart] = @[]
+  for (root, _) in passRoots:
+    parts.add SemcheckPart(src: root,
+      cache: nimcacheDir / "validate" / splitFile(root).name)
+  for x in walkDir(fixtureDir, relative = true):
+    if x.kind != pcFile or not x.path.endsWith(".nim"): continue
+    # The fixtures are plugin sources, so they need the plugin API on the path
+    # exactly as a plugin sub-compile gives it.
+    parts.add SemcheckPart(src: fixtureDir / x.path,
+      cache: fixtureCache / x.path.changeFileExt(""),
+      extraArgs: " --path:" & os.quoteShell("src/lib") &
+                 " --path:" & os.quoteShell("src/nimony/lib"))
+  # `runConcurrently` prints a failing part's diagnostics itself.
+  let semchecked = runConcurrently(semcheckCmds(parts))
+
+  for i in 0 ..< passRoots.len:
+    if semchecked[i] != 0:
       inc c.total
-      failure c, root, "semchecks", "see above"
+      failure c, parts[i].src, "semchecks", "see the diagnostics above"
       continue
-    for f in passFiles:
+    for f in passRoots[i][1]:
       inc c.total
       let (msgs, exitcode) = execLocal("validator",
-        "--strict --nimcache:" & os.quoteShell(cache) & " " & os.quoteShell(f))
+        "--strict --nimcache:" & os.quoteShell(parts[i].cache) & " " &
+        os.quoteShell(f))
       # Warnings count. They are all cleared, and the way to keep them cleared
       # is to notice the first one: either the advance is justified where it is
       # written, or the check that flagged it is wrong and wants fixing.
       if exitcode != 0 or msgs.contains("Warning:"):
         failure c, f, "validator: no violations", msgs
 
-  const fixtureDir = "tests/validator_sem"
-  let fixtureCache = nimcacheDir / "validate" / "fixtures"
-  for x in walkDir(fixtureDir, relative = true):
-    if x.kind != pcFile or not x.path.endsWith(".nim"): continue
+  for i in passRoots.len ..< parts.len:
     inc c.total
-    let src = fixtureDir / x.path
-    let cache = fixtureCache / x.path.changeFileExt("")
-    # The fixtures are plugin sources, so they need the plugin API on the path
-    # exactly as a plugin sub-compile gives it.
-    if not semcheckInto(src, cache,
-        " --path:" & os.quoteShell("src/lib") &
-        " --path:" & os.quoteShell("src/nimony/lib")):
-      failure c, src, "fixture semchecks", "see above"
+    let src = parts[i].src
+    if semchecked[i] != 0:
+      failure c, src, "fixture semchecks", "see the diagnostics above"
       continue
     let (msgs, _) = execLocal("validator",
-      "--nimcache:" & os.quoteShell(cache) & " " & os.quoteShell(src))
+      "--nimcache:" & os.quoteShell(parts[i].cache) & " " & os.quoteShell(src))
     var got = ""
     for line in msgs.splitLines:
       if line.contains("Error:") or line.contains("Warning:"):
