@@ -189,9 +189,11 @@ proc open*(filename: string, mode: FileMode = fmRead,
 
   else:
     template fail(errCode: OSErrorCode, msg: string) =
+      # Read first: `mmapErrno(result.mem)` is gone once `rollback` clears `mem`.
+      let code = errCode
       rollback()
       if result.handle >= 0: discard close(result.handle)
-      raiseOSError(errCode, msg)
+      raiseOSError(code, msg)
 
     var flags = (if readonly: O_RDONLY else: O_RDWR) or O_CLOEXEC
 

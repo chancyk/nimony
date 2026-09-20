@@ -32,6 +32,18 @@ proc main {.raises.} =
   removeFile(base / path("a.txt"))
   removeFile(base / path("b.txt"))
   removeDir(base)
+
+  # A missing directory: nothing to yield and no crash on the close, unless
+  # `checkDir` asks for the error.
+  for kind, p in walkDir(base):
+    assert false
+  var raised = false
+  try:
+    for kind, p in walkDir(base, checkDir = true):
+      assert false
+  except:
+    raised = true
+  assert raised
   echo "ok"
 
 try:
