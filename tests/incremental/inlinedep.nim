@@ -7,3 +7,8 @@
 
 proc bump*(x: int): int {.inline.} =
   x + 1
+
+proc unusedBump*(x: int): int =
+  ## Dead until the `live-edit` step has `sample.nim` call it: the edit that
+  ## moves this module's live set and nobody else's.
+  x * 2
