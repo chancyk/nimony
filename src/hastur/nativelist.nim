@@ -274,6 +274,13 @@ const
     # checks the three halves agree — the table nifasm lays down, the two
     # intrinsics arkham lowers, and the walk in `lib/std/stacktraces`.
     "tests/nimony/stacktraces/tstacktrace",
+    # The OS error codes of failed directory, `open` and `mmap` calls.
+    # Native-relevant by nature: on Linux the `importc` is the raw syscall, which
+    # answers `-errno` and sets no errno variable; on macOS it is still libSystem,
+    # which does. Under `nimony c` libc owns that on both.
+    "tests/nimony/stdlib/tdirs",
+    "tests/nimony/stdlib/twalkdir",
+    "tests/nimony/stdlib/tmemfiles",
     # A `const` set is read straight out of read-only data, so its membership
     # test is an indexed load from a GLOBAL — a shape the C backend never sees a
     # register problem in and arkham got wrong twice. Native-only by nature.

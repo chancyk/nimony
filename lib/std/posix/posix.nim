@@ -15,6 +15,16 @@ when defined(posix):
   # reference across the conditional `type` sections below.
   include posix_other
 
+  const nimNoLibcLinux = defined(nimNoLibc) and defined(linux)
+    ## How a failed call such as `mkdir` reports its error under `nimony n`:
+    ## - Linux: arkham turns the `importc` into the syscall itself. The call
+    ##   returns `-errno`; nothing writes an errno variable.
+    ## - macOS: there is no stable syscall ABI, so the `importc` is still a
+    ##   libSystem call. It returns -1 and the code is in libc's errno, exactly
+    ##   as under the C backend.
+    ## True on Linux only: `errno`, `pcall` and `mmapErrno` read the error out
+    ## of the return value there, and out of libc's errno everywhere else.
+
   const linuxA64Raw* = defined(linux) and defined(arm64) and defined(nimNoLibc)
     ## Linux/AArch64 on the truly freestanding backend (`nimony n`: arkham +
     ## nifasm, no libc linked): every binding below becomes a RAW syscall (arkham
@@ -256,7 +266,7 @@ when defined(posix):
   # reports `-1` and sets libc's errno. Gating on `nimNativeIo` made every such
   # failure read a native variable libc never writes: not a wrong message but a
   # wrong branch, since the `0` it answered maps to `Success`.
-  when defined(nimNoLibc):
+  when nimNoLibcLinux:
     var errnoVar: cint = 0
       ## Native errno for the truly freestanding build, maintained by this
       ## module's own syscall wrappers (currently the directory ops). Nothing
@@ -286,7 +296,7 @@ when defined(posix):
     ##
     ## Wrap every syscall-shaped call in this and read the error out of the
     ## result. Nothing above this module should touch an errno global.
-    when defined(nimNoLibc):
+    when nimNoLibcLinux:
       clong(x)
     else:
       let r = clong(x)
@@ -300,7 +310,7 @@ when defined(posix):
 
   template mmapErrno*(p: pointer): cint =
     ## `errno` for a failed `mmap` (see `mmapFailed`).
-    when defined(nimNoLibc): cint(-cast[int](p))
+    when nimNoLibcLinux: cint(-cast[int](p))
     else: errno()
 
   proc clock_gettime*(a1: ClockId, a2: var Timespec): cint {.importc: "clock_gettime", sideEffect.}
@@ -360,7 +370,7 @@ when defined(posix):
       ## The write matters even under libc — this module's own readdir must
       ## zero errno at end-of-directory, or consumers would misread a stale
       ## value as a failure.
-      when defined(nimNoLibc):
+      when nimNoLibcLinux:
         errnoVar = e
       else:
         errnoLocation()[] = e
@@ -377,8 +387,10 @@ when defined(posix):
 
     proc closedir*(dirp: nil ptr DIR): cint {.sideEffect.} =
       if dirp == nil:
+        # `-errno`: `pcall` hands a raw return value straight on, and a bare
+        # -1 would read as EPERM.
         setErrno EBADF
-        return cint(-1)
+        return cint(-EBADF)
       let fd = dirp.fd
       dealloc(dirp)
       result = close(fd)
